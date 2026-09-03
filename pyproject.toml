@@ -1,0 +1,41 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "active_testing_benchmark"
+version = "0.0.1"
+description = "Benchmarking of active-testing approaches on medical imaging"
+authors = [
+  { name = "Alexander Winther Nielsen" },
+]
+
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "loguru",
+    "mkdocs",
+    "pip",
+    "pytest",
+    "python-dotenv",
+    "ruff",
+    "tqdm",
+    "typer",
+]
+requires-python = "~=3.13.0"
+
+
+[tool.ruff]
+line-length = 99
+src = ["active_testing_benchmark"]
+include = ["pyproject.toml", "active_testing_benchmark/**/*.py"]
+
+[tool.ruff.lint]
+extend-select = ["I"]  # Add import sorting
+
+[tool.ruff.lint.isort]
+known-first-party = ["active_testing_benchmark"]
+force-sort-within-sections = true
+
