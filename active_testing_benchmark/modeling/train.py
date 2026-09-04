@@ -12,7 +12,7 @@ from sklearn.metrics import confusion_matrix, roc_auc_score
 import torch
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import typer
 
 from active_testing_benchmark.config import MLFLOW_DB_PATH, MODELS_DIR, RAW_DATA_DIR
@@ -24,6 +24,7 @@ from active_testing_benchmark.modeling.models import (
 
 app = typer.Typer(add_completion=False, help=__doc__)
 MODEL_NAMES = ["cnn", "resnet18", "densenet121", "vit", "clip"]
+IMBALANCE_STRATEGIES = ["none", "weighted-sampling", "class-weighted-loss"]
 
 
 def set_seed(seed: int) -> None:
@@ -82,9 +83,36 @@ def run_epoch(
     return total_loss / total, correct / total, labels, positive_probabilities, predictions
 
 
+def inverse_frequency_class_weights(
+    dataset: ImageClassificationDataset, num_classes: int
+) -> torch.Tensor:
+    """Return inverse-frequency class weights for labels present in ``dataset``."""
+    labels = torch.tensor([label for _, label in dataset.records], dtype=torch.long)
+    counts = torch.bincount(labels, minlength=num_classes).to(dtype=torch.float)
+    weights = torch.zeros(num_classes, dtype=torch.float)
+    present = counts > 0
+    weights[present] = len(dataset) / (num_classes * counts[present])
+    return weights
+
+
 def make_loader(
-    dataset: ImageClassificationDataset, batch_size: int, workers: int, shuffle: bool
+    dataset: ImageClassificationDataset,
+    batch_size: int,
+    workers: int,
+    shuffle: bool,
+    imbalance_strategy: str = "none",
 ) -> DataLoader:
+    if imbalance_strategy == "weighted-sampling":
+        class_weights = inverse_frequency_class_weights(
+            dataset, num_classes=max(label for _, label in dataset.records) + 1
+        )
+        sample_weights = torch.tensor(
+            [class_weights[label] for _, label in dataset.records], dtype=torch.float
+        )
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
+        return DataLoader(
+            dataset, batch_size=batch_size, sampler=sampler, num_workers=workers, pin_memory=True
+        )
     return DataLoader(
         dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, pin_memory=True
     )
@@ -109,12 +137,17 @@ def main(
     output_dir: Path = typer.Option(MODELS_DIR),  # noqa: B008 - Typer CLI option default.
     experiment_name: str = typer.Option("image-classification"),
     pretrained: bool = typer.Option(True, "--pretrained/--no-pretrained"),
+    imbalance_strategy: str = typer.Option(
+        "none", help="none, weighted-sampling, or class-weighted-loss."
+    ),
 ) -> None:
     """Run a minimal train/validation/test image-classification experiment."""
     if model not in MODEL_NAMES:
         raise typer.BadParameter(f"Choose one of: {', '.join(MODEL_NAMES)}")
     if model == "vit" and image_size != 224:
         raise typer.BadParameter("torchvision vit_b_16 currently requires --image-size 224")
+    if imbalance_strategy not in IMBALANCE_STRATEGIES:
+        raise typer.BadParameter(f"Choose one of: {', '.join(IMBALANCE_STRATEGIES)}")
     metadata_path = metadata_path.resolve()
     image_root = (image_root or metadata_path.parent).resolve()
     if not metadata_path.is_file():
@@ -143,12 +176,26 @@ def main(
         for split in ("training", "validation", "test")
     }
     loaders = {
-        split: make_loader(dataset, batch_size, num_workers, shuffle=split == "training")
+        split: make_loader(
+            dataset,
+            batch_size,
+            num_workers,
+            shuffle=split == "training",
+            imbalance_strategy=imbalance_strategy if split == "training" else "none",
+        )
         for split, dataset in datasets.items()
     }
     classifier.to(device)
     optimizer = AdamW((p for p in classifier.parameters() if p.requires_grad), lr=learning_rate)
-    loss_function = nn.CrossEntropyLoss()
+    class_weights = (
+        inverse_frequency_class_weights(datasets["training"], len(class_to_index))
+        if imbalance_strategy == "class-weighted-loss"
+        else None
+    )
+    training_loss_function = nn.CrossEntropyLoss(
+        weight=class_weights.to(device) if class_weights is not None else None
+    )
+    evaluation_loss_function = nn.CrossEntropyLoss()
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / f"{model}_best.pt"
     config = {
@@ -165,13 +212,18 @@ def main(
         "target_column": target_column,
         "split_column": split_column,
         "pretrained": pretrained,
+        "imbalance_strategy": imbalance_strategy,
+        "class_weights": class_weights.tolist() if class_weights is not None else None,
     }
     config_path = output_dir / f"{model}_config.json"
     mapping_path = output_dir / f"{model}_classes.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     mapping_path.write_text(json.dumps(class_to_index, indent=2) + "\n")
 
-    print(f"Model: {model}\nDevice: {device}\nTrain samples: {len(datasets['training'])}")
+    print(
+        f"Model: {model}\nDevice: {device}\nImbalance strategy: {imbalance_strategy}"
+        f"\nTrain samples: {len(datasets['training'])}"
+    )
     print(
         f"Validation samples: {len(datasets['validation'])}\nTest samples: {len(datasets['test'])}"
     )
@@ -195,10 +247,10 @@ def main(
         best_validation_accuracy = 0.0
         for epoch in range(1, epochs + 1):
             train_loss, train_accuracy, *_ = run_epoch(
-                classifier, loaders["training"], loss_function, device, optimizer
+                classifier, loaders["training"], training_loss_function, device, optimizer
             )
             validation_loss, validation_accuracy, *_ = run_epoch(
-                classifier, loaders["validation"], loss_function, device
+                classifier, loaders["validation"], evaluation_loss_function, device
             )
             print(f"\nEpoch {epoch}/{epochs}")
             print(f"Train loss: {train_loss:.4f} | Train accuracy: {train_accuracy:.4f}")
@@ -228,7 +280,7 @@ def main(
         state = torch.load(checkpoint_path, map_location=device, weights_only=True)
         classifier.load_state_dict(state["model_state_dict"])
         test_loss, test_accuracy, test_labels, test_probabilities, test_predictions = run_epoch(
-            classifier, loaders["test"], loss_function, device
+            classifier, loaders["test"], evaluation_loss_function, device
         )
         final_metrics = {
             "test_loss": test_loss,

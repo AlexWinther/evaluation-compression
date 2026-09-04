@@ -48,6 +48,12 @@ uv run python -m active_testing_benchmark.modeling.train --model vit --epochs 5 
 uv run python -m active_testing_benchmark.modeling.train --model clip --epochs 5 --batch-size 32 --learning-rate 1e-4
 ```
 
+For imbalanced training labels, choose exactly one training-only strategy with
+`--imbalance-strategy weighted-sampling` (balanced draws with replacement) or
+`--imbalance-strategy class-weighted-loss` (inverse-frequency cross-entropy).
+The default, `--imbalance-strategy none`, preserves the unweighted shuffled
+training baseline. Validation and test metrics always use ordinary cross-entropy.
+
 `cnn` starts from scratch. Torchvision models use ImageNet weights; CLIP uses a
 frozen OpenCLIP ViT-B/32 encoder with a trainable classification head. Pass
 `--no-pretrained` to avoid weight downloads. Each run records metrics,
