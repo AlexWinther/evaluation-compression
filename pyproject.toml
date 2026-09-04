@@ -18,13 +18,19 @@ dependencies = [
     "huggingface-hub>=0.30",
     "loguru",
     "mkdocs",
+    "mlflow>=3.0",
     "nbautoexport>=0.5.2",
+    "open-clip-torch>=3.0",
     "pandas>=3.0.5",
+    "pillow",
     "pip",
     "pytest",
     "python-dotenv",
     "remotezip>=0.12",
     "ruff",
+    "scikit-learn",
+    "torch",
+    "torchvision",
     "tqdm",
     "typer",
 ]
@@ -42,4 +48,3 @@ extend-select = ["I"]  # Add import sorting
 [tool.ruff.lint.isort]
 known-first-party = ["active_testing_benchmark"]
 force-sort-within-sections = true
-

@@ -29,6 +29,44 @@ than transferring the complete 40--63 GB disease archive. See the
 for its CC BY-NC-ND 4.0 license; it is for non-commercial research and not for
 clinical decisions or patient care.
 
+## Image-classification experiments
+
+The downloaded DR SLO images already use FairVision's `training`, `validation`,
+and `test` splits. The default command reads
+`data/raw/fairvision/dr/metadata.csv`, maps its `filename` entries such as
+`data_09382.npz` to `test/slo_fundus_09382.jpg`, and uses `dr` as the binary
+target. Raw images are never copied or changed.
+
+Install dependencies once with `make requirements`, then run one model per
+experiment (the first pretrained run downloads published weights):
+
+```bash
+uv run python -m active_testing_benchmark.modeling.train --model cnn --epochs 5 --batch-size 32 --learning-rate 1e-4
+uv run python -m active_testing_benchmark.modeling.train --model resnet18 --epochs 5 --batch-size 32 --learning-rate 1e-4
+uv run python -m active_testing_benchmark.modeling.train --model densenet121 --epochs 5 --batch-size 32 --learning-rate 1e-4
+uv run python -m active_testing_benchmark.modeling.train --model vit --epochs 5 --batch-size 32 --learning-rate 1e-4
+uv run python -m active_testing_benchmark.modeling.train --model clip --epochs 5 --batch-size 32 --learning-rate 1e-4
+```
+
+`cnn` starts from scratch. Torchvision models use ImageNet weights; CLIP uses a
+frozen OpenCLIP ViT-B/32 encoder with a trainable classification head. Pass
+`--no-pretrained` to avoid weight downloads. Each run records metrics,
+checkpoint, configuration, classes, and test confusion matrix in the local
+SQLite-backed MLflow store. View runs from the project root with:
+
+```bash
+make mlflow-ui
+```
+
+For another layout, pass `--metadata-path`, `--image-root`, `--image-column`,
+`--target-column`, and `--split-column`. Split values must be `training`,
+`validation`, and `test` (case-insensitive).
+
+radT is intentionally not installed or enabled yet. Its current published
+materials describe an MLflow extension but do not document a stable minimal
+in-process API for this loop. It can later be evaluated separately (`uv add
+radt`) without affecting normal MLflow training.
+
 ## Project Organization
 
 ```

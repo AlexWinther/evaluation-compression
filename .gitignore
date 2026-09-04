@@ -3,6 +3,10 @@ papers/
 project-*
 data/raw/*
 !data/raw/.gitkeep
+models/*
+!models/.gitkeep
+mlflow.db
+mlartifacts/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

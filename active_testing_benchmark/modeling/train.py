@@ -1,29 +1,254 @@
-from pathlib import Path
+"""Train one image classifier and log the run to local MLflow."""
 
-from loguru import logger
-from tqdm import tqdm
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import random
+
+import mlflow
+import numpy as np
+from sklearn.metrics import confusion_matrix, roc_auc_score
+import torch
+from torch import nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
 import typer
 
-from active_testing_benchmark.config import MODELS_DIR, PROCESSED_DATA_DIR
+from active_testing_benchmark.config import MLFLOW_DB_PATH, MODELS_DIR, RAW_DATA_DIR
+from active_testing_benchmark.modeling.data import ImageClassificationDataset, class_mapping
+from active_testing_benchmark.modeling.models import (
+    create_model_and_transform,
+    torchvision_transform,
+)
 
-app = typer.Typer()
+app = typer.Typer(add_completion=False, help=__doc__)
+MODEL_NAMES = ["cnn", "resnet18", "densenet121", "vit", "clip"]
+
+
+def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch for repeatable experiment starts."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def selected_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    loss_function: nn.Module,
+    device: torch.device,
+    optimizer: AdamW | None = None,
+) -> tuple[float, float, list[int], list[float], list[int]]:
+    """Train when an optimizer is supplied; otherwise evaluate."""
+    is_training = optimizer is not None
+    model.train(is_training)
+    total_loss = correct = total = 0
+    labels: list[int] = []
+    positive_probabilities: list[float] = []
+    predictions: list[int] = []
+    context = torch.enable_grad() if is_training else torch.no_grad()
+    with context:
+        for images, targets in loader:
+            images, targets = images.to(device), targets.to(device)
+            if optimizer is not None:
+                optimizer.zero_grad()
+            outputs = model(images)
+            loss = loss_function(outputs, targets)
+            if optimizer is not None:
+                loss.backward()
+                optimizer.step()
+            batch_predictions = outputs.argmax(dim=1)
+            total_loss += loss.item() * targets.size(0)
+            correct += (batch_predictions == targets).sum().item()
+            total += targets.size(0)
+            if not is_training:
+                labels.extend(targets.cpu().tolist())
+                predictions.extend(batch_predictions.cpu().tolist())
+                if outputs.shape[1] == 2:
+                    positive_probabilities.extend(
+                        torch.softmax(outputs, dim=1)[:, 1].cpu().tolist()
+                    )
+    return total_loss / total, correct / total, labels, positive_probabilities, predictions
+
+
+def make_loader(
+    dataset: ImageClassificationDataset, batch_size: int, workers: int, shuffle: bool
+) -> DataLoader:
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, pin_memory=True
+    )
 
 
 @app.command()
 def main(
-    # ---- REPLACE DEFAULT PATHS AS APPROPRIATE ----
-    features_path: Path = PROCESSED_DATA_DIR / "features.csv",
-    labels_path: Path = PROCESSED_DATA_DIR / "labels.csv",
-    model_path: Path = MODELS_DIR / "model.pkl",
-    # -----------------------------------------
-):
-    # ---- REPLACE THIS WITH YOUR OWN CODE ----
-    logger.info("Training some model...")
-    for i in tqdm(range(10), total=10):
-        if i == 5:
-            logger.info("Something happened for iteration 5.")
-    logger.success("Modeling training complete.")
-    # -----------------------------------------
+    model: str = typer.Option("resnet18", help="cnn, resnet18, densenet121, vit, or clip."),
+    batch_size: int = typer.Option(32, min=1),
+    epochs: int = typer.Option(5, min=1),
+    learning_rate: float = typer.Option(1e-4, min=0.0),
+    seed: int = typer.Option(42),
+    num_workers: int = typer.Option(0, min=0),
+    image_size: int = typer.Option(224, min=32),
+    metadata_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI options as defaults.
+        RAW_DATA_DIR / "fairvision/dr/metadata.csv"
+    ),
+    image_root: Path | None = typer.Option(None),  # noqa: B008 - Typer CLI option default.
+    image_column: str = typer.Option("filename"),
+    target_column: str = typer.Option("dr"),
+    split_column: str = typer.Option("use"),
+    output_dir: Path = typer.Option(MODELS_DIR),  # noqa: B008 - Typer CLI option default.
+    experiment_name: str = typer.Option("image-classification"),
+    pretrained: bool = typer.Option(True, "--pretrained/--no-pretrained"),
+) -> None:
+    """Run a minimal train/validation/test image-classification experiment."""
+    if model not in MODEL_NAMES:
+        raise typer.BadParameter(f"Choose one of: {', '.join(MODEL_NAMES)}")
+    if model == "vit" and image_size != 224:
+        raise typer.BadParameter("torchvision vit_b_16 currently requires --image-size 224")
+    metadata_path = metadata_path.resolve()
+    image_root = (image_root or metadata_path.parent).resolve()
+    if not metadata_path.is_file():
+        raise typer.BadParameter(f"Metadata file does not exist: {metadata_path}")
+
+    set_seed(seed)
+    device = selected_device()
+    class_to_index = class_mapping(metadata_path, target_column)
+    classifier, train_transform = create_model_and_transform(
+        model, len(class_to_index), pretrained, image_size
+    )
+    validation_transform = (
+        train_transform if model == "clip" else torchvision_transform(image_size, training=False)
+    )
+    datasets = {
+        split: ImageClassificationDataset(
+            metadata_path,
+            image_root,
+            image_column,
+            target_column,
+            split_column,
+            split,
+            class_to_index,
+            train_transform if split == "training" else validation_transform,
+        )
+        for split in ("training", "validation", "test")
+    }
+    loaders = {
+        split: make_loader(dataset, batch_size, num_workers, shuffle=split == "training")
+        for split, dataset in datasets.items()
+    }
+    classifier.to(device)
+    optimizer = AdamW((p for p in classifier.parameters() if p.requires_grad), lr=learning_rate)
+    loss_function = nn.CrossEntropyLoss()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / f"{model}_best.pt"
+    config = {
+        "model": model,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "seed": seed,
+        "num_workers": num_workers,
+        "image_size": image_size,
+        "metadata_path": str(metadata_path),
+        "image_root": str(image_root),
+        "image_column": image_column,
+        "target_column": target_column,
+        "split_column": split_column,
+        "pretrained": pretrained,
+    }
+    config_path = output_dir / f"{model}_config.json"
+    mapping_path = output_dir / f"{model}_classes.json"
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    mapping_path.write_text(json.dumps(class_to_index, indent=2) + "\n")
+
+    print(f"Model: {model}\nDevice: {device}\nTrain samples: {len(datasets['training'])}")
+    print(
+        f"Validation samples: {len(datasets['validation'])}\nTest samples: {len(datasets['test'])}"
+    )
+    mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB_PATH}")
+    mlflow.set_experiment(experiment_name)
+    with mlflow.start_run():
+        mlflow.log_params(
+            {
+                **config,
+                "optimizer": "AdamW",
+                "device": str(device),
+                "num_classes": len(class_to_index),
+                "train_samples": len(datasets["training"]),
+                "validation_samples": len(datasets["validation"]),
+                "test_samples": len(datasets["test"]),
+            }
+        )
+        mlflow.log_artifact(str(config_path))
+        mlflow.log_artifact(str(mapping_path))
+        best_validation_loss = float("inf")
+        best_validation_accuracy = 0.0
+        for epoch in range(1, epochs + 1):
+            train_loss, train_accuracy, *_ = run_epoch(
+                classifier, loaders["training"], loss_function, device, optimizer
+            )
+            validation_loss, validation_accuracy, *_ = run_epoch(
+                classifier, loaders["validation"], loss_function, device
+            )
+            print(f"\nEpoch {epoch}/{epochs}")
+            print(f"Train loss: {train_loss:.4f} | Train accuracy: {train_accuracy:.4f}")
+            print(f"Val loss:   {validation_loss:.4f} | Val accuracy:   {validation_accuracy:.4f}")
+            mlflow.log_metrics(
+                {
+                    "train_loss": train_loss,
+                    "train_accuracy": train_accuracy,
+                    "validation_loss": validation_loss,
+                    "validation_accuracy": validation_accuracy,
+                },
+                step=epoch,
+            )
+            if validation_loss < best_validation_loss:
+                best_validation_loss, best_validation_accuracy = (
+                    validation_loss,
+                    validation_accuracy,
+                )
+                torch.save(
+                    {
+                        "model_state_dict": classifier.state_dict(),
+                        "class_to_index": class_to_index,
+                        "config": config,
+                    },
+                    checkpoint_path,
+                )
+        state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        classifier.load_state_dict(state["model_state_dict"])
+        test_loss, test_accuracy, test_labels, test_probabilities, test_predictions = run_epoch(
+            classifier, loaders["test"], loss_function, device
+        )
+        final_metrics = {
+            "test_loss": test_loss,
+            "test_accuracy": test_accuracy,
+            "best_validation_loss": best_validation_loss,
+            "best_validation_accuracy": best_validation_accuracy,
+        }
+        if len(class_to_index) == 2 and len(set(test_labels)) == 2:
+            final_metrics["test_roc_auc"] = roc_auc_score(test_labels, test_probabilities)
+        mlflow.log_metrics(final_metrics)
+        matrix_path = output_dir / f"{model}_test_confusion_matrix.csv"
+        np.savetxt(
+            matrix_path, confusion_matrix(test_labels, test_predictions), delimiter=",", fmt="%d"
+        )
+        for artifact in (checkpoint_path, matrix_path):
+            mlflow.log_artifact(str(artifact))
+    print(f"\nBest checkpoint: {checkpoint_path}")
+    print(f"Test loss: {test_loss:.4f} | Test accuracy: {test_accuracy:.4f}")
+    if "test_roc_auc" in final_metrics:
+        print(f"Test ROC-AUC: {final_metrics['test_roc_auc']:.4f}")
 
 
 if __name__ == "__main__":

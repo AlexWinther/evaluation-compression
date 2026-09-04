@@ -74,6 +74,24 @@ fairvision-metadata: requirements
 	uv run active_testing_benchmark/dataset.py --disease $(or $(DISEASE),glaucoma) --metadata-only
 
 
+## Train an image classifier (set MODEL=cnn, resnet18, densenet121, vit, or clip)
+.PHONY: train
+train: requirements
+	uv run python -m active_testing_benchmark.modeling.train \
+		--model $(or $(MODEL),resnet18) \
+		--epochs $(or $(EPOCHS),5) \
+		--batch-size $(or $(BATCH_SIZE),32) \
+		--learning-rate $(or $(LEARNING_RATE),1e-4) \
+		$(TRAIN_FLAGS)
+
+
+## Start the local MLflow UI using the project SQLite tracking database
+.PHONY: mlflow-ui
+mlflow-ui: requirements
+	uv run mlflow db upgrade sqlite:///mlflow.db
+	uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
+
+
 #################################################################################
 # Self Documenting Commands                                                     #
 #################################################################################
