@@ -62,10 +62,16 @@ create_environment:
 #################################################################################
 
 
-## Make dataset
+## Download FairVision data (set DISEASE=amd, dr, glaucoma, or all)
 .PHONY: data
 data: requirements
-	$(PYTHON_INTERPRETER) active_testing_benchmark/dataset.py
+	@test -n "$(DISEASE)" || (echo "Set DISEASE, e.g. make data DISEASE=glaucoma" && exit 2)
+	uv run active_testing_benchmark/dataset.py --disease $(DISEASE) $(FAIRVISION_FLAGS)
+
+## Download FairVision metadata for one disease (set DISEASE=amd, dr, or glaucoma)
+.PHONY: fairvision-metadata
+fairvision-metadata: requirements
+	uv run active_testing_benchmark/dataset.py --disease $(or $(DISEASE),glaucoma) --metadata-only
 
 
 #################################################################################

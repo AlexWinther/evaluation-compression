@@ -1,6 +1,8 @@
 # Project specific
 papers/
 project-*
+data/raw/*
+!data/raw/.gitkeep
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

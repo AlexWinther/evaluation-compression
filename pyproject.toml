@@ -15,11 +15,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
+    "huggingface-hub>=0.30",
     "loguru",
     "mkdocs",
+    "nbautoexport>=0.5.2",
+    "pandas>=3.0.5",
     "pip",
     "pytest",
     "python-dotenv",
+    "remotezip>=0.12",
     "ruff",
     "tqdm",
     "typer",

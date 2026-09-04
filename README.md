@@ -6,6 +6,29 @@
 
 Benchmarking of active-testing approaches on medical imaging
 
+## FairVision raw data
+
+The FairVision downloader retains the standalone, original-resolution SLO fundus
+JPEGs and the disease metadata CSVs only; it does not download or retain the 3D
+OCT-containing NPZ files. For example:
+
+```bash
+uv run active_testing_benchmark/dataset.py --disease glaucoma --metadata-only
+uv run active_testing_benchmark/dataset.py --disease glaucoma
+```
+or 
+```bash
+make fairvision-metadata DISEASE=glaucoma
+make data DISEASE=glaucoma
+```
+
+Files are written below `data/raw/fairvision/` by default. The image command uses
+HTTP byte ranges to retrieve selected JPEG members from the upstream ZIP rather
+than transferring the complete 40--63 GB disease archive. See the
+[upstream FairVision dataset](https://huggingface.co/datasets/harvardairobotics/FairVision)
+for its CC BY-NC-ND 4.0 license; it is for non-commercial research and not for
+clinical decisions or patient care.
+
 ## Project Organization
 
 ```
@@ -37,8 +60,6 @@ Benchmarking of active-testing approaches on medical imaging
 ├── requirements.txt   <- The requirements file for reproducing the analysis environment, e.g.
 │                         generated with `pip freeze > requirements.txt`
 │
-├── setup.cfg          <- Configuration file for flake8
-│
 └── active_testing_benchmark   <- Source code for use in this project.
     │
     ├── __init__.py             <- Makes active_testing_benchmark a Python module
@@ -58,4 +79,3 @@ Benchmarking of active-testing approaches on medical imaging
 ```
 
 --------
-
