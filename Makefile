@@ -46,17 +46,6 @@ test:
 	python -m pytest tests
 
 
-## Set up Python interpreter environment
-.PHONY: create_environment
-create_environment:
-	uv venv --python $(PYTHON_VERSION)
-	@echo ">>> New uv virtual environment created. Activate with:"
-	@echo ">>> Windows: .\\\\.venv\\\\Scripts\\\\activate"
-	@echo ">>> Unix/macOS: source ./.venv/bin/activate"
-
-
-
-
 #################################################################################
 # PROJECT RULES                                                                 #
 #################################################################################
@@ -92,6 +81,13 @@ mlflow-ui: requirements
 	uv run mlflow db upgrade sqlite:///mlflow.db
 	uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 
+## Promote a model to the "Baseline" tag
+.PHONY: mlflow-model-promote
+mlflow-model-promote: requirements
+	@test -n "$(RUN_ID)" || (echo "Set RUN_ID, e.g. make mlflow-model-promote RUN_ID=1234567890abcdef" && exit 2)
+	uv run python -m active_testing_benchmark.modeling.registry \
+    --run-id $(RUN_ID) \
+    --registry-name $(or $(REGISTRY_NAME),fairvision-dr-image-classifier) \
 
 #################################################################################
 # Self Documenting Commands                                                     #

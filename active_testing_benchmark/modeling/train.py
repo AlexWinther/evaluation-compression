@@ -3,23 +3,41 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import os
 import random
+import sys
+import time
+from pathlib import Path
 
 import mlflow
+import mlflow.pytorch
 import numpy as np
-from sklearn.metrics import confusion_matrix, roc_auc_score
 import torch
+import typer
+from mlflow.models import infer_signature
+from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, WeightedRandomSampler
-import typer
 
-from active_testing_benchmark.config import MLFLOW_DB_PATH, MODELS_DIR, RAW_DATA_DIR
-from active_testing_benchmark.modeling.data import ImageClassificationDataset, class_mapping
+from active_testing_benchmark.config import (
+    MLFLOW_DB_PATH,
+    MODELS_DIR,
+    PROJ_ROOT,
+    RAW_DATA_DIR,
+)
+from active_testing_benchmark.modeling.data import (
+    ImageClassificationDataset,
+    class_mapping,
+)
 from active_testing_benchmark.modeling.models import (
     create_model_and_transform,
     torchvision_transform,
+)
+from active_testing_benchmark.modeling.provenance import (
+    FAIRVISION_SOURCE,
+    build_dataset_provenance,
+    git_provenance,
 )
 
 app = typer.Typer(add_completion=False, help=__doc__)
@@ -73,14 +91,24 @@ def run_epoch(
             total_loss += loss.item() * targets.size(0)
             correct += (batch_predictions == targets).sum().item()
             total += targets.size(0)
-            if not is_training:
-                labels.extend(targets.cpu().tolist())
-                predictions.extend(batch_predictions.cpu().tolist())
-                if outputs.shape[1] == 2:
-                    positive_probabilities.extend(
-                        torch.softmax(outputs, dim=1)[:, 1].cpu().tolist()
-                    )
+            labels.extend(targets.cpu().tolist())
+            predictions.extend(batch_predictions.cpu().tolist())
+            if outputs.shape[1] == 2:
+                positive_probabilities.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().tolist())
     return total_loss / total, correct / total, labels, positive_probabilities, predictions
+
+
+def classification_metrics(
+    labels: list[int],
+    positive_probabilities: list[float],
+    predictions: list[int],
+    num_classes: int,
+) -> dict[str, float]:
+    """Compute imbalance-aware classification metrics when they are defined."""
+    metrics = {"macro_f1": f1_score(labels, predictions, average="macro", zero_division=0.0)}
+    if num_classes == 2 and len(set(labels)) == 2:
+        metrics["roc_auc"] = roc_auc_score(labels, positive_probabilities)
+    return metrics
 
 
 def inverse_frequency_class_weights(
@@ -136,6 +164,7 @@ def main(
     split_column: str = typer.Option("use"),
     output_dir: Path = typer.Option(MODELS_DIR),  # noqa: B008 - Typer CLI option default.
     experiment_name: str = typer.Option("image-classification"),
+    dataset_source: str = typer.Option(FAIRVISION_SOURCE),
     pretrained: bool = typer.Option(True, "--pretrained/--no-pretrained"),
     imbalance_strategy: str = typer.Option(
         "none", help="none, weighted-sampling, or class-weighted-loss."
@@ -196,6 +225,11 @@ def main(
         weight=class_weights.to(device) if class_weights is not None else None
     )
     evaluation_loss_function = nn.CrossEntropyLoss()
+    validation_loss_function = (
+        training_loss_function
+        if imbalance_strategy == "class-weighted-loss"
+        else evaluation_loss_function
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / f"{model}_best.pt"
     config = {
@@ -213,6 +247,7 @@ def main(
         "split_column": split_column,
         "pretrained": pretrained,
         "imbalance_strategy": imbalance_strategy,
+        "dataset_source": dataset_source,
         "class_weights": class_weights.tolist() if class_weights is not None else None,
     }
     config_path = output_dir / f"{model}_config.json"
@@ -227,9 +262,36 @@ def main(
     print(
         f"Validation samples: {len(datasets['validation'])}\nTest samples: {len(datasets['test'])}"
     )
-    mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB_PATH}")
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", f"sqlite:///{MLFLOW_DB_PATH}")
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_registry_uri(os.environ.get("MLFLOW_REGISTRY_URI", tracking_uri))
     mlflow.set_experiment(experiment_name)
-    with mlflow.start_run():
+    provenance = build_dataset_provenance(
+        metadata_path,
+        image_root,
+        image_column,
+        target_column,
+        split_column,
+        class_to_index,
+        dataset_source,
+    )
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    with mlflow.start_run(run_name=f"{model}-seed-{seed}-{timestamp}"):
+        mlflow.set_tags(
+            {
+                **git_provenance(PROJ_ROOT),
+                "dataset.source": dataset_source,
+                "dataset.metadata.sha256": provenance.metadata_digest,
+                "dataset.manifest.sha256": provenance.manifest_digest,
+                "model.family": model,
+                "training.seed": str(seed),
+                "runtime.python": sys.version.split()[0],
+                "runtime.mlflow": mlflow.__version__,
+                "runtime.torch": torch.__version__,
+            }
+        )
+        for split, dataset_input in provenance.datasets.items():
+            mlflow.log_input(dataset_input, context=split)
         mlflow.log_params(
             {
                 **config,
@@ -243,24 +305,72 @@ def main(
         )
         mlflow.log_artifact(str(config_path))
         mlflow.log_artifact(str(mapping_path))
+        mlflow.log_artifact(str(PROJ_ROOT / "uv.lock"))
+        mlflow.log_dict(
+            {
+                "dataset_source": dataset_source,
+                "metadata_sha256": provenance.metadata_digest,
+                "manifest_sha256": provenance.manifest_digest,
+                "split_counts": provenance.split_counts,
+                "image_bytes_logged": False,
+                "metadata_rows_logged": False,
+                "model_input_example": "synthetic zero tensor",
+            },
+            "provenance.json",
+        )
         best_validation_loss = float("inf")
         best_validation_accuracy = 0.0
         for epoch in range(1, epochs + 1):
-            train_loss, train_accuracy, *_ = run_epoch(
-                classifier, loaders["training"], training_loss_function, device, optimizer
+            train_loss, train_accuracy, train_labels, train_probabilities, train_predictions = (
+                run_epoch(
+                    classifier, loaders["training"], training_loss_function, device, optimizer
+                )
             )
-            validation_loss, validation_accuracy, *_ = run_epoch(
-                classifier, loaders["validation"], evaluation_loss_function, device
+            (
+                validation_loss,
+                validation_accuracy,
+                validation_labels,
+                validation_probabilities,
+                validation_predictions,
+            ) = run_epoch(classifier, loaders["validation"], validation_loss_function, device)
+            train_metrics = classification_metrics(
+                train_labels, train_probabilities, train_predictions, len(class_to_index)
+            )
+            validation_metrics = classification_metrics(
+                validation_labels,
+                validation_probabilities,
+                validation_predictions,
+                len(class_to_index),
             )
             print(f"\nEpoch {epoch}/{epochs}")
-            print(f"Train loss: {train_loss:.4f} | Train accuracy: {train_accuracy:.4f}")
-            print(f"Val loss:   {validation_loss:.4f} | Val accuracy:   {validation_accuracy:.4f}")
+            print(
+                f"Train loss: {train_loss:.4f} | Train accuracy: {train_accuracy:.4f}"
+                f" | Train macro-F1: {train_metrics['macro_f1']:.4f}"
+                + _roc_auc_report(train_metrics, "Train")
+            )
+            print(
+                f"Val loss:   {validation_loss:.4f} | Val accuracy:   {validation_accuracy:.4f}"
+                f" | Val macro-F1:   {validation_metrics['macro_f1']:.4f}"
+                + _roc_auc_report(validation_metrics, "Val")
+            )
             mlflow.log_metrics(
                 {
                     "train_loss": train_loss,
                     "train_accuracy": train_accuracy,
+                    "train_macro_f1": train_metrics["macro_f1"],
                     "validation_loss": validation_loss,
                     "validation_accuracy": validation_accuracy,
+                    "validation_macro_f1": validation_metrics["macro_f1"],
+                    **{
+                        f"train_{name}": value
+                        for name, value in train_metrics.items()
+                        if name == "roc_auc"
+                    },
+                    **{
+                        f"validation_{name}": value
+                        for name, value in validation_metrics.items()
+                        if name == "roc_auc"
+                    },
                 },
                 step=epoch,
             )
@@ -287,9 +397,13 @@ def main(
             "test_accuracy": test_accuracy,
             "best_validation_loss": best_validation_loss,
             "best_validation_accuracy": best_validation_accuracy,
+            **{
+                f"test_{name}": value
+                for name, value in classification_metrics(
+                    test_labels, test_probabilities, test_predictions, len(class_to_index)
+                ).items()
+            },
         }
-        if len(class_to_index) == 2 and len(set(test_labels)) == 2:
-            final_metrics["test_roc_auc"] = roc_auc_score(test_labels, test_probabilities)
         mlflow.log_metrics(final_metrics)
         matrix_path = output_dir / f"{model}_test_confusion_matrix.csv"
         np.savetxt(
@@ -297,10 +411,28 @@ def main(
         )
         for artifact in (checkpoint_path, matrix_path):
             mlflow.log_artifact(str(artifact))
+        input_example = torch.zeros((1, 3, image_size, image_size), dtype=torch.float32)
+        classifier.eval()
+        with torch.no_grad():
+            output_example = classifier(input_example.to(device)).cpu().numpy()
+        mlflow.pytorch.log_model(
+            classifier,
+            name="model",
+            signature=infer_signature(input_example.numpy(), output_example),
+            input_example=input_example.numpy(),
+            code_paths=[str(PROJ_ROOT / "active_testing_benchmark")],
+            extra_files=[str(config_path), str(mapping_path)],
+            serialization_format="pickle",
+        )
     print(f"\nBest checkpoint: {checkpoint_path}")
     print(f"Test loss: {test_loss:.4f} | Test accuracy: {test_accuracy:.4f}")
     if "test_roc_auc" in final_metrics:
         print(f"Test ROC-AUC: {final_metrics['test_roc_auc']:.4f}")
+
+
+def _roc_auc_report(metrics: dict[str, float], split: str) -> str:
+    """Format ROC-AUC only for binary splits containing both classes."""
+    return f" | {split} ROC-AUC: {metrics['roc_auc']:.4f}" if "roc_auc" in metrics else ""
 
 
 if __name__ == "__main__":

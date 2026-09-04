@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, RandomSampler, WeightedRandomSampler
 from active_testing_benchmark.modeling.data import ImageClassificationDataset, class_mapping
 from active_testing_benchmark.modeling.models import create_model
 from active_testing_benchmark.modeling.train import (
+    classification_metrics,
     inverse_frequency_class_weights,
     make_loader,
     run_epoch,
@@ -142,6 +143,26 @@ def test_class_weighted_loss_weights_minority_class_more(tmp_path: Path) -> None
     weights = inverse_frequency_class_weights(dataset, num_classes=2)
 
     assert weights.tolist() == pytest.approx([2.0, 2 / 3])
+
+
+def test_classification_metrics_include_macro_f1_and_binary_roc_auc() -> None:
+    metrics = classification_metrics(
+        labels=[0, 0, 1, 1],
+        positive_probabilities=[0.1, 0.4, 0.6, 0.9],
+        predictions=[0, 1, 1, 1],
+        num_classes=2,
+    )
+
+    assert metrics["macro_f1"] == pytest.approx(0.7333333333333334)
+    assert metrics["roc_auc"] == pytest.approx(1.0)
+
+
+def test_classification_metrics_omit_undefined_roc_auc() -> None:
+    metrics = classification_metrics(
+        labels=[0, 0], positive_probabilities=[0.1, 0.2], predictions=[0, 0], num_classes=2
+    )
+
+    assert metrics == {"macro_f1": 1.0}
 
 
 def _imbalanced_image_dataset(tmp_path: Path) -> tuple[Path, Path]:

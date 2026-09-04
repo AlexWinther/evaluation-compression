@@ -52,7 +52,9 @@ For imbalanced training labels, choose exactly one training-only strategy with
 `--imbalance-strategy weighted-sampling` (balanced draws with replacement) or
 `--imbalance-strategy class-weighted-loss` (inverse-frequency cross-entropy).
 The default, `--imbalance-strategy none`, preserves the unweighted shuffled
-training baseline. Validation and test metrics always use ordinary cross-entropy.
+training baseline. With `class-weighted-loss`, validation uses the same weighted
+cross-entropy for checkpoint selection; test loss remains unweighted. Each epoch
+reports macro-F1 and, for binary splits containing both classes, ROC-AUC.
 
 `cnn` starts from scratch. Torchvision models use ImageNet weights; CLIP uses a
 frozen OpenCLIP ViT-B/32 encoder with a trainable classification head. Pass
@@ -63,6 +65,22 @@ SQLite-backed MLflow store. View runs from the project root with:
 ```bash
 make mlflow-ui
 ```
+
+Each run records sanitized dataset lineage for the training, validation, and test
+splits: FairVision source, metadata checksum, selected-record manifest checksum,
+schema, and aggregate split counts. It never uploads raw images or metadata rows.
+The native MLflow model artifact includes a tensor signature, representative input,
+configuration, and class mapping. To promote a manually reviewed run to a curated
+baseline, use:
+
+```bash
+uv run python -m active_testing_benchmark.modeling.registry \
+  --run-id <run-id> \
+  --registry-name fairvision-dr-image-classifier
+```
+
+This creates a model version and moves the `baseline` alias. Load that selected
+baseline through `models:/fairvision-dr-image-classifier@baseline`.
 
 For another layout, pass `--metadata-path`, `--image-root`, `--image-column`,
 `--target-column`, and `--split-column`. Split values must be `training`,
