@@ -91,6 +91,12 @@ materials describe an MLflow extension but do not document a stable minimal
 in-process API for this loop. It can later be evaluated separately (`uv add
 radt`) without affecting normal MLflow training.
 
+## Acknowledgment
+
+The weekly meeting notes are inspired by the
+[WhitakerLabProjectManagement](https://github.com/WhitakerLab/WhitakerLabProjectManagement)
+repository. We thank its makers for sharing their approach.
+
 ## Project Organization
 
 ```
