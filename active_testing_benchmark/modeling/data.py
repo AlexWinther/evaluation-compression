@@ -41,6 +41,7 @@ class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
             )
 
         self.records: list[tuple[Path, int]] = []
+        self.row_ids = split_dataframe.index.to_numpy(copy=True)
         for _, row in split_dataframe.iterrows():
             image_path = resolve_image_path(image_root, str(row[image_column]), split)
             if not image_path.is_file():

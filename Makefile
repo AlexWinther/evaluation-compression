@@ -75,9 +75,20 @@ train: requirements
 		$(TRAIN_FLAGS)
 
 
-## Start the local MLflow UI using the project SQLite tracking database
+## Benchmark reduced test subsets (set ACTIVE_TESTING_FLAGS with models and test sizes)
+.PHONY: active-testing
+active-testing: requirements
+	uv run python -m active_testing_benchmark.active_testing $(ACTIVE_TESTING_FLAGS)
+
+## Visualize an active-testing run (set EXPERIMENT_DIR to its report directory)
+.PHONY: active-testing-plot
+active-testing-plot: requirements
+	uv run python -m active_testing_benchmark.plots $(EXPERIMENT_DIR) $(ACTIVE_TESTING_PLOT_FLAGS)
+
+## Start the legacy local/archive MLflow UI using the project SQLite database
 .PHONY: mlflow-ui
 mlflow-ui: requirements
+	@echo "Local/archive MLflow only; normal work uses https://mlflow.alwn.dev"
 	uv run mlflow db upgrade sqlite:///mlflow.db
 	uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 

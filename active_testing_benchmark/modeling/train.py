@@ -1,9 +1,8 @@
-"""Train one image classifier and log the run to local MLflow."""
+"""Train one image classifier and log the run to MLflow."""
 
 from __future__ import annotations
 
 import json
-import os
 import random
 import sys
 import time
@@ -21,7 +20,6 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from active_testing_benchmark.config import (
-    MLFLOW_DB_PATH,
     MODELS_DIR,
     PROJ_ROOT,
     RAW_DATA_DIR,
@@ -39,6 +37,7 @@ from active_testing_benchmark.modeling.provenance import (
     build_dataset_provenance,
     git_provenance,
 )
+from active_testing_benchmark.modeling.registry import configure_mlflow
 
 app = typer.Typer(add_completion=False, help=__doc__)
 MODEL_NAMES = ["cnn", "resnet18", "densenet121", "vit", "clip"]
@@ -177,6 +176,7 @@ def main(
         raise typer.BadParameter("torchvision vit_b_16 currently requires --image-size 224")
     if imbalance_strategy not in IMBALANCE_STRATEGIES:
         raise typer.BadParameter(f"Choose one of: {', '.join(IMBALANCE_STRATEGIES)}")
+    configure_mlflow()
     metadata_path = metadata_path.resolve()
     image_root = (image_root or metadata_path.parent).resolve()
     if not metadata_path.is_file():
@@ -262,9 +262,6 @@ def main(
     print(
         f"Validation samples: {len(datasets['validation'])}\nTest samples: {len(datasets['test'])}"
     )
-    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", f"sqlite:///{MLFLOW_DB_PATH}")
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_registry_uri(os.environ.get("MLFLOW_REGISTRY_URI", tracking_uri))
     mlflow.set_experiment(experiment_name)
     provenance = build_dataset_provenance(
         metadata_path,

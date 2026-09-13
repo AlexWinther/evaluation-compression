@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     "huggingface-hub>=0.30",
     "loguru",
+    "matplotlib>=3.10",
     "mkdocs",
     "mlflow>=3.0",
     "nbautoexport>=0.5.2",

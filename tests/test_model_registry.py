@@ -30,3 +30,62 @@ def test_register_baseline_tags_version_and_moves_alias(monkeypatch) -> None:
     assert ("tag", "fairvision-dr-image-classifier", "3", "source.run_id", "run-123") in calls
     assert ("tag", "fairvision-dr-image-classifier", "3", "metric.test_accuracy", "0.9") in calls
     assert ("alias", "fairvision-dr-image-classifier", "baseline", "3") in calls
+
+
+def test_configure_mlflow_requires_tracking_uri(monkeypatch) -> None:
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
+
+    try:
+        registry.configure_mlflow()
+    except RuntimeError as error:
+        assert "MLFLOW_TRACKING_URI is required" in str(error)
+    else:
+        raise AssertionError("configure_mlflow() should reject missing MLFLOW_TRACKING_URI")
+
+
+def test_configure_mlflow_uses_tracking_uri_for_registry_by_default(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
+    monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
+    monkeypatch.setattr(
+        registry.mlflow,
+        "set_tracking_uri",
+        lambda uri: calls.append(("tracking", uri)),
+    )
+    monkeypatch.setattr(
+        registry.mlflow,
+        "set_registry_uri",
+        lambda uri: calls.append(("registry", uri)),
+    )
+
+    result = registry.configure_mlflow()
+
+    assert result == "https://mlflow.example.test"
+    assert calls == [
+        ("tracking", "https://mlflow.example.test"),
+        ("registry", "https://mlflow.example.test"),
+    ]
+
+
+def test_configure_mlflow_honors_registry_override(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
+    monkeypatch.setenv("MLFLOW_REGISTRY_URI", "sqlite:///registry.db")
+    monkeypatch.setattr(
+        registry.mlflow,
+        "set_tracking_uri",
+        lambda uri: calls.append(("tracking", uri)),
+    )
+    monkeypatch.setattr(
+        registry.mlflow,
+        "set_registry_uri",
+        lambda uri: calls.append(("registry", uri)),
+    )
+
+    registry.configure_mlflow()
+
+    assert calls == [
+        ("tracking", "https://mlflow.example.test"),
+        ("registry", "sqlite:///registry.db"),
+    ]

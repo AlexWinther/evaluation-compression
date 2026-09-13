@@ -8,6 +8,7 @@ models/*
 mlflow.db
 mlartifacts/
 mlruns/
+reports/active-testing
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -230,3 +231,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MLflow deployment secrets and backup material
+deploy/mlflow/.env
+deploy/mlflow/*.dump
+deploy/mlflow/*.sql
+deploy/mlflow/*.tar
+deploy/mlflow/*.tar.gz
+deploy/mlflow/backups/

@@ -8,14 +8,19 @@ import mlflow
 from mlflow import MlflowClient
 import typer
 
-from active_testing_benchmark.config import MLFLOW_DB_PATH
-
 app = typer.Typer(add_completion=False, help=__doc__)
 
 
 def configure_mlflow() -> str:
-    """Configure the local store unless callers provide a remote tracking URI."""
-    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", f"sqlite:///{MLFLOW_DB_PATH}")
+    """Configure MLflow from explicit environment variables."""
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+    if not tracking_uri:
+        raise RuntimeError(
+            "MLFLOW_TRACKING_URI is required. Set it to the remote MLflow server "
+            "(for example, https://mlflow.alwn.dev) or explicitly select local "
+            "mode with a URI such as sqlite:///mlflow.db."
+        )
+
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_registry_uri(os.environ.get("MLFLOW_REGISTRY_URI", tracking_uri))
     return tracking_uri
