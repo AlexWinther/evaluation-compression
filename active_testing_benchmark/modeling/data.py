@@ -24,6 +24,7 @@ class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
         split: str,
         class_to_index: dict[str, int],
         transform: object | None = None,
+        validate_paths: bool = True,
     ) -> None:
         dataframe = pd.read_csv(metadata_path)
         required = {image_column, target_column, split_column}
@@ -43,8 +44,10 @@ class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
         self.records: list[tuple[Path, int]] = []
         self.row_ids = split_dataframe.index.to_numpy(copy=True)
         for _, row in split_dataframe.iterrows():
-            image_path = resolve_image_path(image_root, str(row[image_column]), split)
-            if not image_path.is_file():
+            image_path = resolve_image_path(
+                image_root, str(row[image_column]), split, check_exists=validate_paths
+            )
+            if validate_paths and not image_path.is_file():
                 raise FileNotFoundError(
                     f"Image for metadata value {row[image_column]!r} was not found at {image_path}. "
                     "Pass --image-root or --image-column for a different layout."
@@ -65,17 +68,28 @@ class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
         return image, label
 
 
-def resolve_image_path(image_root: Path, image_value: str, split: str) -> Path:
+def resolve_image_path(
+    image_root: Path, image_value: str, split: str, check_exists: bool = True
+) -> Path:
     """Resolve direct relative paths and FairVision ``data_*.npz`` identifiers.
 
     FairVision metadata names OCT files (``data_00001.npz``), while this project
     downloads corresponding SLO JPEGs (``training/slo_fundus_00001.jpg``).
     """
     supplied_path = Path(image_value)
+    match = re.fullmatch(r"data_(\d+)\.npz", supplied_path.name)
+    if match:
+        fairvision_path = image_root / split / f"slo_fundus_{match.group(1)}.jpg"
+        if not check_exists or fairvision_path.is_file():
+            return fairvision_path
     candidates = [
         supplied_path if supplied_path.is_absolute() else image_root / supplied_path,
         image_root / split / supplied_path.name,
     ]
+    if not check_exists:
+        if supplied_path.is_absolute() or supplied_path.parent != Path("."):
+            return candidates[0]
+        return candidates[1]
     match = re.search(r"(\d+)$", supplied_path.stem)
     if match:
         candidates.append(image_root / split / f"slo_fundus_{match.group(1)}.jpg")

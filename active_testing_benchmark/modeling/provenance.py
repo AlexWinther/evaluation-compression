@@ -58,9 +58,11 @@ def build_dataset_provenance(
         if split not in records_by_split:
             continue
         label = str(row[target_column])
-        image_path = resolve_image_path(image_root, str(row[image_column]), split)
+        image_path = resolve_image_path(
+            image_root, str(row[image_column]), split, check_exists=False
+        )
         try:
-            image_reference = str(image_path.resolve().relative_to(image_root.resolve()))
+            image_reference = str(image_path.relative_to(image_root))
         except ValueError:
             image_reference = image_path.name
         records_by_split[split].append(

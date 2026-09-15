@@ -108,6 +108,13 @@ duplicate. To promote an older training run instead, add `--run-id <run-id>` (or
 `RUN_ID=<run-id>` when using `make mlflow-model-promote`). Load the curated model
 through `models:/fairvision-dr-cnn@baseline`.
 
+Training resolves FairVision metadata paths without eagerly probing every image,
+avoiding thousands of metadata operations on HPC shared filesystems. Add
+`--validate-images` when a complete preflight check is worth that startup cost.
+Startup messages identify device initialization, dataset indexing, and the first
+MLflow server connection separately. Use `--device cpu` to bypass CUDA discovery
+or `--device cuda` to require a working CUDA allocation instead of auto-detection.
+
 For another layout, pass `--metadata-path`, `--image-root`, `--image-column`,
 `--target-column`, and `--split-column`. Split values must be `training`,
 `validation`, and `test` (case-insensitive).

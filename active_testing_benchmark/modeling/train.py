@@ -49,16 +49,29 @@ MODEL_NAMES = ["cnn", "resnet18", "densenet121", "vit", "clip"]
 IMBALANCE_STRATEGIES = ["none", "weighted-sampling", "class-weighted-loss"]
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, device: torch.device) -> None:
     """Seed Python, NumPy, and PyTorch for repeatable experiment starts."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
 
-def selected_device() -> torch.device:
+def selected_device(requested: str = "auto") -> torch.device:
+    """Resolve an explicit device or automatically select the best available one."""
+    if requested not in {"auto", "cpu", "cuda", "mps"}:
+        raise ValueError("Device must be one of: auto, cpu, cuda, mps")
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA was requested but is not available")
+        return torch.device("cuda")
+    if requested == "mps":
+        if not torch.backends.mps.is_available():
+            raise ValueError("MPS was requested but is not available")
+        return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -159,6 +172,9 @@ def main(
     seed: int = typer.Option(42),
     num_workers: int = typer.Option(0, min=0),
     image_size: int = typer.Option(224, min=32),
+    device_preference: str = typer.Option(
+        "auto", "--device", help="Compute device: auto, cpu, cuda, or mps."
+    ),
     metadata_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI options as defaults.
         RAW_DATA_DIR / "fairvision/dr/metadata.csv"
     ),
@@ -170,6 +186,11 @@ def main(
         help="Disease identifier used in the registered model name; defaults to target-column.",
     ),
     split_column: str = typer.Option("use"),
+    validate_images: bool = typer.Option(
+        False,
+        "--validate-images/--no-validate-images",
+        help="Check every image path before training; slow on HPC shared filesystems.",
+    ),
     experiment_name: str = typer.Option("image-classification"),
     dataset_source: str = typer.Option(FAIRVISION_SOURCE),
     pretrained: bool = typer.Option(True, "--pretrained/--no-pretrained"),
@@ -189,14 +210,25 @@ def main(
         registry_name = fairvision_model_name(disease_type, model)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
+    typer.echo("Configuring MLflow...", err=True)
     configure_mlflow()
     metadata_path = metadata_path.resolve()
     image_root = (image_root or metadata_path.parent).resolve()
     if not metadata_path.is_file():
         raise typer.BadParameter(f"Metadata file does not exist: {metadata_path}")
 
-    set_seed(seed)
-    device = selected_device()
+    typer.echo("Initializing PyTorch compute device...", err=True)
+    try:
+        device = selected_device(device_preference)
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="--device") from error
+    set_seed(seed, device)
+    typer.echo(f"Selected device: {device}", err=True)
+    typer.echo(
+        "Indexing dataset splits"
+        + (" and validating image paths..." if validate_images else "..."),
+        err=True,
+    )
     class_to_index = class_mapping(metadata_path, target_column)
     classifier, train_transform = create_model_and_transform(
         model, len(class_to_index), pretrained, image_size
@@ -214,6 +246,7 @@ def main(
             split,
             class_to_index,
             train_transform if split == "training" else validation_transform,
+            validate_paths=validate_images,
         )
         for split in ("training", "validation", "test")
     }
@@ -251,6 +284,7 @@ def main(
         "seed": seed,
         "num_workers": num_workers,
         "image_size": image_size,
+        "device_preference": device_preference,
         "metadata_path": str(metadata_path),
         "image_root": str(image_root),
         "image_column": image_column,
@@ -258,6 +292,7 @@ def main(
         "disease_type": disease_type,
         "registry_name": registry_name,
         "split_column": split_column,
+        "validate_images": validate_images,
         "pretrained": pretrained,
         "imbalance_strategy": imbalance_strategy,
         "dataset_source": dataset_source,
@@ -270,6 +305,7 @@ def main(
     print(
         f"Validation samples: {len(datasets['validation'])}\nTest samples: {len(datasets['test'])}"
     )
+    typer.echo(f"Connecting to MLflow experiment {experiment_name!r}...", err=True)
     mlflow.set_experiment(experiment_name)
     provenance = build_dataset_provenance(
         metadata_path,
