@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 
+from loguru import logger
 import mlflow
 from mlflow.models import infer_signature
 import mlflow.pytorch
@@ -85,6 +86,7 @@ def run_epoch(
     loss_function: nn.Module,
     device: torch.device,
     optimizer: AdamW | None = None,
+    progress_label: str | None = None,
 ) -> tuple[float, float, list[int], list[float], list[int]]:
     """Train when an optimizer is supplied; otherwise evaluate."""
     is_training = optimizer is not None
@@ -93,9 +95,12 @@ def run_epoch(
     labels: list[int] = []
     positive_probabilities: list[float] = []
     predictions: list[int] = []
+    batch_count = len(loader)
+    progress_interval = max(1, (batch_count + 3) // 4)
+    started_at = time.monotonic()
     context = torch.enable_grad() if is_training else torch.no_grad()
     with context:
-        for images, targets in loader:
+        for batch_index, (images, targets) in enumerate(loader, start=1):
             images, targets = images.to(device), targets.to(device)
             if optimizer is not None:
                 optimizer.zero_grad()
@@ -112,6 +117,18 @@ def run_epoch(
             predictions.extend(batch_predictions.cpu().tolist())
             if outputs.shape[1] == 2:
                 positive_probabilities.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().tolist())
+            if progress_label and (
+                batch_index % progress_interval == 0 or batch_index == batch_count
+            ):
+                logger.info(
+                    "{}: {}/{} batches ({:.0f}%), {} samples, {:.1f}s elapsed",
+                    progress_label,
+                    batch_index,
+                    batch_count,
+                    100 * batch_index / batch_count,
+                    total,
+                    time.monotonic() - started_at,
+                )
     return total_loss / total, correct / total, labels, positive_probabilities, predictions
 
 
@@ -210,34 +227,37 @@ def main(
         registry_name = fairvision_model_name(disease_type, model)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
-    typer.echo("Configuring MLflow...", err=True)
+    logger.info("Configuring MLflow for registered model {}", registry_name)
     configure_mlflow()
     metadata_path = metadata_path.resolve()
     image_root = (image_root or metadata_path.parent).resolve()
     if not metadata_path.is_file():
         raise typer.BadParameter(f"Metadata file does not exist: {metadata_path}")
 
-    typer.echo("Initializing PyTorch compute device...", err=True)
+    logger.info("Initializing PyTorch compute device (requested={})", device_preference)
     try:
         device = selected_device(device_preference)
     except ValueError as error:
         raise typer.BadParameter(str(error), param_hint="--device") from error
     set_seed(seed, device)
-    typer.echo(f"Selected device: {device}", err=True)
-    typer.echo(
+    logger.info("Selected compute device: {}", device)
+    logger.info(
         "Indexing dataset splits"
-        + (" and validating image paths..." if validate_images else "..."),
-        err=True,
+        + (" and validating image paths" if validate_images else " without path validation")
     )
+    logger.info("Reading class mapping from {}", metadata_path)
     class_to_index = class_mapping(metadata_path, target_column)
+    logger.info("Creating {} classifier with {} output classes", model, len(class_to_index))
     classifier, train_transform = create_model_and_transform(
         model, len(class_to_index), pretrained, image_size
     )
     validation_transform = (
         train_transform if model == "clip" else torchvision_transform(image_size, training=False)
     )
-    datasets = {
-        split: ImageClassificationDataset(
+    datasets = {}
+    for split in ("training", "validation", "test"):
+        logger.info("Indexing {!r} split", split)
+        datasets[split] = ImageClassificationDataset(
             metadata_path,
             image_root,
             image_column,
@@ -248,8 +268,8 @@ def main(
             train_transform if split == "training" else validation_transform,
             validate_paths=validate_images,
         )
-        for split in ("training", "validation", "test")
-    }
+        logger.info("Indexed {!r} split: {} samples", split, len(datasets[split]))
+    logger.info("Creating data loaders with {} worker(s)", num_workers)
     loaders = {
         split: make_loader(
             dataset,
@@ -260,6 +280,7 @@ def main(
         )
         for split, dataset in datasets.items()
     }
+    logger.info("Moving model to {}", device)
     classifier.to(device)
     optimizer = AdamW((p for p in classifier.parameters() if p.requires_grad), lr=learning_rate)
     class_weights = (
@@ -298,15 +319,17 @@ def main(
         "dataset_source": dataset_source,
         "class_weights": class_weights.tolist() if class_weights is not None else None,
     }
-    print(
-        f"Model: {model}\nDevice: {device}\nImbalance strategy: {imbalance_strategy}"
-        f"\nTrain samples: {len(datasets['training'])}"
+    logger.info(
+        "Training setup ready: model={}, strategy={}, train={}, validation={}, test={}",
+        model,
+        imbalance_strategy,
+        len(datasets["training"]),
+        len(datasets["validation"]),
+        len(datasets["test"]),
     )
-    print(
-        f"Validation samples: {len(datasets['validation'])}\nTest samples: {len(datasets['test'])}"
-    )
-    typer.echo(f"Connecting to MLflow experiment {experiment_name!r}...", err=True)
+    logger.info("Connecting to MLflow experiment {!r}", experiment_name)
     mlflow.set_experiment(experiment_name)
+    logger.info("Building dataset provenance")
     provenance = build_dataset_provenance(
         metadata_path,
         image_root,
@@ -316,8 +339,11 @@ def main(
         class_to_index,
         dataset_source,
     )
+    logger.info("Dataset provenance ready: manifest SHA-256={}", provenance.manifest_digest)
     timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     with mlflow.start_run(run_name=f"{model}-seed-{seed}-{timestamp}") as run:
+        logger.info("Started MLflow run {}", run.info.run_id)
+        logger.info("Logging run tags, parameters, inputs, and provenance")
         mlflow.set_tags(
             {
                 **git_provenance(PROJ_ROOT),
@@ -361,22 +387,36 @@ def main(
             },
             "provenance.json",
         )
+        logger.info("Initial MLflow run metadata logged")
         best_validation_loss = float("inf")
         best_validation_accuracy = 0.0
         best_state: dict[str, torch.Tensor] | None = None
         for epoch in range(1, epochs + 1):
+            logger.info("Epoch {}/{}: starting training pass", epoch, epochs)
             train_loss, train_accuracy, train_labels, train_probabilities, train_predictions = (
                 run_epoch(
-                    classifier, loaders["training"], training_loss_function, device, optimizer
+                    classifier,
+                    loaders["training"],
+                    training_loss_function,
+                    device,
+                    optimizer,
+                    progress_label=f"Epoch {epoch}/{epochs} training",
                 )
             )
+            logger.info("Epoch {}/{}: starting validation pass", epoch, epochs)
             (
                 validation_loss,
                 validation_accuracy,
                 validation_labels,
                 validation_probabilities,
                 validation_predictions,
-            ) = run_epoch(classifier, loaders["validation"], validation_loss_function, device)
+            ) = run_epoch(
+                classifier,
+                loaders["validation"],
+                validation_loss_function,
+                device,
+                progress_label=f"Epoch {epoch}/{epochs} validation",
+            )
             train_metrics = classification_metrics(
                 train_labels, train_probabilities, train_predictions, len(class_to_index)
             )
@@ -386,16 +426,23 @@ def main(
                 validation_predictions,
                 len(class_to_index),
             )
-            print(f"\nEpoch {epoch}/{epochs}")
-            print(
-                f"Train loss: {train_loss:.4f} | Train accuracy: {train_accuracy:.4f}"
-                f" | Train macro-F1: {train_metrics['macro_f1']:.4f}"
-                + _roc_auc_report(train_metrics, "Train")
+            logger.info(
+                "Epoch {}/{} train: loss={:.4f}, accuracy={:.4f}, macro-F1={:.4f}{}",
+                epoch,
+                epochs,
+                train_loss,
+                train_accuracy,
+                train_metrics["macro_f1"],
+                _roc_auc_report(train_metrics, "train"),
             )
-            print(
-                f"Val loss:   {validation_loss:.4f} | Val accuracy:   {validation_accuracy:.4f}"
-                f" | Val macro-F1:   {validation_metrics['macro_f1']:.4f}"
-                + _roc_auc_report(validation_metrics, "Val")
+            logger.info(
+                "Epoch {}/{} validation: loss={:.4f}, accuracy={:.4f}, macro-F1={:.4f}{}",
+                epoch,
+                epochs,
+                validation_loss,
+                validation_accuracy,
+                validation_metrics["macro_f1"],
+                _roc_auc_report(validation_metrics, "validation"),
             )
             mlflow.log_metrics(
                 {
@@ -424,11 +471,22 @@ def main(
                     validation_accuracy,
                 )
                 best_state = deepcopy(classifier.state_dict())
+                logger.info(
+                    "Epoch {}/{}: retained new best model (validation loss={:.4f})",
+                    epoch,
+                    epochs,
+                    validation_loss,
+                )
         if best_state is None:  # pragma: no cover - epochs is validated as positive
             raise RuntimeError("Training completed without producing a model state")
+        logger.info("Restoring best-validation model and starting test pass")
         classifier.load_state_dict(best_state)
         test_loss, test_accuracy, test_labels, test_probabilities, test_predictions = run_epoch(
-            classifier, loaders["test"], evaluation_loss_function, device
+            classifier,
+            loaders["test"],
+            evaluation_loss_function,
+            device,
+            progress_label="Test",
         )
         final_metrics = {
             "test_loss": test_loss,
@@ -443,11 +501,15 @@ def main(
             },
         }
         mlflow.log_metrics(final_metrics)
+        logger.info(
+            "Test metrics logged to MLflow: loss={:.4f}, accuracy={:.4f}", test_loss, test_accuracy
+        )
         input_example = torch.zeros((1, 3, image_size, image_size), dtype=torch.float32)
         classifier.eval()
         with torch.no_grad():
             output_example = classifier(input_example.to(device)).cpu().numpy()
         with tempfile.TemporaryDirectory(prefix="fairvision-mlflow-") as temporary_directory:
+            logger.info("Preparing final model artifacts for MLflow upload")
             artifact_dir = Path(temporary_directory)
             config_path = artifact_dir / f"{model}_config.json"
             mapping_path = artifact_dir / f"{model}_classes.json"
@@ -470,6 +532,7 @@ def main(
                 extra_files=[str(config_path), str(mapping_path)],
                 serialization_format="pickle",
             )
+        logger.info("Model artifact uploaded; registering {}", registry_name)
         version = register_trained_model(
             model_info.model_uri,
             registry_name,
@@ -479,15 +542,21 @@ def main(
             model,
             final_metrics,
         )
-    print(f"\nRegistered model: models:/{registry_name}/latest (version {version})")
-    print(f"Test loss: {test_loss:.4f} | Test accuracy: {test_accuracy:.4f}")
+        logger.info("Registered {} version {}", registry_name, version)
+    logger.success(
+        "Training complete: models:/{}/latest (version {}), test loss={:.4f}, accuracy={:.4f}",
+        registry_name,
+        version,
+        test_loss,
+        test_accuracy,
+    )
     if "test_roc_auc" in final_metrics:
-        print(f"Test ROC-AUC: {final_metrics['test_roc_auc']:.4f}")
+        logger.info("Test ROC-AUC: {:.4f}", final_metrics["test_roc_auc"])
 
 
 def _roc_auc_report(metrics: dict[str, float], split: str) -> str:
     """Format ROC-AUC only for binary splits containing both classes."""
-    return f" | {split} ROC-AUC: {metrics['roc_auc']:.4f}" if "roc_auc" in metrics else ""
+    return f", {split} ROC-AUC={metrics['roc_auc']:.4f}" if "roc_auc" in metrics else ""
 
 
 if __name__ == "__main__":
