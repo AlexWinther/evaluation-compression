@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Cluster resource viewer — shows free GPUs, CPU, RAM, and walltime."""
+
+import argparse
+import subprocess
+from datetime import datetime
+
+
+def scontrol_nodes():
+    result = subprocess.run(
+        ["scontrol", "-o", "show", "node"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    nodes = {}
+    for line in result.stdout.splitlines():
+        node = {}
+        for token in line.split():
+            if "=" in token:
+                k, _, v = token.partition("=")
+                node[k] = v
+        if "NodeName" in node:
+            nodes[node["NodeName"]] = node
+    return nodes
+
+
+def parse_tres_gpus(tres):
+    """Parse gres/gpu:type=count entries from a TRES string."""
+    gpus = {}
+    for part in tres.split(","):
+        if not part.startswith("gres/gpu:"):
+            continue
+        rest = part[len("gres/gpu:") :]
+        if "=" not in rest:
+            continue
+        gpu_type, _, count_str = rest.partition("=")
+        try:
+            gpus[gpu_type] = int(count_str)
+        except ValueError:
+            pass
+    return gpus
+
+
+def pending_node_starts():
+    """Map node name -> earliest pending job start (epoch seconds)."""
+    result = subprocess.run(
+        ["squeue", "--noheader", "--states=PENDING", "--format=%S|%D|%N"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    node_min_start = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 3:
+            continue
+        start_str, sched_nodes = parts[0], parts[2]
+        if start_str in ("N/A", "") or not sched_nodes or sched_nodes == "(null)":
+            continue
+        try:
+            start_epoch = int(datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%S").timestamp())
+        except ValueError:
+            continue
+        exp = subprocess.run(
+            ["scontrol", "show", "hostnames", sched_nodes],
+            capture_output=True,
+            text=True,
+        )
+        for node in exp.stdout.splitlines():
+            node = node.strip()
+            if not node:
+                continue
+            if node not in node_min_start or start_epoch < node_min_start[node]:
+                node_min_start[node] = start_epoch
+    return node_min_start
+
+
+def format_walltime(min_start, now):
+    if min_start is None:
+        return "IDLE"
+    remaining = min_start - now - 300
+    if remaining <= 0:
+        return "SOON"
+    h = remaining // 3600
+    m = (remaining % 3600) // 60
+    s = remaining % 60
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+ANSI = {
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "white": "\033[37m",
+}
+_RESET = "\033[0m"
+
+
+def style(text, attrs=None, width=None, align="^"):
+    all_attrs = ["bold"] + [a for a in (attrs or []) if a != "bold"]
+    styled = "".join(ANSI[a] for a in all_attrs) + text + _RESET
+    if width is None:
+        return styled
+    pad = width - len(text)
+    if align == "^":
+        left = pad // 2
+        right = pad - left
+        return " " * left + styled + " " * right
+    return styled + " " * pad if align == "<" else " " * pad + styled
+
+
+_STATE_COLORS = {"IDLE": "green", "MIXED": "yellow", "ALLOC": "red", "DRAIN": "red"}
+
+
+def fmt_state(state, width=10):
+    color = _STATE_COLORS.get(state)
+    attrs = [color, "bold"] if color else ["bold"]
+    return style(state, attrs=attrs, width=width)
+
+
+def fmt_count(n, width, thresholds=((16, "red"), (32, "yellow"))):
+    for threshold, color in thresholds:
+        if n < threshold:
+            return style(str(n), attrs=[color], width=width)
+    return style(str(n), attrs=["green"], width=width)
+
+
+def fmt_free_gpus(count, width=11):
+    if count > 0:
+        return style(str(count), attrs=["green"], width=width)
+    return style(str(count), width=width)
+
+
+def fmt_gpu_str(gpu_str, has_free, width=28):
+    text = gpu_str[:width]
+    if not has_free and text != "-":
+        return style(text, attrs=["dim"], width=width)
+    return style(text, width=width)
+
+
+def fmt_walltime(walltime, width=9):
+    text = walltime[:width]
+    if text == "IDLE":
+        return style(text, attrs=["green"], width=width)
+    if text == "SOON":
+        return style(text, attrs=["red", "bold"], width=width)
+    return style(text, attrs=["yellow"], width=width)
+
+
+# DGX Spark nodes carry a GB10 Superchip GPU that Slurm has no Gres entry for
+# (Gres=(null), CfgTRES has no gres/gpu:*), so they're invisible to
+# parse_tres_gpus. Hardcode them here until Slurm is configured with a gpu
+# Gres for these nodes.
+DGX_SPARK_NODES = {
+    "dgx1": ("GB10", 1),
+    "asus1": ("GB10", 1),
+    "asus2": ("GB10", 1),
+}
+
+
+def is_broken(state):
+    broken = {"DOWN", "DOWN*", "FAIL", "INVAL", "FUTURE"}
+    return any(s in state for s in broken) or ("UNKNOWN" in state and "NOT_RESPONDING" in state)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Show free cluster resources")
+    parser.add_argument("--all", "-A", action="store_true", help="Include CPU-only nodes")
+    parser.add_argument(
+        "--all-states", "-a", action="store_true", help="Include nodes in any state"
+    )
+    args = parser.parse_args()
+
+    nodes = scontrol_nodes()
+    node_starts = pending_node_starts()
+    now = int(datetime.now().timestamp())
+
+    rows = []
+    for name, node in sorted(nodes.items()):
+        state = node.get("State", "")
+        if not args.all_states and (is_broken(state) or "DRAIN" in state or "RESERVED" in state):
+            continue
+
+        total_cpu = int(node.get("CPUTot", 0))
+        free_cpu = total_cpu - int(node.get("CPUAlloc", 0))
+        total_mem_gb = int(node.get("RealMemory", 0)) // 1000
+        free_mem_gb = (int(node.get("RealMemory", 0)) - int(node.get("AllocMem", 0))) // 1000
+
+        features = node.get("AvailableFeatures", "")
+        if "nogpu" in features.split(",") and not args.all:
+            continue
+
+        all_gpus = parse_tres_gpus(node.get("CfgTRES", ""))
+        used_gpus = parse_tres_gpus(node.get("AllocTRES", ""))
+        free_gpus = {
+            t: all_gpus[t] - used_gpus.get(t, 0)
+            for t in all_gpus
+            if all_gpus[t] - used_gpus.get(t, 0) > 0
+        }
+
+        if not all_gpus and name in DGX_SPARK_NODES:
+            gpu_type, gpu_count = DGX_SPARK_NODES[name]
+            all_gpus = {gpu_type: gpu_count}
+            # No Gres means Slurm can't tell us GPU allocation directly, so
+            # fall back to whole-node state: free only when fully IDLE.
+            free_gpus = all_gpus if state.split("+")[0] == "IDLE" else {}
+
+        if not free_gpus and not args.all and not (args.all_states and all_gpus):
+            continue
+        if not args.all_states and free_cpu < 1 and free_mem_gb < 1:
+            continue
+
+        if free_gpus:
+            gpu_str = ", ".join(f"{t} x{n}" for t, n in free_gpus.items())
+        elif all_gpus:
+            gpu_str = ", ".join(f"{t} x0" for t in all_gpus)
+        else:
+            gpu_str = "-"
+        partitions = node.get("Partitions", "")
+        rows.append(
+            {
+                "node": name,
+                "gpu_str": gpu_str,
+                "free_gpus": free_gpus,
+                "all_gpus": all_gpus,
+                "free_cpu": free_cpu,
+                "total_cpu": total_cpu,
+                "free_mem_gb": free_mem_gb,
+                "total_mem_gb": total_mem_gb,
+                "walltime": format_walltime(node_starts.get(name), now),
+                "state": "DRAIN" if "DRAIN" in state else state.split("+")[0],
+                "partitions": partitions,
+                "has_gpu": bool(free_gpus),
+            }
+        )
+
+    rows.sort(
+        key=lambda r: (
+            not r["has_gpu"],
+            not bool(r["all_gpus"]),
+            -sum(r["free_gpus"].values()),
+            r["node"],
+        )
+    )
+
+    sep = "+-----------+------------+---------------+------------+-------------+------------------------------+-----------+--------------------------------+"
+    print(sep)
+    print(
+        "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            style("Node", attrs=["bold"], width=9, align="<"),
+            style("Free Cores", attrs=["bold"], width=10),
+            style("Free RAM (GB)", attrs=["bold"], width=13),
+            style("Status", attrs=["bold"], width=10),
+            style("Free GPU(s)", attrs=["bold"], width=11),
+            style("GPU name(s)", attrs=["bold"], width=28),
+            style("Walltime", attrs=["bold"], width=9),
+            style("Partitions", attrs=["bold"], width=30),
+        )
+    )
+    print(sep)
+    prev_has_gpu_hw = None
+    for r in rows:
+        has_gpu_hw = bool(r["all_gpus"])
+        if prev_has_gpu_hw is True and not has_gpu_hw:
+            print(sep)
+            print(
+                "| {:9} | {:^10} | {:^13} | {:^10} | {:^11} | {} | {:^9} | {:^30} |".format(
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    style("CPU ONLY", attrs=["bold"], width=28),
+                    "",
+                    "",
+                )
+            )
+            print(sep)
+        prev_has_gpu_hw = has_gpu_hw
+        total_free = sum(r["free_gpus"].values()) if r["free_gpus"] else 0
+        print(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                style(r["node"], width=9, align="<"),
+                fmt_count(r["free_cpu"], width=10),
+                fmt_count(r["free_mem_gb"], width=13),
+                fmt_state(r["state"]),
+                fmt_free_gpus(total_free),
+                fmt_gpu_str(r["gpu_str"], r["has_gpu"]),
+                fmt_walltime(r["walltime"]),
+                style(r["partitions"][:30], width=30),
+            )
+        )
+    print(sep)
+
+
+if __name__ == "__main__":
+    main()
