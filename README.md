@@ -59,7 +59,8 @@ reports macro-F1 and, for binary splits containing both classes, ROC-AUC.
 `cnn` starts from scratch. Torchvision models use ImageNet weights; CLIP uses a
 frozen OpenCLIP ViT-B/32 encoder with a trainable classification head. Pass
 `--no-pretrained` to avoid weight downloads. Each run records metrics,
-checkpoint, configuration, classes, and test confusion matrix in MLflow.
+configuration, classes, test confusion matrix, and the best-validation model in
+the remote MLflow server. Training does not persist a local checkpoint.
 
 For normal laptop development, copy `.env.example` to the ignored `.env`, replace
 the credential placeholders, and restrict its permissions:
@@ -80,25 +81,32 @@ scheduler command history. Confirm compute nodes can resolve the MLflow hostname
 and make outbound HTTPS connections before starting long jobs.
 
 The remote UI is available at `https://mlflow.alwn.dev` using the same Basic Auth
-credentials. `make mlflow-ui` is retained only for explicitly local or archived
-SQLite stores; local training must opt in with an explicit URI such as
-`MLFLOW_TRACKING_URI=sqlite:///mlflow.db`.
+credentials.
 
 Each run records sanitized dataset lineage for the training, validation, and test
 splits: FairVision source, metadata checksum, selected-record manifest checksum,
 schema, and aggregate split counts. It never uploads raw images or metadata rows.
 The native MLflow model artifact includes a tensor signature, representative input,
-configuration, and class mapping. To promote a manually reviewed run to a curated
-baseline, use:
+configuration, and class mapping. A completed training run is automatically
+registered as `fairvision-{disease-type}-{model-type}`. MLflow reserves the alias
+name `latest`, so its native latest-version selector is used. For example, the
+default DR CNN is available at `models:/fairvision-dr-cnn/latest`. Pass
+`--disease-type` when the target column is not the desired disease identifier.
+Project commands also accept `fairvision-dr-cnn@latest` as shorthand and convert
+it to MLflow's native selector.
+
+After reviewing a run, promote its latest version to the curated
+`baseline` alias with:
 
 ```bash
 uv run python -m active_testing_benchmark.modeling.registry \
-  --run-id <run-id> \
-  --registry-name fairvision-dr-image-classifier
+  --registry-name fairvision-dr-cnn
 ```
 
-This creates a model version and moves the `baseline` alias. Load that selected
-baseline through `models:/fairvision-dr-image-classifier@baseline`.
+This moves `@baseline` to the latest registered version without creating a
+duplicate. To promote an older training run instead, add `--run-id <run-id>` (or
+`RUN_ID=<run-id>` when using `make mlflow-model-promote`). Load the curated model
+through `models:/fairvision-dr-cnn@baseline`.
 
 For another layout, pass `--metadata-path`, `--image-root`, `--image-column`,
 `--target-column`, and `--split-column`. Split values must be `training`,
@@ -112,12 +120,12 @@ radt`) without affecting normal MLflow training.
 ## Offline active-testing experiment
 
 Compare random test subsets against full-test metrics for one or more saved
-models. Registry names default to the `baseline` alias; use `name@alias` for
+models. Bare registry names default to MLflow's `/latest` selector; use `name@alias` for
 another alias, or `run:<run-id>` / `runs:/<run-id>/model` for a training run:
 
 ```bash
 uv run python -m active_testing_benchmark.active_testing \
-  --model fairvision-dr-image-classifier@baseline \
+  --model fairvision-dr-cnn@baseline \
   --model run:<run-id> \
   --test-size 25 --test-size 0.1 --test-size 1.0 \
   --runs 5 --seed 42

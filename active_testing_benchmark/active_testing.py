@@ -27,7 +27,7 @@ from active_testing_benchmark.config import RAW_DATA_DIR, REPORTS_DIR
 from active_testing_benchmark.modeling.data import ImageClassificationDataset
 from active_testing_benchmark.modeling.models import torchvision_transform
 from active_testing_benchmark.modeling.provenance import FAIRVISION_SOURCE
-from active_testing_benchmark.modeling.registry import configure_mlflow
+from active_testing_benchmark.modeling.registry import configure_mlflow, latest_model_version
 
 app = typer.Typer(add_completion=False, help=__doc__)
 
@@ -212,7 +212,7 @@ def evaluate_subsets(
 
 
 def normalize_model_source(source: str) -> str:
-    """Bare registry names default to @baseline; run IDs use explicit run: syntax."""
+    """Bare registry names use MLflow's native latest-version selector."""
     source = source.strip()
     if source.startswith("runs:/"):
         if not re.fullmatch(r"runs:/[^/]+/model", source):
@@ -224,9 +224,15 @@ def normalize_model_source(source: str) -> str:
             raise ValueError("Expected run:<run-id>")
         return f"runs:/{run_id}/model"
     name = source.removeprefix("models:/")
+    if name.endswith("@latest"):
+        name = name.removesuffix("@latest")
+        if re.fullmatch(r"[^/@:\s]+", name):
+            return f"models:/{name}/latest"
+    if re.fullmatch(r"[^/@:\s]+/(?:latest|[1-9][0-9]*)", name):
+        return f"models:/{name}"
     if not re.fullmatch(r"[^/@:\s]+(?:@[^/@:\s]+)?", name):
         raise ValueError("Expected registry-name[@alias] or run:<run-id>")
-    return f"models:/{name}" + ("@baseline" if "@" not in name else "")
+    return f"models:/{name}" + ("/latest" if "@" not in name else "")
 
 
 def infer_model(
@@ -243,9 +249,15 @@ def infer_model(
     # Resolve the movable alias once, recording the immutable version used.
     resolved = source
     if source.startswith("models:/"):
-        name, alias = source[len("models:/") :].split("@")
-        version = mlflow.MlflowClient().get_model_version_by_alias(name, alias)
-        resolved = f"models:/{name}/{version.version}"
+        model_reference = source[len("models:/") :]
+        if "@" in model_reference:
+            name, alias = model_reference.split("@")
+            version = mlflow.MlflowClient().get_model_version_by_alias(name, alias)
+            resolved = f"models:/{name}/{version.version}"
+        elif model_reference.endswith("/latest"):
+            name = model_reference.removesuffix("/latest")
+            version = latest_model_version(name)
+            resolved = f"models:/{name}/{version.version}"
     local = Path(mlflow.artifacts.download_artifacts(artifact_uri=resolved))
     configs = list(local.glob("extra_files/*_config.json"))
     mappings = list(local.glob("extra_files/*_classes.json"))

@@ -6,7 +6,7 @@ import pandas as pd
 from PIL import Image
 
 from active_testing_benchmark.modeling.provenance import build_dataset_provenance
-from active_testing_benchmark.modeling.registry import register_baseline
+from active_testing_benchmark.modeling.registry import latest_model_version
 from active_testing_benchmark.modeling.train import main as train
 
 
@@ -69,8 +69,8 @@ def test_training_logs_dataset_inputs_and_reloadable_model(tmp_path: Path, monke
         image_root=image_root,
         image_column="image",
         target_column="label",
+        disease_type="label",
         split_column="split",
-        output_dir=tmp_path / "models",
         experiment_name=experiment_name,
         pretrained=False,
         imbalance_strategy="none",
@@ -89,11 +89,12 @@ def test_training_logs_dataset_inputs_and_reloadable_model(tmp_path: Path, monke
         "test",
     }
     assert logged_run.data.tags["dataset.manifest.sha256"]
-    loaded_model = mlflow.pytorch.load_model(f"runs:/{run_id}/model")
+    loaded_model = mlflow.pytorch.load_model("models:/fairvision-label-cnn/latest")
     assert loaded_model is not None
-    version = register_baseline(run_id, "tiny-image-classifier")
-    selected = mlflow.MlflowClient().get_model_version_by_alias("tiny-image-classifier", "baseline")
-    assert selected.version == version
+    selected = latest_model_version("fairvision-label-cnn")
+    assert selected.run_id == run_id
+    assert selected.tags["disease.type"] == "label"
+    assert selected.tags["model.type"] == "cnn"
 
 
 def _write_dataset(tmp_path: Path) -> tuple[Path, Path]:

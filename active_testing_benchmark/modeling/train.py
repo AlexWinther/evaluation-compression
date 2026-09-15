@@ -2,25 +2,26 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+from pathlib import Path
 import random
 import sys
+import tempfile
 import time
-from pathlib import Path
 
 import mlflow
+from mlflow.models import infer_signature
 import mlflow.pytorch
 import numpy as np
-import torch
-import typer
-from mlflow.models import infer_signature
 from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
+import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, WeightedRandomSampler
+import typer
 
 from active_testing_benchmark.config import (
-    MODELS_DIR,
     PROJ_ROOT,
     RAW_DATA_DIR,
 )
@@ -37,7 +38,11 @@ from active_testing_benchmark.modeling.provenance import (
     build_dataset_provenance,
     git_provenance,
 )
-from active_testing_benchmark.modeling.registry import configure_mlflow
+from active_testing_benchmark.modeling.registry import (
+    configure_mlflow,
+    fairvision_model_name,
+    register_trained_model,
+)
 
 app = typer.Typer(add_completion=False, help=__doc__)
 MODEL_NAMES = ["cnn", "resnet18", "densenet121", "vit", "clip"]
@@ -160,8 +165,11 @@ def main(
     image_root: Path | None = typer.Option(None),  # noqa: B008 - Typer CLI option default.
     image_column: str = typer.Option("filename"),
     target_column: str = typer.Option("dr"),
+    disease_type: str | None = typer.Option(
+        None,
+        help="Disease identifier used in the registered model name; defaults to target-column.",
+    ),
     split_column: str = typer.Option("use"),
-    output_dir: Path = typer.Option(MODELS_DIR),  # noqa: B008 - Typer CLI option default.
     experiment_name: str = typer.Option("image-classification"),
     dataset_source: str = typer.Option(FAIRVISION_SOURCE),
     pretrained: bool = typer.Option(True, "--pretrained/--no-pretrained"),
@@ -176,6 +184,11 @@ def main(
         raise typer.BadParameter("torchvision vit_b_16 currently requires --image-size 224")
     if imbalance_strategy not in IMBALANCE_STRATEGIES:
         raise typer.BadParameter(f"Choose one of: {', '.join(IMBALANCE_STRATEGIES)}")
+    disease_type = disease_type or target_column
+    try:
+        registry_name = fairvision_model_name(disease_type, model)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
     configure_mlflow()
     metadata_path = metadata_path.resolve()
     image_root = (image_root or metadata_path.parent).resolve()
@@ -230,8 +243,6 @@ def main(
         if imbalance_strategy == "class-weighted-loss"
         else evaluation_loss_function
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / f"{model}_best.pt"
     config = {
         "model": model,
         "batch_size": batch_size,
@@ -244,17 +255,14 @@ def main(
         "image_root": str(image_root),
         "image_column": image_column,
         "target_column": target_column,
+        "disease_type": disease_type,
+        "registry_name": registry_name,
         "split_column": split_column,
         "pretrained": pretrained,
         "imbalance_strategy": imbalance_strategy,
         "dataset_source": dataset_source,
         "class_weights": class_weights.tolist() if class_weights is not None else None,
     }
-    config_path = output_dir / f"{model}_config.json"
-    mapping_path = output_dir / f"{model}_classes.json"
-    config_path.write_text(json.dumps(config, indent=2) + "\n")
-    mapping_path.write_text(json.dumps(class_to_index, indent=2) + "\n")
-
     print(
         f"Model: {model}\nDevice: {device}\nImbalance strategy: {imbalance_strategy}"
         f"\nTrain samples: {len(datasets['training'])}"
@@ -273,7 +281,7 @@ def main(
         dataset_source,
     )
     timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-    with mlflow.start_run(run_name=f"{model}-seed-{seed}-{timestamp}"):
+    with mlflow.start_run(run_name=f"{model}-seed-{seed}-{timestamp}") as run:
         mlflow.set_tags(
             {
                 **git_provenance(PROJ_ROOT),
@@ -281,6 +289,8 @@ def main(
                 "dataset.metadata.sha256": provenance.metadata_digest,
                 "dataset.manifest.sha256": provenance.manifest_digest,
                 "model.family": model,
+                "model.registered_name": registry_name,
+                "disease.type": disease_type,
                 "training.seed": str(seed),
                 "runtime.python": sys.version.split()[0],
                 "runtime.mlflow": mlflow.__version__,
@@ -300,8 +310,8 @@ def main(
                 "test_samples": len(datasets["test"]),
             }
         )
-        mlflow.log_artifact(str(config_path))
-        mlflow.log_artifact(str(mapping_path))
+        mlflow.log_dict(config, "training_config.json")
+        mlflow.log_dict(class_to_index, "class_mapping.json")
         mlflow.log_artifact(str(PROJ_ROOT / "uv.lock"))
         mlflow.log_dict(
             {
@@ -317,6 +327,7 @@ def main(
         )
         best_validation_loss = float("inf")
         best_validation_accuracy = 0.0
+        best_state: dict[str, torch.Tensor] | None = None
         for epoch in range(1, epochs + 1):
             train_loss, train_accuracy, train_labels, train_probabilities, train_predictions = (
                 run_epoch(
@@ -376,16 +387,10 @@ def main(
                     validation_loss,
                     validation_accuracy,
                 )
-                torch.save(
-                    {
-                        "model_state_dict": classifier.state_dict(),
-                        "class_to_index": class_to_index,
-                        "config": config,
-                    },
-                    checkpoint_path,
-                )
-        state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-        classifier.load_state_dict(state["model_state_dict"])
+                best_state = deepcopy(classifier.state_dict())
+        if best_state is None:  # pragma: no cover - epochs is validated as positive
+            raise RuntimeError("Training completed without producing a model state")
+        classifier.load_state_dict(best_state)
         test_loss, test_accuracy, test_labels, test_probabilities, test_predictions = run_epoch(
             classifier, loaders["test"], evaluation_loss_function, device
         )
@@ -402,26 +407,43 @@ def main(
             },
         }
         mlflow.log_metrics(final_metrics)
-        matrix_path = output_dir / f"{model}_test_confusion_matrix.csv"
-        np.savetxt(
-            matrix_path, confusion_matrix(test_labels, test_predictions), delimiter=",", fmt="%d"
-        )
-        for artifact in (checkpoint_path, matrix_path):
-            mlflow.log_artifact(str(artifact))
         input_example = torch.zeros((1, 3, image_size, image_size), dtype=torch.float32)
         classifier.eval()
         with torch.no_grad():
             output_example = classifier(input_example.to(device)).cpu().numpy()
-        mlflow.pytorch.log_model(
-            classifier,
-            name="model",
-            signature=infer_signature(input_example.numpy(), output_example),
-            input_example=input_example.numpy(),
-            code_paths=[str(PROJ_ROOT / "active_testing_benchmark")],
-            extra_files=[str(config_path), str(mapping_path)],
-            serialization_format="pickle",
+        with tempfile.TemporaryDirectory(prefix="fairvision-mlflow-") as temporary_directory:
+            artifact_dir = Path(temporary_directory)
+            config_path = artifact_dir / f"{model}_config.json"
+            mapping_path = artifact_dir / f"{model}_classes.json"
+            matrix_path = artifact_dir / f"{model}_test_confusion_matrix.csv"
+            config_path.write_text(json.dumps(config, indent=2) + "\n")
+            mapping_path.write_text(json.dumps(class_to_index, indent=2) + "\n")
+            np.savetxt(
+                matrix_path,
+                confusion_matrix(test_labels, test_predictions),
+                delimiter=",",
+                fmt="%d",
+            )
+            mlflow.log_artifact(str(matrix_path))
+            model_info = mlflow.pytorch.log_model(
+                classifier,
+                name="model",
+                signature=infer_signature(input_example.numpy(), output_example),
+                input_example=input_example.numpy(),
+                code_paths=[str(PROJ_ROOT / "active_testing_benchmark")],
+                extra_files=[str(config_path), str(mapping_path)],
+                serialization_format="pickle",
+            )
+        version = register_trained_model(
+            model_info.model_uri,
+            registry_name,
+            run.info.run_id,
+            run.info.experiment_id,
+            disease_type,
+            model,
+            final_metrics,
         )
-    print(f"\nBest checkpoint: {checkpoint_path}")
+    print(f"\nRegistered model: models:/{registry_name}/latest (version {version})")
     print(f"Test loss: {test_loss:.4f} | Test accuracy: {test_accuracy:.4f}")
     if "test_roc_auc" in final_metrics:
         print(f"Test ROC-AUC: {final_metrics['test_roc_auc']:.4f}")

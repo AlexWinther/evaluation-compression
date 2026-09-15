@@ -67,7 +67,7 @@ fairvision-metadata: requirements
 .PHONY: train
 train: requirements
 	uv run python -m active_testing_benchmark.modeling.train \
-		--model $(or $(MODEL),resnet18) \
+		--model $(or $(MODEL),cnn) \
 		--epochs $(or $(EPOCHS),5) \
 		--batch-size $(or $(BATCH_SIZE),32) \
 		--learning-rate $(or $(LEARNING_RATE),1e-4) \
@@ -85,20 +85,11 @@ active-testing: requirements
 active-testing-plot: requirements
 	uv run python -m active_testing_benchmark.plots $(EXPERIMENT_DIR) $(ACTIVE_TESTING_PLOT_FLAGS)
 
-## Start the legacy local/archive MLflow UI using the project SQLite database
-.PHONY: mlflow-ui
-mlflow-ui: requirements
-	@echo "Local/archive MLflow only; normal work uses https://mlflow.alwn.dev"
-	uv run mlflow db upgrade sqlite:///mlflow.db
-	uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
-
-## Promote a model to the "Baseline" tag
+## Promote a registered model's latest version to @baseline after review
 .PHONY: mlflow-model-promote
 mlflow-model-promote: requirements
-	@test -n "$(RUN_ID)" || (echo "Set RUN_ID, e.g. make mlflow-model-promote RUN_ID=1234567890abcdef" && exit 2)
-	uv run python -m active_testing_benchmark.modeling.registry \
-    --run-id $(RUN_ID) \
-    --registry-name $(or $(REGISTRY_NAME),fairvision-dr-image-classifier) \
+	@test -n "$(REGISTRY_NAME)" || (echo "Set REGISTRY_NAME, e.g. make mlflow-model-promote REGISTRY_NAME=fairvision-dr-cnn" && exit 2)
+	uv run python -m active_testing_benchmark.modeling.registry --registry-name $(REGISTRY_NAME) $(if $(RUN_ID),--run-id $(RUN_ID),)
 
 #################################################################################
 # Self Documenting Commands                                                     #

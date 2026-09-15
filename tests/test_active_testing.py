@@ -108,9 +108,11 @@ def test_callable_contract_and_label_isolation():
 @pytest.mark.parametrize(
     "source,expected",
     [
-        ("classifier", "models:/classifier@baseline"),
+        ("classifier", "models:/classifier/latest"),
+        ("classifier@latest", "models:/classifier/latest"),
         ("classifier@reviewed", "models:/classifier@reviewed"),
         ("models:/classifier@baseline", "models:/classifier@baseline"),
+        ("models:/classifier/latest", "models:/classifier/latest"),
         ("run:abc", "runs:/abc/model"),
         ("runs:/abc/model", "runs:/abc/model"),
     ],

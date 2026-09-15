@@ -1,29 +1,25 @@
-from pathlib import Path
-
 from loguru import logger
-from tqdm import tqdm
+import mlflow.pytorch
 import typer
 
-from active_testing_benchmark.config import MODELS_DIR, PROCESSED_DATA_DIR
+from active_testing_benchmark.active_testing import normalize_model_source
+from active_testing_benchmark.modeling.registry import configure_mlflow
 
 app = typer.Typer()
 
 
 @app.command()
 def main(
-    # ---- REPLACE DEFAULT PATHS AS APPROPRIATE ----
-    features_path: Path = PROCESSED_DATA_DIR / "test_features.csv",
-    model_path: Path = MODELS_DIR / "model.pkl",
-    predictions_path: Path = PROCESSED_DATA_DIR / "test_predictions.csv",
-    # -----------------------------------------
+    model: str = typer.Option(
+        "fairvision-dr-cnn", help="Registered model name, optionally with an alias."
+    ),
 ):
-    # ---- REPLACE THIS WITH YOUR OWN CODE ----
-    logger.info("Performing inference for model...")
-    for i in tqdm(range(10), total=10):
-        if i == 5:
-            logger.info("Something happened for iteration 5.")
-    logger.success("Inference complete.")
-    # -----------------------------------------
+    """Load a model from the configured MLflow server for use by inference code."""
+    configure_mlflow()
+    model_uri = normalize_model_source(model)
+    logger.info(f"Loading model from {model_uri}")
+    mlflow.pytorch.load_model(model_uri, map_location="cpu")
+    logger.success("Model loaded from MLflow.")
 
 
 if __name__ == "__main__":
