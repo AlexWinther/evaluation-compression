@@ -11,7 +11,7 @@ app = typer.Typer()
 @app.command()
 def main(
     model: str = typer.Option(
-        "fairvision-dr-cnn", help="Registered model name, optionally with an alias."
+        "fairvision-dr-resnet18", help="Registered model name, optionally with an alias."
     ),
 ):
     """Load a model from the configured MLflow server for use by inference code."""

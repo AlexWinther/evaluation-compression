@@ -37,15 +37,11 @@ and `test` splits. The default command reads
 `data_09382.npz` to `test/slo_fundus_09382.jpg`, and uses `dr` as the binary
 target. Raw images are never copied or changed.
 
-Install dependencies once with `make requirements`, then run one model per
-experiment (the first pretrained run downloads published weights):
+Install dependencies once with `make requirements`, then train ResNet-18 (the
+first pretrained run downloads published weights):
 
 ```bash
-uv run python -m active_testing_benchmark.modeling.train --model cnn --epochs 5 --batch-size 32 --learning-rate 1e-4
 uv run python -m active_testing_benchmark.modeling.train --model resnet18 --epochs 5 --batch-size 32 --learning-rate 1e-4
-uv run python -m active_testing_benchmark.modeling.train --model densenet121 --epochs 5 --batch-size 32 --learning-rate 1e-4
-uv run python -m active_testing_benchmark.modeling.train --model vit --epochs 5 --batch-size 32 --learning-rate 1e-4
-uv run python -m active_testing_benchmark.modeling.train --model clip --epochs 5 --batch-size 32 --learning-rate 1e-4
 ```
 
 For imbalanced training labels, choose exactly one training-only strategy with
@@ -56,9 +52,8 @@ training baseline. With `class-weighted-loss`, validation uses the same weighted
 cross-entropy for checkpoint selection; test loss remains unweighted. Each epoch
 reports macro-F1 and, for binary splits containing both classes, ROC-AUC.
 
-`cnn` starts from scratch. Torchvision models use ImageNet weights; CLIP uses a
-frozen OpenCLIP ViT-B/32 encoder with a trainable classification head. Pass
-`--no-pretrained` to avoid weight downloads. Each run records metrics,
+ResNet-18 uses ImageNet weights by default. Pass `--no-pretrained` to avoid
+weight downloads. Each run records metrics,
 configuration, classes, test confusion matrix, and the best-validation model in
 the remote MLflow server. Training does not persist a local checkpoint.
 
@@ -88,11 +83,11 @@ splits: FairVision source, metadata checksum, selected-record manifest checksum,
 schema, and aggregate split counts. It never uploads raw images or metadata rows.
 The native MLflow model artifact includes a tensor signature, representative input,
 configuration, and class mapping. A completed training run is automatically
-registered as `fairvision-{disease-type}-{model-type}`. MLflow reserves the alias
+registered as `fairvision-{disease-type}-resnet18`. MLflow reserves the alias
 name `latest`, so its native latest-version selector is used. For example, the
-default DR CNN is available at `models:/fairvision-dr-cnn/latest`. Pass
+default DR ResNet-18 is available at `models:/fairvision-dr-resnet18/latest`. Pass
 `--disease-type` when the target column is not the desired disease identifier.
-Project commands also accept `fairvision-dr-cnn@latest` as shorthand and convert
+Project commands also accept `fairvision-dr-resnet18@latest` as shorthand and convert
 it to MLflow's native selector.
 
 After reviewing a run, promote its latest version to the curated
@@ -100,13 +95,13 @@ After reviewing a run, promote its latest version to the curated
 
 ```bash
 uv run python -m active_testing_benchmark.modeling.registry \
-  --registry-name fairvision-dr-cnn
+  --registry-name fairvision-dr-resnet18
 ```
 
 This moves `@baseline` to the latest registered version without creating a
 duplicate. To promote an older training run instead, add `--run-id <run-id>` (or
 `RUN_ID=<run-id>` when using `make mlflow-model-promote`). Load the curated model
-through `models:/fairvision-dr-cnn@baseline`.
+through `models:/fairvision-dr-resnet18@baseline`.
 
 Training resolves FairVision metadata paths without eagerly probing every image,
 avoiding thousands of metadata operations on HPC shared filesystems. Add
@@ -132,12 +127,12 @@ another alias, or `run:<run-id>` / `runs:/<run-id>/model` for a training run:
 
 ```bash
 uv run python -m active_testing_benchmark.active_testing \
-  --model fairvision-dr-cnn@baseline \
+  --model fairvision-dr-resnet18@baseline \
   --model run:<run-id> \
   --test-size 25 --test-size 0.1 --test-size 1.0 \
   --runs 5 --seed 42
 
-make active-testing ACTIVE_TESTING_FLAGS="--model fairvision-dr-cnn --test-size 0.1"
+make active-testing ACTIVE_TESTING_FLAGS="--model fairvision-dr-resnet18 --test-size 0.1"
 ```
 
 Integer sizes are counts (`1` means one row); decimal or exponent sizes are

@@ -51,7 +51,7 @@ def test_dataset_loads_a_batch(tiny_image_dataset: tuple[Path, Path]) -> None:
     assert labels.shape == (2,)
 
 
-@pytest.mark.parametrize("name", ["cnn", "resnet18", "densenet121", "vit", "clip"])
+@pytest.mark.parametrize("name", ["resnet18"])
 def test_models_produce_class_logits(name: str) -> None:
     model = create_model(name, num_classes=3, pretrained=False)
     model.eval()
@@ -73,7 +73,7 @@ def test_short_training_epoch_runs(tiny_image_dataset: tuple[Path, Path]) -> Non
         mapping,
         transform=lambda image: torch.zeros(3, 32, 32),
     )
-    model = create_model("cnn", num_classes=2, pretrained=False)
+    model = create_model("resnet18", num_classes=2, pretrained=False)
     loss, accuracy, *_ = run_epoch(
         model,
         DataLoader(dataset, batch_size=2),

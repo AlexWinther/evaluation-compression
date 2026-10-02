@@ -46,7 +46,7 @@ from active_testing_benchmark.modeling.registry import (
 )
 
 app = typer.Typer(add_completion=False, help=__doc__)
-MODEL_NAMES = ["cnn", "resnet18", "densenet121", "vit", "clip"]
+MODEL_NAMES = ["resnet18"]
 IMBALANCE_STRATEGIES = ["none", "weighted-sampling", "class-weighted-loss"]
 
 
@@ -182,7 +182,7 @@ def make_loader(
 
 @app.command()
 def main(
-    model: str = typer.Option("resnet18", help="cnn, resnet18, densenet121, vit, or clip."),
+    model: str = typer.Option("resnet18", help="Currently supported model: resnet18."),
     batch_size: int = typer.Option(32, min=1),
     epochs: int = typer.Option(5, min=1),
     learning_rate: float = typer.Option(1e-4, min=0.0),
@@ -218,8 +218,6 @@ def main(
     """Run a minimal train/validation/test image-classification experiment."""
     if model not in MODEL_NAMES:
         raise typer.BadParameter(f"Choose one of: {', '.join(MODEL_NAMES)}")
-    if model == "vit" and image_size != 224:
-        raise typer.BadParameter("torchvision vit_b_16 currently requires --image-size 224")
     if imbalance_strategy not in IMBALANCE_STRATEGIES:
         raise typer.BadParameter(f"Choose one of: {', '.join(IMBALANCE_STRATEGIES)}")
     disease_type = disease_type or target_column
@@ -251,9 +249,7 @@ def main(
     classifier, train_transform = create_model_and_transform(
         model, len(class_to_index), pretrained, image_size
     )
-    validation_transform = (
-        train_transform if model == "clip" else torchvision_transform(image_size, training=False)
-    )
+    validation_transform = torchvision_transform(image_size, training=False)
     datasets = {}
     for split in ("training", "validation", "test"):
         logger.info("Indexing {!r} split", split)
