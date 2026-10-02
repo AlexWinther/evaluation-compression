@@ -72,7 +72,7 @@ train: requirements
 		--patience $(or $(PATIENCE),5) \
 		--batch-size $(or $(BATCH_SIZE),32) \
 		--learning-rate $(or $(LEARNING_RATE),1e-4) \
-		--imbalance-strategy $(or $(IMBALANCE_STRATEGY),none) \
+		--imbalance-strategy $(or $(IMBALANCE_STRATEGY),class-weighted-loss) \
 		$(TRAIN_FLAGS)
 
 

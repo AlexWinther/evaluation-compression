@@ -215,7 +215,8 @@ def main(
     dataset_source: str = typer.Option(FAIRVISION_SOURCE),
     pretrained: bool = typer.Option(True, "--pretrained/--no-pretrained"),
     imbalance_strategy: str = typer.Option(
-        "none", help="none, weighted-sampling, or class-weighted-loss."
+        "class-weighted-loss",
+        help="none, weighted-sampling, or class-weighted-loss (the default).",
     ),
 ) -> None:
     """Run a minimal train/validation/test image-classification experiment."""

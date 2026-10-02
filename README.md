@@ -44,13 +44,15 @@ first pretrained run downloads published weights):
 uv run python -m active_testing_benchmark.modeling.train --model resnet18 --epochs 30 --patience 5 --batch-size 32 --learning-rate 1e-4
 ```
 
-For imbalanced training labels, choose exactly one training-only strategy with
-`--imbalance-strategy weighted-sampling` (balanced draws with replacement) or
-`--imbalance-strategy class-weighted-loss` (inverse-frequency cross-entropy).
-The default, `--imbalance-strategy none`, preserves the unweighted shuffled
-training baseline. With `class-weighted-loss`, validation uses the same weighted
-cross-entropy for checkpoint selection; test loss remains unweighted. Each epoch
-reports macro-F1 and, for binary splits containing both classes, ROC-AUC.
+The default imbalance strategy is `--imbalance-strategy class-weighted-loss`,
+which weights cross-entropy inversely to each class's frequency in the training
+split. This keeps each training image in the epoch while giving the minority
+class more influence. `--imbalance-strategy weighted-sampling` instead draws a
+balanced epoch with replacement, which can repeat minority images and omit some
+majority images; `none` keeps ordinary shuffled training. Weighted loss is also
+used for validation checkpoint selection, while test loss remains unweighted.
+Each epoch reports macro-F1 and, for binary splits containing both classes,
+ROC-AUC.
 
 ResNet-18 uses ImageNet weights by default. Pass `--no-pretrained` to avoid
 weight downloads. Each run records metrics,
