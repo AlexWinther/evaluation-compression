@@ -1,0 +1,55 @@
+---
+config:
+  theme: dark
+  layout: dagra
+
+  flowchart:
+    subGraphTitleMargin:
+      top: 10
+      bottom: 0
+---
+
+flowchart LR
+  subgraph SG1["Phase 1 - Data preperation"]
+    A[("FairVision Dataset\nImages + Labels\n+ Demographics")]
+    subgraph SG11["Predefined Fairvision splits"]
+      B[("Train\n6,000 images")]
+      C[("Validation\n1,000 images")]
+      D[("Test\n3,000 images")]
+    end
+    A --> B & C & D
+
+    E[("Full Training\n7,000 images")]
+    F(["5-fold cross validation (CV)"])
+    G[("CV Train\n5,600 images")]
+    H[("CV Validation\n1,400 images")]
+    B & C --> E --- F --> G & H
+  end
+
+    G & H --- DE["During Development"] --> I
+    D & E --- FE["Final Experiment"] --> I
+
+  subgraph SG2["Phase 2 - Experiment"]
+    I["Training ResNet18"]
+  
+    subgraph SG21["Active Evaluation"]
+      J["Selection Strategies"]
+      K1("Uniform Sampling")
+      K2("Proportional/Balanced Stratified Sampling")
+      K3(["LURE"])
+      K4(["ASE"])
+      K5(["PPAT"])
+      L["Acquire Labels Under\na Limited Test Budget"]
+      M["Estimate Population Risk"]
+    end
+    I --> J --> K1 & K2 & K3 & K4 & K5 --> L --> M
+  end
+
+  subgraph SG4["Phase 3 - Benchmarking"]
+    S1["Overall Risk Estimation\nAccuracy, Bias, Variance"]
+    S2["Subgroup Fairness\nPerformance Across Demographics"]
+    T["Compare Methods Across\nModels and Label Budgets"]
+    U["Assess Efficient and Fair\nEvaluation of Medical AI"]
+
+    M --> S1 & S2 --> T --> U
+  end
