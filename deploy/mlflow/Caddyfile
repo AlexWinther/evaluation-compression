@@ -1,0 +1,7 @@
+{$MLFLOW_HOSTNAME} {
+    basic_auth argon2id {
+        {$MLFLOW_BASIC_AUTH_USERNAME} {$MLFLOW_BASIC_AUTH_HASH}
+    }
+
+    reverse_proxy mlflow:5000
+}

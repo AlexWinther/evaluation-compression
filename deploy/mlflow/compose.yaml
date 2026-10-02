@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:16.15-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - /srv/mlflow/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - internal
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local/mlflow:3.16.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MLFLOW_HOSTNAME: ${MLFLOW_HOSTNAME}
+    command:
+      - sh
+      - -c
+      - >
+        exec mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri
+        "postgresql+psycopg2://$$POSTGRES_USER:$$POSTGRES_PASSWORD@postgres:5432/$$POSTGRES_DB"
+        --artifacts-destination /var/lib/mlflow/artifacts
+        --serve-artifacts
+        --allowed-hosts "$$MLFLOW_HOSTNAME"
+        --cors-allowed-origins "https://$$MLFLOW_HOSTNAME"
+    volumes:
+      - /srv/mlflow/artifacts:/var/lib/mlflow/artifacts
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    depends_on:
+      - mlflow
+    environment:
+      MLFLOW_HOSTNAME: ${MLFLOW_HOSTNAME}
+      MLFLOW_BASIC_AUTH_USERNAME: ${MLFLOW_BASIC_AUTH_USERNAME}
+      MLFLOW_BASIC_AUTH_HASH: ${MLFLOW_BASIC_AUTH_HASH}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /srv/mlflow/caddy/data:/data
+      - /srv/mlflow/caddy/config:/config
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
