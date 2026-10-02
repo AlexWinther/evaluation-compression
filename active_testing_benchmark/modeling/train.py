@@ -184,7 +184,10 @@ def make_loader(
 def main(
     model: str = typer.Option("resnet18", help="Currently supported model: resnet18."),
     batch_size: int = typer.Option(32, min=1),
-    epochs: int = typer.Option(5, min=1),
+    epochs: int = typer.Option(30, min=1),
+    patience: int = typer.Option(
+        5, min=1, help="Stop after this many consecutive epochs without lower validation loss."
+    ),
     learning_rate: float = typer.Option(1e-4, min=0.0),
     seed: int = typer.Option(42),
     num_workers: int = typer.Option(0, min=0),
@@ -297,6 +300,7 @@ def main(
         "model": model,
         "batch_size": batch_size,
         "epochs": epochs,
+        "patience": patience,
         "learning_rate": learning_rate,
         "seed": seed,
         "num_workers": num_workers,
@@ -387,6 +391,7 @@ def main(
         best_validation_loss = float("inf")
         best_validation_accuracy = 0.0
         best_state: dict[str, torch.Tensor] | None = None
+        epochs_without_improvement = 0
         for epoch in range(1, epochs + 1):
             logger.info("Epoch {}/{}: starting training pass", epoch, epochs)
             train_loss, train_accuracy, train_labels, train_probabilities, train_predictions = (
@@ -467,12 +472,29 @@ def main(
                     validation_accuracy,
                 )
                 best_state = deepcopy(classifier.state_dict())
+                epochs_without_improvement = 0
                 logger.info(
                     "Epoch {}/{}: retained new best model (validation loss={:.4f})",
                     epoch,
                     epochs,
                     validation_loss,
                 )
+            else:
+                epochs_without_improvement += 1
+                logger.info(
+                    "Epoch {}/{}: validation loss did not improve ({}/{} consecutive epochs)",
+                    epoch,
+                    epochs,
+                    epochs_without_improvement,
+                    patience,
+                )
+                if epochs_without_improvement >= patience:
+                    logger.info(
+                        "Early stopping after epoch {}: validation loss did not improve for {} epochs",
+                        epoch,
+                        patience,
+                    )
+                    break
         if best_state is None:  # pragma: no cover - epochs is validated as positive
             raise RuntimeError("Training completed without producing a model state")
         logger.info("Restoring best-validation model and starting test pass")

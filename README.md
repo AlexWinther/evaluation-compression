@@ -41,7 +41,7 @@ Install dependencies once with `make requirements`, then train ResNet-18 (the
 first pretrained run downloads published weights):
 
 ```bash
-uv run python -m active_testing_benchmark.modeling.train --model resnet18 --epochs 5 --batch-size 32 --learning-rate 1e-4
+uv run python -m active_testing_benchmark.modeling.train --model resnet18 --epochs 30 --patience 5 --batch-size 32 --learning-rate 1e-4
 ```
 
 For imbalanced training labels, choose exactly one training-only strategy with
@@ -56,6 +56,11 @@ ResNet-18 uses ImageNet weights by default. Pass `--no-pretrained` to avoid
 weight downloads. Each run records metrics,
 configuration, classes, test confusion matrix, and the best-validation model in
 the remote MLflow server. Training does not persist a local checkpoint.
+
+Training stops early after 5 consecutive epochs without lower validation loss
+by default. Set `--patience` to change that threshold and `--epochs` to set the
+maximum number of epochs (30 by default). The checkpoint with the lowest
+validation loss is restored before evaluating the test split.
 
 For normal laptop development, copy `.env.example` to the ignored `.env`, replace
 the credential placeholders, and restrict its permissions:

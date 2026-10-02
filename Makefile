@@ -68,7 +68,8 @@ fairvision-metadata: requirements
 train: requirements
 	uv run python -m active_testing_benchmark.modeling.train \
 		--model $(or $(MODEL),resnet18) \
-		--epochs $(or $(EPOCHS),5) \
+		--epochs $(or $(EPOCHS),30) \
+		--patience $(or $(PATIENCE),5) \
 		--batch-size $(or $(BATCH_SIZE),32) \
 		--learning-rate $(or $(LEARNING_RATE),1e-4) \
 		--imbalance-strategy $(or $(IMBALANCE_STRATEGY),none) \
