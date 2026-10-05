@@ -2,8 +2,7 @@ from loguru import logger
 import mlflow.pytorch
 import typer
 
-from active_testing_benchmark.active_testing import normalize_model_source
-from active_testing_benchmark.modeling.registry import configure_mlflow
+from active_testing_benchmark.modeling.registry import configure_mlflow, normalize_model_source
 
 app = typer.Typer()
 

@@ -39,6 +39,30 @@ def configure_mlflow() -> str:
     return tracking_uri
 
 
+def normalize_model_source(source: str) -> str:
+    """Normalize registry names and run identifiers to MLflow model URIs."""
+    source = source.strip()
+    if source.startswith("runs:/"):
+        if not re.fullmatch(r"runs:/[^/]+/model", source):
+            raise ValueError("Run URI must be runs:/<run-id>/model")
+        return source
+    if source.startswith("run:"):
+        run_id = source[4:]
+        if not run_id or "/" in run_id:
+            raise ValueError("Expected run:<run-id>")
+        return f"runs:/{run_id}/model"
+    name = source.removeprefix("models:/")
+    if name.endswith("@latest"):
+        name = name.removesuffix("@latest")
+        if re.fullmatch(r"[^/@:\s]+", name):
+            return f"models:/{name}/latest"
+    if re.fullmatch(r"[^/@:\s]+/(?:latest|[1-9][0-9]*)", name):
+        return f"models:/{name}"
+    if not re.fullmatch(r"[^/@:\s]+(?:@[^/@:\s]+)?", name):
+        raise ValueError("Expected registry-name[@alias] or run:<run-id>")
+    return f"models:/{name}" + ("/latest" if "@" not in name else "")
+
+
 def latest_model_version(registry_name: str, client: MlflowClient | None = None):
     """Return the highest numbered version of a registered model."""
     if "'" in registry_name:

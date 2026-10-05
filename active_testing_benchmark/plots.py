@@ -166,7 +166,7 @@ def plot_results(
         constrained_layout=True,
     )
     figure.suptitle(
-        f"Active-testing estimates ({config.get('reducer', 'unknown')} selection, "
+        f"Active-testing estimates ({config.get('method', 'unknown')} method, "
         f"{config.get('runs', int(results['run'].nunique()))} runs)",
         fontsize=14,
     )
@@ -177,7 +177,7 @@ def plot_results(
         axes[row, 0].set_ylabel(label)
         axes[row, 1].set_ylabel(f"Absolute {label.lower()} error")
 
-    axes[0, 0].set_title("Subset estimate (dots are individual runs)")
+    axes[0, 0].set_title("Risk estimate (dots are individual runs)")
     axes[0, 1].set_title("Mean absolute error")
     x_label = (
         "Test subset size (% of full test set)" if x_axis == "percent" else "Test subset size"

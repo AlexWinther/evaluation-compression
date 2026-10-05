@@ -1,23 +1,20 @@
-"""Offline subset estimation benchmark for the project's MLflow PyTorch models."""
+"""Active finite-pool risk estimation and its MLflow-backed image-classification runner."""
 
 # ruff: noqa: B008 -- Typer declares CLI options as argument defaults.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
 import math
 from pathlib import Path
 import re
-from typing import Protocol
 
 import mlflow
 import mlflow.pytorch
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -27,37 +24,96 @@ from active_testing_benchmark.config import RAW_DATA_DIR, REPORTS_DIR
 from active_testing_benchmark.modeling.data import ImageClassificationDataset
 from active_testing_benchmark.modeling.models import torchvision_transform
 from active_testing_benchmark.modeling.provenance import FAIRVISION_SOURCE
-from active_testing_benchmark.modeling.registry import configure_mlflow, latest_model_version
+from active_testing_benchmark.modeling.registry import (
+    configure_mlflow,
+    latest_model_version,
+    normalize_model_source,
+)
 
 app = typer.Typer(add_completion=False, help=__doc__)
 
 
-class Reducer(Protocol):
-    """Return ordered unique candidate IDs; revealed labels comes only from earlier rounds.
+@dataclass
+class SelectionPlan:
+    """Items requested and probabilities under the method's sampling design.
 
-    Prediction arrays, when supplied, align with candidate_ids. Callers own the
-    label-reveal loop; the offline scorer must never supply unrevealed labels.
+    Selection probabilities describe ordered conditional draws. Inclusion
+    probabilities describe the marginal chance that each selected item is included.
     """
 
-    def __call__(
-        self,
-        candidate_ids: np.ndarray,
-        budget: int,
-        seed: int,
-        *,
-        model_predictions: Mapping[str, np.ndarray] | None = None,
-        revealed_labels: Mapping[int, int] | None = None,
-    ) -> np.ndarray: ...
+    indices: list[int]
+    selection_probabilities: list[float] | None = None
+    inclusion_probabilities: list[float] | None = None
+    metadata: dict | None = None
 
 
-class Metric(Protocol):
-    def __call__(
-        self,
-        labels: np.ndarray,
-        predictions: np.ndarray,
-        probabilities: np.ndarray,
-        metadata: pd.DataFrame | None = None,
-    ) -> dict[str, float]: ...
+@dataclass
+class Estimate:
+    """A method's current estimate of finite-pool risk."""
+
+    risk: float
+    n_labels: int
+
+
+class ActiveEvaluationMethod:
+    """Interface implemented by methods that choose labels and estimate risk."""
+
+    def initialize(self, problem):
+        raise NotImplementedError
+
+    def acquire(self, state, history) -> SelectionPlan:
+        raise NotImplementedError
+
+    def observe(self, state, selection, labels, losses):
+        raise NotImplementedError
+
+    def estimate(self, state, history) -> Estimate:
+        raise NotImplementedError
+
+
+class UniformSampleMean(ActiveEvaluationMethod):
+    """Uniform sampling without replacement and the mean of observed losses."""
+
+    def __init__(self, seed: int = 0, batch_size: int | None = None) -> None:
+        if batch_size is not None and batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        self.rng = np.random.Generator(np.random.PCG64(seed))
+        self.batch_size = batch_size
+
+    def initialize(self, problem: dict) -> dict:
+        return {
+            "remaining": set(range(problem["N"])),
+            "remaining_budget": problem["budget"],
+            "observed_losses": [],
+        }
+
+    def acquire(self, state: dict, history: list[dict]) -> SelectionPlan:
+        remaining = sorted(state["remaining"])
+        count = min(
+            self.batch_size or state["remaining_budget"],
+            state["remaining_budget"],
+            len(remaining),
+        )
+        if count < 1:
+            raise ValueError("No remaining budget or unlabeled items")
+
+        positions = self.rng.choice(len(remaining), size=count, replace=False)
+        indices = [int(remaining[int(position)]) for position in positions]
+        return SelectionPlan(
+            indices=indices,
+            selection_probabilities=[1.0 / (len(remaining) - offset) for offset in range(count)],
+            inclusion_probabilities=[count / len(remaining)] * count,
+            metadata={"design": "uniform_without_replacement"},
+        )
+
+    def observe(self, state: dict, selection: SelectionPlan, labels: list, losses: list) -> None:
+        state["remaining"].difference_update(selection.indices)
+        state["remaining_budget"] -= len(selection.indices)
+        state["observed_losses"].extend(losses)
+
+    def estimate(self, state: dict, history: list[dict]) -> Estimate:
+        losses = state["observed_losses"]
+        return Estimate(risk=float(np.mean(losses)), n_labels=len(losses))
 
 
 def resolve_budget(value: str, population: int) -> int:
@@ -78,54 +134,69 @@ def resolve_budget(value: str, population: int) -> int:
     return budget
 
 
-def random_reducer(
-    candidate_ids: np.ndarray,
+def run_active_evaluation(
+    method: ActiveEvaluationMethod,
+    X_pool,
+    y_pool,
+    model,
+    loss_fn,
     budget: int,
-    seed: int,
-    *,
-    model_predictions: Mapping[str, np.ndarray] | None = None,
-    revealed_labels: Mapping[int, int] | None = None,
-) -> np.ndarray:
-    if len(np.unique(candidate_ids)) != len(candidate_ids):
-        raise ValueError("Candidate IDs must be unique")
-    if not 1 <= budget <= len(candidate_ids):
-        raise ValueError("Budget must be less than the candidate population")
-    return np.random.default_rng(seed).choice(candidate_ids, budget, replace=False)
+    history_out: list[dict] | None = None,
+) -> Estimate:
+    """Run the label-acquisition loop against a finite-pool label oracle."""
+    if len(X_pool) != len(y_pool):
+        raise ValueError("X_pool and y_pool must have the same length")
+    if not 1 <= budget <= len(X_pool):
+        raise ValueError("budget must be between 1 and the pool size")
 
-
-def classification_metrics(
-    labels: np.ndarray,
-    predictions: np.ndarray,
-    probabilities: np.ndarray,
-    metadata: pd.DataFrame | None = None,
-) -> dict[str, float]:
-    """Fixed-class macro metrics and top-label ECE with 10 equal-width bins."""
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        labels,
-        predictions,
-        labels=np.arange(probabilities.shape[1]),
-        average="macro",
-        zero_division="warn",
-    )
-    confidence = probabilities.max(axis=1).astype(np.float64)
-    bins = np.minimum((confidence * 10).astype(int), 9)
-    correct = predictions == labels
-    ece = sum(
-        np.mean(bins == b) * abs(correct[bins == b].mean() - confidence[bins == b].mean())
-        for b in range(10)
-        if np.any(bins == b)
-    )
-    auc = float("nan")
-    if probabilities.shape[1] == 2 and len(np.unique(labels)) == 2:
-        auc = float(roc_auc_score(labels, probabilities[:, 1]))
-    return {
-        "accuracy": float(accuracy_score(labels, predictions)),
-        "macro_f1": float(f1),
-        "macro_precision": float(precision),
-        "macro_recall": float(recall),
-        "roc_auc": auc,
-        "calibration_error": float(ece),
+    problem = {
+        "N": len(X_pool),
+        "X_pool": X_pool,
+        "model": model,
+        "loss_fn": loss_fn,
+        "budget": budget,
     }
+    state = method.initialize(problem)
+    history = []
+    acquired = set()
+
+    while len(acquired) < budget:
+        selection = method.acquire(state, history)
+        indices = selection.indices
+        if not indices or len(indices) != len(set(indices)):
+            raise ValueError("A selection must contain unique indices")
+        if any(not isinstance(index, (int, np.integer)) for index in indices):
+            raise ValueError("Selection indices must be integers")
+        if len(acquired) + len(indices) > budget:
+            raise ValueError("Selection exceeds the remaining label budget")
+        if any(index < 0 or index >= len(X_pool) or index in acquired for index in indices):
+            raise ValueError("Selection indices must be remaining pool indices")
+
+        labels = [y_pool[index] for index in indices]
+        losses = [
+            float(loss_fn(model(X_pool[index]), label)) for index, label in zip(indices, labels)
+        ]
+        for probabilities in (
+            selection.selection_probabilities,
+            selection.inclusion_probabilities,
+        ):
+            if probabilities is not None and (
+                len(probabilities) != len(indices)
+                or not np.isfinite(probabilities).all()
+                or any(probability < 0 or probability > 1 for probability in probabilities)
+            ):
+                raise ValueError(
+                    "Selection probabilities must align with selected indices in [0, 1]"
+                )
+        history.append(
+            {"round": len(history), "selection": selection, "labels": labels, "losses": losses}
+        )
+        method.observe(state, selection, labels, losses)
+        acquired.update(indices)
+
+    if history_out is not None:
+        history_out.extend(history)
+    return method.estimate(state, history)
 
 
 @dataclass
@@ -136,103 +207,9 @@ class Predictions:
     probabilities: np.ndarray
 
 
-def evaluate_subsets(
-    models: Mapping[str, Predictions],
-    budgets: list[int],
-    runs: int,
-    seed: int,
-    reducer: Reducer = random_reducer,
-    metric: Metric = classification_metrics,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
-    """Score shared, independent selections without disclosing labels to the reducer."""
-    if not models or runs < 1 or seed < 0:
-        raise ValueError("Supply models, positive runs, and a nonnegative seed")
-    candidates = next(iter(models.values())).row_ids
-    for data in models.values():
-        if not np.array_equal(data.row_ids, candidates):
-            raise ValueError("Models must be evaluated on identical ordered metadata rows")
-    full = {
-        name: metric(data.labels, data.predictions, data.probabilities)
-        for name, data in models.items()
-    }
-    full_rows = [
-        {"model": name, "metric": key, "value": value}
-        for name, values in full.items()
-        for key, value in values.items()
-    ]
-    rows, manifests = [], {}
-    positions = {row_id: index for index, row_id in enumerate(candidates)}
-    for size_index, budget in enumerate(tqdm(budgets, desc="Subset evaluation", unit="size")):
-        for repetition in tqdm(range(runs), desc=f"Budget {budget}", unit="run", leave=False):
-            child_seed = int(
-                np.random.SeedSequence([seed, size_index, repetition]).generate_state(
-                    1, dtype=np.uint64
-                )[0]
-            )
-            selected = reducer(candidates.copy(), budget, child_seed)
-            if (
-                len(selected) != budget
-                or len(np.unique(selected)) != budget
-                or not np.isin(selected, candidates).all()
-            ):
-                raise ValueError("Reducer must return budget unique candidate IDs")
-            subset_id = f"size-{size_index}-run-{repetition}"
-            common = {
-                "subset_id": subset_id,
-                "budget": budget,
-                "run": repetition,
-                "seed": child_seed,
-            }
-            manifests[subset_id] = pd.DataFrame(
-                {
-                    **common,
-                    "row_id": selected,
-                    "selection_order": np.arange(budget),
-                }
-            )
-            indices = np.array([positions[row_id] for row_id in selected])
-            for name, data in models.items():
-                estimates = metric(
-                    data.labels[indices], data.predictions[indices], data.probabilities[indices]
-                )
-                for key, estimate in estimates.items():
-                    reference = full[name][key]
-                    rows.append(
-                        dict(
-                            **common,
-                            model=name,
-                            metric=key,
-                            estimate=estimate,
-                            full_value=reference,
-                            error=estimate - reference,
-                            absolute_error=abs(estimate - reference),
-                        )
-                    )
-    return pd.DataFrame(rows), pd.DataFrame(full_rows), manifests
-
-
-def normalize_model_source(source: str) -> str:
-    """Bare registry names use MLflow's native latest-version selector."""
-    source = source.strip()
-    if source.startswith("runs:/"):
-        if not re.fullmatch(r"runs:/[^/]+/model", source):
-            raise ValueError("Run URI must be runs:/<run-id>/model")
-        return source
-    if source.startswith("run:"):
-        run_id = source[4:]
-        if not run_id or "/" in run_id:
-            raise ValueError("Expected run:<run-id>")
-        return f"runs:/{run_id}/model"
-    name = source.removeprefix("models:/")
-    if name.endswith("@latest"):
-        name = name.removesuffix("@latest")
-        if re.fullmatch(r"[^/@:\s]+", name):
-            return f"models:/{name}/latest"
-    if re.fullmatch(r"[^/@:\s]+/(?:latest|[1-9][0-9]*)", name):
-        return f"models:/{name}"
-    if not re.fullmatch(r"[^/@:\s]+(?:@[^/@:\s]+)?", name):
-        raise ValueError("Expected registry-name[@alias] or run:<run-id>")
-    return f"models:/{name}" + ("/latest" if "@" not in name else "")
+def classification_error(prediction, target) -> float:
+    """Return zero-one loss for a class-probability vector and integer target."""
+    return float(int(np.argmax(prediction)) != int(target))
 
 
 def infer_model(
@@ -320,7 +297,7 @@ def main(
     test_size: list[str] = typer.Option(..., help="Repeat counts (10) or fractions (0.1)."),
     runs: int = typer.Option(5, min=1),
     seed: int = typer.Option(42, min=0),
-    reducer: str = typer.Option("random"),
+    method: str = typer.Option("uniform-sample-mean"),
     metadata_path: Path = typer.Option(RAW_DATA_DIR / "fairvision/dr/metadata.csv"),
     image_root: Path | None = typer.Option(None),
     image_column: str = typer.Option("filename"),
@@ -329,14 +306,15 @@ def main(
     dataset_source: str = typer.Option(FAIRVISION_SOURCE),
     image_size: int | None = typer.Option(None, min=32),
     batch_size: int = typer.Option(32, min=1),
+    acquisition_batch_size: int | None = typer.Option(None, min=1),
     num_workers: int = typer.Option(0, min=0),
     output_dir: Path = typer.Option(REPORTS_DIR / "active-testing"),
     experiment_name: str = typer.Option("active-testing"),
 ) -> None:
-    """Infer once per model, score subsets, and record one MLflow experiment run."""
+    """Estimate finite-pool classification error using an active label budget."""
     try:
-        if reducer != "random":
-            raise ValueError("Only the random reducer is currently supported")
+        if method != "uniform-sample-mean":
+            raise ValueError("Only the uniform-sample-mean method is currently supported")
         sources = list(dict.fromkeys(normalize_model_source(source) for source in model))
         metadata_path = metadata_path.resolve()
         image_root = (image_root or metadata_path.parent).resolve()
@@ -347,7 +325,7 @@ def main(
         raise typer.BadParameter(str(error)) from error
     configure_mlflow()
     mlflow.set_experiment(experiment_name)
-    with mlflow.start_run(run_name=f"{reducer}-seed-{seed}") as run:
+    with mlflow.start_run(run_name=f"{method}-seed-{seed}") as run:
         destination = output_dir / run.info.run_id
         destination.mkdir(parents=True, exist_ok=False)
         models, provenance = {}, {}
@@ -365,9 +343,75 @@ def main(
                 batch_size,
                 num_workers,
             )
-        results, full, manifests = evaluate_subsets(models, budgets, runs, seed)
+        result_rows, manifest_rows = [], []
+        for size_index, budget in enumerate(budgets):
+            for repetition in range(runs):
+                child_seed = int(
+                    np.random.SeedSequence([seed, size_index, repetition]).generate_state(
+                        1, dtype=np.uint64
+                    )[0]
+                )
+                for name, data in models.items():
+                    sampled_history = []
+                    model_predictions = data.probabilities
+                    prediction_model = lambda index, outputs=model_predictions: outputs[int(index)]
+                    estimate = run_active_evaluation(
+                        UniformSampleMean(child_seed, acquisition_batch_size),
+                        np.arange(len(data.labels)),
+                        data.labels,
+                        prediction_model,
+                        classification_error,
+                        budget,
+                        history_out=sampled_history,
+                    )
+                    full_risk = float(np.mean(data.predictions != data.labels))
+                    result_rows.append(
+                        {
+                            "method": method,
+                            "model": name,
+                            "metric": "classification_error",
+                            "budget": budget,
+                            "run": repetition,
+                            "seed": child_seed,
+                            "estimate": estimate.risk,
+                            "full_value": full_risk,
+                            "error": estimate.risk - full_risk,
+                            "absolute_error": abs(estimate.risk - full_risk),
+                            "n_labels": estimate.n_labels,
+                        }
+                    )
+                    selection_order = 0
+                    for batch in sampled_history:
+                        selection = batch["selection"]
+                        for offset, pool_index in enumerate(selection.indices):
+                            manifest_rows.append(
+                                {
+                                    "method": method,
+                                    "model": name,
+                                    "budget": budget,
+                                    "run": repetition,
+                                    "seed": child_seed,
+                                    "row_id": int(data.row_ids[pool_index]),
+                                    "selection_round": batch["round"],
+                                    "selection_order": selection_order + offset,
+                                    "selection_probability": (
+                                        selection.selection_probabilities[offset]
+                                        if selection.selection_probabilities is not None
+                                        else None
+                                    ),
+                                    "inclusion_probability": (
+                                        selection.inclusion_probabilities[offset]
+                                        if selection.inclusion_probabilities is not None
+                                        else None
+                                    ),
+                                    "label_revealed": True,
+                                }
+                            )
+                        selection_order += len(selection.indices)
+        results = pd.DataFrame(result_rows)
+        manifests = pd.DataFrame(manifest_rows)
         config = {
-            "reducer": reducer,
+            "method": method,
             "runs": runs,
             "seed": seed,
             "test_sizes": test_size,
@@ -384,23 +428,26 @@ def main(
             "batch_size": batch_size,
             "num_workers": num_workers,
             "image_size": image_size,
-            "calibration_bins": 10,
             "row_id": "zero-based CSV row index",
+            "loss": "zero-one classification error",
+            "acquisition_batch_size": acquisition_batch_size or "full_budget",
         }
         (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         results.to_csv(destination / "results.csv", index=False)
-        full.to_csv(destination / "full_metrics.csv", index=False)
-        manifest_dir = destination / "subsets"
-        manifest_dir.mkdir()
-        for name, manifest in manifests.items():
-            manifest.to_csv(manifest_dir / f"{name}.csv", index=False)
+        manifests.to_csv(destination / "selection_manifest.csv", index=False)
         mlflow.log_params(
-            {"reducer": reducer, "runs": runs, "seed": seed, "population": population}
+            {
+                "method": method,
+                "runs": runs,
+                "seed": seed,
+                "population": population,
+                "acquisition_batch_size": acquisition_batch_size or "full_budget",
+            }
         )
-        for row in full.itertuples():
-            if math.isfinite(row.value):
-                mlflow.log_metric(f"full/{row.model}/{row.metric}", row.value)
-        typer.echo("Uploading configuration, metrics, and subset manifests to MLflow...")
+        for row in results.itertuples():
+            mlflow.log_metric(f"risk/{row.model}/full", row.full_value)
+            mlflow.log_metric(f"risk/{row.model}/estimate/budget-{row.budget}", row.estimate)
+        typer.echo("Uploading configuration, risk estimates, and selection manifest to MLflow...")
         mlflow.log_artifacts(str(destination))
     typer.echo(f"Results: {destination}")
 

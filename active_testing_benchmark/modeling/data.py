@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+from typing import Callable
 
 import pandas as pd
-from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
+from torchvision.io import ImageReadMode, decode_image
 
 
 class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
@@ -23,7 +24,7 @@ class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
         split_column: str,
         split: str,
         class_to_index: dict[str, int],
-        transform: object | None = None,
+        transform: Callable | None = None,
         validate_paths: bool = True,
     ) -> None:
         dataframe = pd.read_csv(metadata_path)
@@ -61,10 +62,9 @@ class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
 
     def __getitem__(self, index: int) -> tuple[Tensor, int]:
         image_path, label = self.records[index]
-        with Image.open(image_path) as image:
-            image = image.convert("RGB")
-            if self.transform is not None:
-                image = self.transform(image)
+        image = decode_image(str(image_path), mode=ImageReadMode.RGB)
+        if self.transform is not None:
+            image = self.transform(image)
         return image, label
 
 

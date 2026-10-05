@@ -76,7 +76,7 @@ train: requirements
 		$(TRAIN_FLAGS)
 
 
-## Benchmark reduced test subsets (set ACTIVE_TESTING_FLAGS with models and test sizes)
+## Estimate finite-pool classification error (set ACTIVE_TESTING_FLAGS with models and test sizes)
 .PHONY: active-testing
 active-testing: requirements
 	uv run python -m active_testing_benchmark.active_testing $(ACTIVE_TESTING_FLAGS)

@@ -126,11 +126,18 @@ materials describe an MLflow extension but do not document a stable minimal
 in-process API for this loop. It can later be evaluated separately (`uv add
 radt`) without affecting normal MLflow training.
 
-## Offline active-testing experiment
+## Active finite-pool risk estimation
 
-Compare random test subsets against full-test metrics for one or more saved
-models. Bare registry names default to MLflow's `/latest` selector; use `name@alias` for
-another alias, or `run:<run-id>` / `runs:/<run-id>/model` for a training run:
+The active-testing interface separates acquisition, observation, and estimation.
+Methods receive the pool size, unlabeled pool, model, and loss function at
+initialization. The benchmark reveals labels and losses only for acquired rows.
+`UniformSampleMean` samples without replacement and estimates finite-pool
+classification error with the observed mean loss. Its `SelectionPlan` records
+conditional selection probabilities and item inclusion probabilities.
+
+The MLflow command currently runs this method against saved classifiers. Bare
+registry names default to MLflow's `/latest` selector; use `name@alias` or
+`run:<run-id>` / `runs:/<run-id>/model` for a training run:
 
 ```bash
 uv run python -m active_testing_benchmark.active_testing \
@@ -145,35 +152,29 @@ make active-testing ACTIVE_TESTING_FLAGS="--model fairvision-dr-resnet18 --test-
 Integer sizes are counts (`1` means one row); decimal or exponent sizes are
 fractions in `(0, 1]`, rounded up (`1.0` means the whole test split). Oversized or
 empty budgets are rejected. Each size/repetition gets an independent seeded
-sample without replacement, shared across all models. Samples may overlap or
-coincide by chance; they are not nested or forced to be disjoint.
+sample without replacement. By default, uniform acquisition selects the whole
+budget in one batch. Set `--acquisition-batch-size` to divide acquisition into
+smaller batches.
 
-This POC loads the project's native MLflow PyTorch classifiers with their saved
-configuration and class mapping. It performs one full-test inference pass per
-model on CPU and retains row IDs, labels, predictions, and probabilities in
-memory. Registry aliases are resolved to recorded version IDs. Preprocessing and
-image size follow each saved model, with an optional `--image-size` override.
+The command loads the project's native MLflow PyTorch classifiers with their
+saved configuration and class mapping. It performs one full-test inference pass
+per model on CPU and retains row IDs, labels, predictions, and probabilities in
+memory for the offline label-oracle simulation. The method only sees acquired
+labels and losses. Registry aliases are resolved to recorded version IDs.
+Preprocessing and image size follow each saved model, with an optional
+`--image-size` override.
 The dataset options are `--metadata-path`, `--image-root`, `--image-column`,
 `--target-column`, `--split-column`, and `--dataset-source`; batching uses `--batch-size` and
 `--num-workers`.
 
 Each invocation writes `reports/active-testing/<mlflow-run-id>/` (or beneath
-`--output-dir`) containing `config.json`, `full_metrics.csv`, `results.csv`, and
-`subsets/*.csv`. Results include signed error (estimate minus full-test value)
-and absolute error. Metrics are accuracy, macro-F1, macro precision/recall,
-binary ROC-AUC, and top-label expected calibration error with 10 equal-width
-confidence bins. Macro metrics always include every class from the saved mapping
-and use zero for undefined precision/recall. ROC-AUC is empty when the model is
-not binary or the evaluated sample lacks both classes. Probability column 1 is
-the positive class. Calibration error is the bin-size-weighted absolute gap
-between mean confidence and accuracy.
-
-Manifests contain zero-based source CSV row IDs (excluding the header), budget,
-repetition, seed, subset ID, and zero-based selection order. Keep the source CSV
-unchanged to reuse these IDs; its SHA-256 is recorded. No images are copied.
-Configuration, full metrics, results, and manifests are logged as artifacts in
-one MLflow run under `--experiment-name active-testing`, using the same tracking
-settings as training.
+`--output-dir`) containing `config.json`, `results.csv`, and
+`selection_manifest.csv`. Results compare the sample-mean classification error
+with the full finite-pool classification error and include signed and absolute
+error. Manifests contain source CSV row IDs, budget, repetition, seed, selection
+round and order, both probability fields, and label-reveal state. The metadata
+CSV checksum is recorded; raw images are not copied. Configuration, results,
+and manifests are logged as artifacts in one MLflow run.
 
 Visualize the estimates and their absolute error across subset sizes with:
 
@@ -184,18 +185,8 @@ make active-testing-plot EXPERIMENT_DIR=reports/active-testing/<mlflow-run-id>
 ```
 
 The figure is written to `active-testing-results.png` inside the experiment
-directory. It contains one row per metric, shows every repetition as a faint dot,
-connects the mean estimates, and marks each model's full-test value with a dashed
-line. Use repeated `--metric` options to select metrics, `--x-axis count` for raw
-sample counts, or `--output path/to/figure.pdf` to choose another path or format.
-
-`Reducer` and `Metric` are lightweight callable protocols in `active_testing.py`.
-Reducers can accept aligned model predictions and a mapping of previously
-revealed labels; metrics accept labels, predictions, probabilities, and optional
-metadata. The current shared-subset loop passes neither predictions nor labels
-to the random reducer. A future iterative caller must manage earlier-round label
-reveals and model-dependent subset provenance. No active method, plugin system,
-or YAML configuration is implemented in this POC.
+directory. It shows the classification-error estimate and absolute error across
+budgets, with the full-pool value marked for reference.
 
 ## Acknowledgment
 
