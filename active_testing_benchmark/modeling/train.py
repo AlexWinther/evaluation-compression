@@ -87,11 +87,13 @@ def run_epoch(
     device: torch.device,
     optimizer: AdamW | None = None,
     progress_label: str | None = None,
-) -> tuple[float, float, list[int], list[float], list[int]]:
+    class_weights: torch.Tensor | None = None,
+) -> tuple[float, float, list[int], list[float], list[int], dict[str, float]]:
     """Train when an optimizer is supplied; otherwise evaluate."""
     is_training = optimizer is not None
     model.train(is_training)
     total_loss = correct = total = 0
+    weighted_loss_sum = unweighted_loss_sum = weighted_denominator = 0.0
     labels: list[int] = []
     positive_probabilities: list[float] = []
     predictions: list[int] = []
@@ -106,6 +108,18 @@ def run_epoch(
                 optimizer.zero_grad()
             outputs = model(images)
             loss = loss_function(outputs, targets)
+            with torch.no_grad():
+                unweighted_loss_sum += nn.functional.cross_entropy(
+                    outputs, targets, reduction="sum"
+                ).item()
+                weighted_loss_sum += nn.functional.cross_entropy(
+                    outputs, targets, weight=class_weights, reduction="sum"
+                ).item()
+                weighted_denominator += (
+                    class_weights[targets].sum().item()
+                    if class_weights is not None
+                    else targets.numel()
+                )
             if optimizer is not None:
                 loss.backward()
                 optimizer.step()
@@ -129,7 +143,21 @@ def run_epoch(
                     total,
                     time.monotonic() - started_at,
                 )
-    return total_loss / total, correct / total, labels, positive_probabilities, predictions
+    weighted_loss = (
+        weighted_loss_sum / weighted_denominator if weighted_denominator > 0 else float("nan")
+    )
+    loss_metrics = {
+        "weighted": weighted_loss,
+        "unweighted": unweighted_loss_sum / total,
+    }
+    return (
+        total_loss / total,
+        correct / total,
+        labels,
+        positive_probabilities,
+        predictions,
+        loss_metrics,
+    )
 
 
 def classification_metrics(
@@ -288,6 +316,12 @@ def main(
         if imbalance_strategy == "class-weighted-loss"
         else None
     )
+    loss_reporting_weights = class_weights
+    if loss_reporting_weights is None:
+        loss_reporting_weights = inverse_frequency_class_weights(
+            datasets["training"], len(class_to_index)
+        )
+    loss_reporting_weights = loss_reporting_weights.to(device)
     training_loss_function = nn.CrossEntropyLoss(
         weight=class_weights.to(device) if class_weights is not None else None
     )
@@ -319,6 +353,7 @@ def main(
         "imbalance_strategy": imbalance_strategy,
         "dataset_source": dataset_source,
         "class_weights": class_weights.tolist() if class_weights is not None else None,
+        "loss_reporting_class_weights": loss_reporting_weights.cpu().tolist(),
     }
     logger.info(
         "Training setup ready: model={}, strategy={}, train={}, validation={}, test={}",
@@ -395,15 +430,21 @@ def main(
         epochs_without_improvement = 0
         for epoch in range(1, epochs + 1):
             logger.info("Epoch {}/{}: starting training pass", epoch, epochs)
-            train_loss, train_accuracy, train_labels, train_probabilities, train_predictions = (
-                run_epoch(
-                    classifier,
-                    loaders["training"],
-                    training_loss_function,
-                    device,
-                    optimizer,
-                    progress_label=f"Epoch {epoch}/{epochs} training",
-                )
+            (
+                train_loss,
+                train_accuracy,
+                train_labels,
+                train_probabilities,
+                train_predictions,
+                train_loss_metrics,
+            ) = run_epoch(
+                classifier,
+                loaders["training"],
+                training_loss_function,
+                device,
+                optimizer,
+                progress_label=f"Epoch {epoch}/{epochs} training",
+                class_weights=loss_reporting_weights,
             )
             logger.info("Epoch {}/{}: starting validation pass", epoch, epochs)
             (
@@ -412,12 +453,14 @@ def main(
                 validation_labels,
                 validation_probabilities,
                 validation_predictions,
+                validation_loss_metrics,
             ) = run_epoch(
                 classifier,
                 loaders["validation"],
                 validation_loss_function,
                 device,
                 progress_label=f"Epoch {epoch}/{epochs} validation",
+                class_weights=loss_reporting_weights,
             )
             train_metrics = classification_metrics(
                 train_labels, train_probabilities, train_predictions, len(class_to_index)
@@ -449,9 +492,13 @@ def main(
             mlflow.log_metrics(
                 {
                     "train_loss": train_loss,
+                    "train_loss_weighted": train_loss_metrics["weighted"],
+                    "train_loss_unweighted": train_loss_metrics["unweighted"],
                     "train_accuracy": train_accuracy,
                     "train_macro_f1": train_metrics["macro_f1"],
                     "validation_loss": validation_loss,
+                    "validation_loss_weighted": validation_loss_metrics["weighted"],
+                    "validation_loss_unweighted": validation_loss_metrics["unweighted"],
                     "validation_accuracy": validation_accuracy,
                     "validation_macro_f1": validation_metrics["macro_f1"],
                     **{
@@ -500,7 +547,14 @@ def main(
             raise RuntimeError("Training completed without producing a model state")
         logger.info("Restoring best-validation model and starting test pass")
         classifier.load_state_dict(best_state)
-        test_loss, test_accuracy, test_labels, test_probabilities, test_predictions = run_epoch(
+        (
+            test_loss,
+            test_accuracy,
+            test_labels,
+            test_probabilities,
+            test_predictions,
+            _,
+        ) = run_epoch(
             classifier,
             loaders["test"],
             evaluation_loss_function,
