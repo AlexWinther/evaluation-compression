@@ -16,6 +16,19 @@ INTERIM_DATA_DIR = DATA_DIR / "interim"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 EXTERNAL_DATA_DIR = DATA_DIR / "external"
 
+FAIRVISION_PROTECTED_ATTRIBUTES = (
+    "age",
+    "gender",
+    "race",
+    "ethnicity",
+    "language",
+    "maritalstatus",
+)
+CLASS_TO_IDX = {
+    "dr": {"non-vision threatening dr": 0, "vision threatening dr": 1},
+    "glaucoma": {"no": 0, "yes": 1},
+    "amd": {"normal": 0, "early amd": 1, "intermediate amd": 2, "late amd": 3},
+}
 MODELS_DIR = PROJ_ROOT / "models"
 MLFLOW_DB_PATH = PROJ_ROOT / "mlflow.db"
 

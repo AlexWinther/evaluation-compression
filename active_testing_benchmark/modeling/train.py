@@ -2,43 +2,39 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import json
-from pathlib import Path
 import random
 import sys
 import tempfile
 import time
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
 
-from loguru import logger
 import mlflow
-from mlflow.models import infer_signature
 import mlflow.pytorch
 import numpy as np
-from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
 import torch
+import typer
+from loguru import logger
+from mlflow.models import infer_signature
+from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, WeightedRandomSampler
-import typer
+from tqdm import tqdm
 
-from active_testing_benchmark.config import (
-    PROJ_ROOT,
-    RAW_DATA_DIR,
-)
 from active_testing_benchmark.modeling.data import (
-    ImageClassificationDataset,
-    class_mapping,
+    FairVisionDataset,
+    get_class_counts,
+    inverse_frequency_weights,
 )
-from active_testing_benchmark.modeling.models import (
-    create_model_and_transform,
-    torchvision_transform,
-)
-from active_testing_benchmark.modeling.provenance import (
-    FAIRVISION_SOURCE,
-    build_dataset_provenance,
-    git_provenance,
-)
+
+# from active_testing_benchmark.modeling.provenance import (
+#     FAIRVISION_SOURCE,
+#     build_dataset_provenance,
+#     git_provenance,
+# )
 from active_testing_benchmark.modeling.registry import (
     configure_mlflow,
     fairvision_model_name,
@@ -46,8 +42,6 @@ from active_testing_benchmark.modeling.registry import (
 )
 
 app = typer.Typer(add_completion=False, help=__doc__)
-MODEL_NAMES = ["resnet18"]
-IMBALANCE_STRATEGIES = ["none", "weighted-sampling", "class-weighted-loss"]
 
 
 def set_seed(seed: int, device: torch.device) -> None:
@@ -59,7 +53,7 @@ def set_seed(seed: int, device: torch.device) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def selected_device(requested: str = "auto") -> torch.device:
+def select_device(requested: str = "auto") -> torch.device:
     """Resolve an explicit device or automatically select the best available one."""
     if requested not in {"auto", "cpu", "cuda", "mps"}:
         raise ValueError("Device must be one of: auto, cpu, cuda, mps")
@@ -80,557 +74,115 @@ def selected_device(requested: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
-def run_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    loss_function: nn.Module,
-    device: torch.device,
-    optimizer: AdamW | None = None,
-    progress_label: str | None = None,
-    class_weights: torch.Tensor | None = None,
-) -> tuple[float, float, list[int], list[float], list[int], dict[str, float]]:
-    """Train when an optimizer is supplied; otherwise evaluate."""
-    is_training = optimizer is not None
-    model.train(is_training)
-    total_loss = correct = total = 0
-    weighted_loss_sum = unweighted_loss_sum = weighted_denominator = 0.0
-    labels: list[int] = []
-    positive_probabilities: list[float] = []
-    predictions: list[int] = []
-    batch_count = len(loader)
-    progress_interval = max(1, (batch_count + 3) // 4)
-    started_at = time.monotonic()
-    context = torch.enable_grad() if is_training else torch.no_grad()
-    with context:
-        for batch_index, (images, targets) in enumerate(loader, start=1):
-            images, targets = images.to(device), targets.to(device)
-            if optimizer is not None:
-                optimizer.zero_grad()
-            outputs = model(images)
-            loss = loss_function(outputs, targets)
-            with torch.no_grad():
-                unweighted_loss_sum += nn.functional.cross_entropy(
-                    outputs, targets, reduction="sum"
-                ).item()
-                weighted_loss_sum += nn.functional.cross_entropy(
-                    outputs, targets, weight=class_weights, reduction="sum"
-                ).item()
-                weighted_denominator += (
-                    class_weights[targets].sum().item()
-                    if class_weights is not None
-                    else targets.numel()
-                )
-            if optimizer is not None:
-                loss.backward()
-                optimizer.step()
-            batch_predictions = outputs.argmax(dim=1)
-            total_loss += loss.item() * targets.size(0)
-            correct += (batch_predictions == targets).sum().item()
-            total += targets.size(0)
-            labels.extend(targets.cpu().tolist())
-            predictions.extend(batch_predictions.cpu().tolist())
-            if outputs.shape[1] == 2:
-                positive_probabilities.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().tolist())
-            if progress_label and (
-                batch_index % progress_interval == 0 or batch_index == batch_count
-            ):
-                logger.info(
-                    "{}: {}/{} batches ({:.0f}%), {} samples, {:.1f}s elapsed",
-                    progress_label,
-                    batch_index,
-                    batch_count,
-                    100 * batch_index / batch_count,
-                    total,
-                    time.monotonic() - started_at,
-                )
-    weighted_loss = (
-        weighted_loss_sum / weighted_denominator if weighted_denominator > 0 else float("nan")
-    )
-    loss_metrics = {
-        "weighted": weighted_loss,
-        "unweighted": unweighted_loss_sum / total,
-    }
-    return (
-        total_loss / total,
-        correct / total,
-        labels,
-        positive_probabilities,
-        predictions,
-        loss_metrics,
+@dataclass(frozen=True)
+class TrainConfig:
+    batch_size: int = 32
+    num_workers: int = 0
+    epochs: int = 5
+    learning_rate: float = 1e-4
+    seed: int = 42
+    image_size: int = 224
+    weighted_sampling: bool = False
+    weighted_loss: bool = True
+    sampling_power: float = 1.0
+    loss_power: float = 1.0
+
+
+def make_train_loader_and_loss(
+    dataset: FairVisionDataset, config: TrainConfig, device: torch.device
+):
+    counts = get_class_counts(dataset)
+    sampler = None
+    if config.weighted_sampling:
+        per_class_weights = inverse_frequency_weights(counts, config.sampling_power)
+        targets = torch.as_tensor(dataset.targets, dtype=torch.long)
+        sample_weights = per_class_weights[targets].double()
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(dataset),
+            replacement=True,
+            generator=torch.Generator().manual_seed(config.seed),
+        )
+
+    train_loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        sampler=sampler,
+        shuffle=sampler is None,
+        num_workers=config.num_workers,
+        pin_memory=device.type == "cuda",
+        generator=torch.Generator().manual_seed(config.seed),
     )
 
-
-def classification_metrics(
-    labels: list[int],
-    positive_probabilities: list[float],
-    predictions: list[int],
-    num_classes: int,
-) -> dict[str, float]:
-    """Compute imbalance-aware classification metrics when they are defined."""
-    metrics = {"macro_f1": f1_score(labels, predictions, average="macro", zero_division=0.0)}
-    if num_classes == 2 and len(set(labels)) == 2:
-        metrics["roc_auc"] = roc_auc_score(labels, positive_probabilities)
-    return metrics
-
-
-def inverse_frequency_class_weights(
-    dataset: ImageClassificationDataset, num_classes: int
-) -> torch.Tensor:
-    """Return inverse-frequency class weights for labels present in ``dataset``."""
-    labels = torch.tensor([label for _, label in dataset.records], dtype=torch.long)
-    counts = torch.bincount(labels, minlength=num_classes).to(dtype=torch.float)
-    weights = torch.zeros(num_classes, dtype=torch.float)
-    present = counts > 0
-    weights[present] = len(dataset) / (num_classes * counts[present])
-    return weights
-
-
-def make_loader(
-    dataset: ImageClassificationDataset,
-    batch_size: int,
-    workers: int,
-    shuffle: bool,
-    imbalance_strategy: str = "none",
-) -> DataLoader:
-    if imbalance_strategy == "weighted-sampling":
-        class_weights = inverse_frequency_class_weights(
-            dataset, num_classes=max(label for _, label in dataset.records) + 1
-        )
-        sample_weights = torch.tensor(
-            [class_weights[label] for _, label in dataset.records], dtype=torch.float
-        )
-        sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
-        return DataLoader(
-            dataset, batch_size=batch_size, sampler=sampler, num_workers=workers, pin_memory=True
-        )
-    return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, pin_memory=True
-    )
-
-
-@app.command()
-def main(
-    model: str = typer.Option("resnet18", help="Currently supported model: resnet18."),
-    batch_size: int = typer.Option(32, min=1),
-    epochs: int = typer.Option(30, min=1),
-    patience: int = typer.Option(
-        5, min=1, help="Stop after this many consecutive epochs without lower validation loss."
-    ),
-    learning_rate: float = typer.Option(1e-4, min=0.0),
-    seed: int = typer.Option(42),
-    num_workers: int = typer.Option(0, min=0),
-    image_size: int = typer.Option(224, min=32),
-    device_preference: str = typer.Option(
-        "auto", "--device", help="Compute device: auto, cpu, cuda, or mps."
-    ),
-    metadata_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI options as defaults.
-        RAW_DATA_DIR / "fairvision/dr/metadata.csv"
-    ),
-    image_root: Path | None = typer.Option(None),  # noqa: B008 - Typer CLI option default.
-    image_column: str = typer.Option("filename"),
-    target_column: str = typer.Option("dr"),
-    disease_type: str | None = typer.Option(
-        None,
-        help="Disease identifier used in the registered model name; defaults to target-column.",
-    ),
-    split_column: str = typer.Option("use"),
-    validate_images: bool = typer.Option(
-        False,
-        "--validate-images/--no-validate-images",
-        help="Check every image path before training; slow on HPC shared filesystems.",
-    ),
-    experiment_name: str = typer.Option("image-classification"),
-    dataset_source: str = typer.Option(FAIRVISION_SOURCE),
-    pretrained: bool = typer.Option(True, "--pretrained/--no-pretrained"),
-    imbalance_strategy: str = typer.Option(
-        "class-weighted-loss",
-        help="none, weighted-sampling, or class-weighted-loss (the default).",
-    ),
-) -> None:
-    """Run a minimal train/validation/test image-classification experiment."""
-    if model not in MODEL_NAMES:
-        raise typer.BadParameter(f"Choose one of: {', '.join(MODEL_NAMES)}")
-    if imbalance_strategy not in IMBALANCE_STRATEGIES:
-        raise typer.BadParameter(f"Choose one of: {', '.join(IMBALANCE_STRATEGIES)}")
-    disease_type = disease_type or target_column
-    try:
-        registry_name = fairvision_model_name(disease_type, model)
-    except ValueError as error:
-        raise typer.BadParameter(str(error)) from error
-    logger.info("Configuring MLflow for registered model {}", registry_name)
-    configure_mlflow()
-    metadata_path = metadata_path.resolve()
-    image_root = (image_root or metadata_path.parent).resolve()
-    if not metadata_path.is_file():
-        raise typer.BadParameter(f"Metadata file does not exist: {metadata_path}")
-
-    logger.info("Initializing PyTorch compute device (requested={})", device_preference)
-    try:
-        device = selected_device(device_preference)
-    except ValueError as error:
-        raise typer.BadParameter(str(error), param_hint="--device") from error
-    set_seed(seed, device)
-    logger.info("Selected compute device: {}", device)
-    logger.info(
-        "Indexing dataset splits"
-        + (" and validating image paths" if validate_images else " without path validation")
-    )
-    logger.info("Reading class mapping from {}", metadata_path)
-    class_to_index = class_mapping(metadata_path, target_column)
-    logger.info("Creating {} classifier with {} output classes", model, len(class_to_index))
-    classifier, train_transform = create_model_and_transform(
-        model, len(class_to_index), pretrained, image_size
-    )
-    validation_transform = torchvision_transform(image_size, training=False)
-    datasets = {}
-    for split in ("training", "validation", "test"):
-        logger.info("Indexing {!r} split", split)
-        datasets[split] = ImageClassificationDataset(
-            metadata_path,
-            image_root,
-            image_column,
-            target_column,
-            split_column,
-            split,
-            class_to_index,
-            train_transform if split == "training" else validation_transform,
-            validate_paths=validate_images,
-        )
-        logger.info("Indexed {!r} split: {} samples", split, len(datasets[split]))
-    logger.info("Creating data loaders with {} worker(s)", num_workers)
-    loaders = {
-        split: make_loader(
-            dataset,
-            batch_size,
-            num_workers,
-            shuffle=split == "training",
-            imbalance_strategy=imbalance_strategy if split == "training" else "none",
-        )
-        for split, dataset in datasets.items()
-    }
-    logger.info("Moving model to {}", device)
-    classifier.to(device)
-    optimizer = AdamW((p for p in classifier.parameters() if p.requires_grad), lr=learning_rate)
-    class_weights = (
-        inverse_frequency_class_weights(datasets["training"], len(class_to_index))
-        if imbalance_strategy == "class-weighted-loss"
+    loss_weights = (
+        inverse_frequency_weights(counts, config.loss_power).to(device)
+        if config.weighted_loss
         else None
     )
-    loss_reporting_weights = class_weights
-    if loss_reporting_weights is None:
-        loss_reporting_weights = inverse_frequency_class_weights(
-            datasets["training"], len(class_to_index)
-        )
-    loss_reporting_weights = loss_reporting_weights.to(device)
-    training_loss_function = nn.CrossEntropyLoss(
-        weight=class_weights.to(device) if class_weights is not None else None
-    )
-    evaluation_loss_function = nn.CrossEntropyLoss()
-    validation_loss_function = (
-        training_loss_function
-        if imbalance_strategy == "class-weighted-loss"
-        else evaluation_loss_function
-    )
-    config = {
-        "model": model,
-        "batch_size": batch_size,
-        "epochs": epochs,
-        "patience": patience,
-        "learning_rate": learning_rate,
-        "seed": seed,
-        "num_workers": num_workers,
-        "image_size": image_size,
-        "device_preference": device_preference,
-        "metadata_path": str(metadata_path),
-        "image_root": str(image_root),
-        "image_column": image_column,
-        "target_column": target_column,
-        "disease_type": disease_type,
-        "registry_name": registry_name,
-        "split_column": split_column,
-        "validate_images": validate_images,
-        "pretrained": pretrained,
-        "imbalance_strategy": imbalance_strategy,
-        "dataset_source": dataset_source,
-        "class_weights": class_weights.tolist() if class_weights is not None else None,
-        "loss_reporting_class_weights": loss_reporting_weights.cpu().tolist(),
-    }
-    logger.info(
-        "Training setup ready: model={}, strategy={}, train={}, validation={}, test={}",
-        model,
-        imbalance_strategy,
-        len(datasets["training"]),
-        len(datasets["validation"]),
-        len(datasets["test"]),
-    )
-    logger.info("Connecting to MLflow experiment {!r}", experiment_name)
-    mlflow.set_experiment(experiment_name)
-    logger.info("Building dataset provenance")
-    provenance = build_dataset_provenance(
-        metadata_path,
-        image_root,
-        image_column,
-        target_column,
-        split_column,
-        class_to_index,
-        dataset_source,
-    )
-    logger.info("Dataset provenance ready: manifest SHA-256={}", provenance.manifest_digest)
-    timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-    with mlflow.start_run(run_name=f"{model}-seed-{seed}-{timestamp}") as run:
-        logger.info("Started MLflow run {}", run.info.run_id)
-        logger.info("Logging run tags, parameters, inputs, and provenance")
-        mlflow.set_tags(
-            {
-                **git_provenance(PROJ_ROOT),
-                "dataset.source": dataset_source,
-                "dataset.metadata.sha256": provenance.metadata_digest,
-                "dataset.manifest.sha256": provenance.manifest_digest,
-                "model.family": model,
-                "model.registered_name": registry_name,
-                "disease.type": disease_type,
-                "training.seed": str(seed),
-                "runtime.python": sys.version.split()[0],
-                "runtime.mlflow": mlflow.__version__,
-                "runtime.torch": torch.__version__,
-            }
-        )
-        for split, dataset_input in provenance.datasets.items():
-            mlflow.log_input(dataset_input, context=split)
-        mlflow.log_params(
-            {
-                **config,
-                "optimizer": "AdamW",
-                "device": str(device),
-                "num_classes": len(class_to_index),
-                "train_samples": len(datasets["training"]),
-                "validation_samples": len(datasets["validation"]),
-                "test_samples": len(datasets["test"]),
-            }
-        )
-        mlflow.log_dict(config, "training_config.json")
-        mlflow.log_dict(class_to_index, "class_mapping.json")
-        mlflow.log_artifact(str(PROJ_ROOT / "uv.lock"))
-        mlflow.log_dict(
-            {
-                "dataset_source": dataset_source,
-                "metadata_sha256": provenance.metadata_digest,
-                "manifest_sha256": provenance.manifest_digest,
-                "split_counts": provenance.split_counts,
-                "image_bytes_logged": False,
-                "metadata_rows_logged": False,
-                "model_input_example": "synthetic zero tensor",
-            },
-            "provenance.json",
-        )
-        logger.info("Initial MLflow run metadata logged")
-        best_validation_loss = float("inf")
-        best_validation_accuracy = 0.0
-        best_state: dict[str, torch.Tensor] | None = None
-        epochs_without_improvement = 0
-        for epoch in range(1, epochs + 1):
-            logger.info("Epoch {}/{}: starting training pass", epoch, epochs)
-            (
-                train_loss,
-                train_accuracy,
-                train_labels,
-                train_probabilities,
-                train_predictions,
-                train_loss_metrics,
-            ) = run_epoch(
-                classifier,
-                loaders["training"],
-                training_loss_function,
-                device,
-                optimizer,
-                progress_label=f"Epoch {epoch}/{epochs} training",
-                class_weights=loss_reporting_weights,
-            )
-            logger.info("Epoch {}/{}: starting validation pass", epoch, epochs)
-            (
-                validation_loss,
-                validation_accuracy,
-                validation_labels,
-                validation_probabilities,
-                validation_predictions,
-                validation_loss_metrics,
-            ) = run_epoch(
-                classifier,
-                loaders["validation"],
-                validation_loss_function,
-                device,
-                progress_label=f"Epoch {epoch}/{epochs} validation",
-                class_weights=loss_reporting_weights,
-            )
-            train_metrics = classification_metrics(
-                train_labels, train_probabilities, train_predictions, len(class_to_index)
-            )
-            validation_metrics = classification_metrics(
-                validation_labels,
-                validation_probabilities,
-                validation_predictions,
-                len(class_to_index),
-            )
-            logger.info(
-                "Epoch {}/{} train: loss={:.4f}, accuracy={:.4f}, macro-F1={:.4f}{}",
-                epoch,
-                epochs,
-                train_loss,
-                train_accuracy,
-                train_metrics["macro_f1"],
-                _roc_auc_report(train_metrics, "train"),
-            )
-            logger.info(
-                "Epoch {}/{} validation: loss={:.4f}, accuracy={:.4f}, macro-F1={:.4f}{}",
-                epoch,
-                epochs,
-                validation_loss,
-                validation_accuracy,
-                validation_metrics["macro_f1"],
-                _roc_auc_report(validation_metrics, "validation"),
-            )
-            mlflow.log_metrics(
+    train_criterion = nn.CrossEntropyLoss(weight=loss_weights)
+    return train_loader, train_criterion, counts, loss_weights
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: AdamW,
+    device: torch.device,
+):
+    model.train()
+    running_loss = 0.0
+
+    for i, batch in enumerate(tqdm(loader)):
+        images = batch["image"].to(device, non_blocking=True)
+        targets = batch["target"].to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = criterion(logits, targets)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+        if i > 5:
+            break
+
+    return running_loss / len(loader)  # Mean minibatch loss
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
+    model.eval()
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+    total_loss = 0.0
+    correct = 0
+    n = 0
+    predictions = []
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True)
+        targets = batch["target"].to(device, non_blocking=True).long()
+        logits = model(images)
+        probabilities = logits.softmax(dim=1)
+        predicted = logits.argmax(dim=1)
+
+        total_loss += criterion(logits, targets).item()
+        correct += (predicted == targets).sum().item()
+        n += targets.numel()
+        for i, image_id in enumerate(batch["id"]):
+            predictions.append(
                 {
-                    "train_loss": train_loss,
-                    "train_loss_weighted": train_loss_metrics["weighted"],
-                    "train_loss_unweighted": train_loss_metrics["unweighted"],
-                    "train_accuracy": train_accuracy,
-                    "train_macro_f1": train_metrics["macro_f1"],
-                    "validation_loss": validation_loss,
-                    "validation_loss_weighted": validation_loss_metrics["weighted"],
-                    "validation_loss_unweighted": validation_loss_metrics["unweighted"],
-                    "validation_accuracy": validation_accuracy,
-                    "validation_macro_f1": validation_metrics["macro_f1"],
-                    **{
-                        f"train_{name}": value
-                        for name, value in train_metrics.items()
-                        if name == "roc_auc"
+                    "id": image_id,
+                    "target": targets[i].item(),
+                    "prediction": predicted[i].item(),
+                    "probabilities": probabilities[i].cpu().tolist(),
+                    "protected": {
+                        name: values[i] for name, values in batch["protected"].items()
                     },
-                    **{
-                        f"validation_{name}": value
-                        for name, value in validation_metrics.items()
-                        if name == "roc_auc"
-                    },
-                },
-                step=epoch,
+                }
             )
-            if validation_loss < best_validation_loss:
-                best_validation_loss, best_validation_accuracy = (
-                    validation_loss,
-                    validation_accuracy,
-                )
-                best_state = deepcopy(classifier.state_dict())
-                epochs_without_improvement = 0
-                logger.info(
-                    "Epoch {}/{}: retained new best model (validation loss={:.4f})",
-                    epoch,
-                    epochs,
-                    validation_loss,
-                )
-            else:
-                epochs_without_improvement += 1
-                logger.info(
-                    "Epoch {}/{}: validation loss did not improve ({}/{} consecutive epochs)",
-                    epoch,
-                    epochs,
-                    epochs_without_improvement,
-                    patience,
-                )
-                if epochs_without_improvement >= patience:
-                    logger.info(
-                        "Early stopping after epoch {}: validation loss did not improve for {} epochs",
-                        epoch,
-                        patience,
-                    )
-                    break
-        if best_state is None:  # pragma: no cover - epochs is validated as positive
-            raise RuntimeError("Training completed without producing a model state")
-        logger.info("Restoring best-validation model and starting test pass")
-        classifier.load_state_dict(best_state)
-        (
-            test_loss,
-            test_accuracy,
-            test_labels,
-            test_probabilities,
-            test_predictions,
-            _,
-        ) = run_epoch(
-            classifier,
-            loaders["test"],
-            evaluation_loss_function,
-            device,
-            progress_label="Test",
-        )
-        final_metrics = {
-            "test_loss": test_loss,
-            "test_accuracy": test_accuracy,
-            "best_validation_loss": best_validation_loss,
-            "best_validation_accuracy": best_validation_accuracy,
-            **{
-                f"test_{name}": value
-                for name, value in classification_metrics(
-                    test_labels, test_probabilities, test_predictions, len(class_to_index)
-                ).items()
-            },
-        }
-        mlflow.log_metrics(final_metrics)
-        logger.info(
-            "Test metrics logged to MLflow: loss={:.4f}, accuracy={:.4f}", test_loss, test_accuracy
-        )
-        input_example = torch.zeros((1, 3, image_size, image_size), dtype=torch.float32)
-        classifier.eval()
-        with torch.no_grad():
-            output_example = classifier(input_example.to(device)).cpu().numpy()
-        with tempfile.TemporaryDirectory(prefix="fairvision-mlflow-") as temporary_directory:
-            logger.info("Preparing final model artifacts for MLflow upload")
-            artifact_dir = Path(temporary_directory)
-            config_path = artifact_dir / f"{model}_config.json"
-            mapping_path = artifact_dir / f"{model}_classes.json"
-            matrix_path = artifact_dir / f"{model}_test_confusion_matrix.csv"
-            config_path.write_text(json.dumps(config, indent=2) + "\n")
-            mapping_path.write_text(json.dumps(class_to_index, indent=2) + "\n")
-            np.savetxt(
-                matrix_path,
-                confusion_matrix(test_labels, test_predictions),
-                delimiter=",",
-                fmt="%d",
-            )
-            mlflow.log_artifact(str(matrix_path))
-            model_info = mlflow.pytorch.log_model(
-                classifier,
-                name="model",
-                signature=infer_signature(input_example.numpy(), output_example),
-                input_example=input_example.numpy(),
-                code_paths=[str(PROJ_ROOT / "active_testing_benchmark")],
-                extra_files=[str(config_path), str(mapping_path)],
-                serialization_format="pickle",
-            )
-        logger.info("Model artifact uploaded; registering {}", registry_name)
-        version = register_trained_model(
-            model_info.model_uri,
-            registry_name,
-            run.info.run_id,
-            run.info.experiment_id,
-            disease_type,
-            model,
-            final_metrics,
-        )
-        logger.info("Registered {} version {}", registry_name, version)
-    logger.success(
-        "Training complete: models:/{}/latest (version {}), test loss={:.4f}, accuracy={:.4f}",
-        registry_name,
-        version,
-        test_loss,
-        test_accuracy,
+
+    # auc
+    auc = roc_auc_score(
+        [p["target"] for p in predictions],
+        [p["probabilities"][1] for p in predictions],
     )
-    if "test_roc_auc" in final_metrics:
-        logger.info("Test ROC-AUC: {:.4f}", final_metrics["test_roc_auc"])
-
-
-def _roc_auc_report(metrics: dict[str, float], split: str) -> str:
-    """Format ROC-AUC only for binary splits containing both classes."""
-    return f", {split} ROC-AUC={metrics['roc_auc']:.4f}" if "roc_auc" in metrics else ""
-
-
-if __name__ == "__main__":
-    app()
+    
+    return {"loss": total_loss / n, "accuracy": correct / n, "roc_auc": auc, "predictions": predictions}

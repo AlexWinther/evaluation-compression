@@ -31,6 +31,7 @@ dependencies = [
     "ruff",
     "scikit-learn",
     "torch",
+    "torchcodec>=0.17.0",
     "torchvision",
     "tqdm",
     "typer",

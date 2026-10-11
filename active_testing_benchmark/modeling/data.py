@@ -1,107 +1,144 @@
-"""Small dataset helpers for image-classification experiments."""
+"""Torch dataset implementation for FairVision dataset for image classification."""
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
-from typing import Callable
+from pathlib import Path
+from typing import Callable, Iterable
 
 import pandas as pd
+import torch
 from torch import Tensor
 from torch.utils.data import Dataset
-from torchvision.io import ImageReadMode, decode_image
+from torchcodec.decoders import decode_image
+
+from active_testing_benchmark.config import (
+    CLASS_TO_IDX,
+    FAIRVISION_PROTECTED_ATTRIBUTES,
+    RAW_DATA_DIR,
+)
 
 
-class ImageClassificationDataset(Dataset[tuple[Tensor, int]]):
-    """Load one metadata split without copying or transforming the source images."""
-
+class FairVisionDataset(Dataset):
     def __init__(
         self,
-        metadata_path: Path,
-        image_root: Path,
-        image_column: str,
-        target_column: str,
-        split_column: str,
-        split: str,
-        class_to_index: dict[str, int],
+        disease: str = 'dr',
+        split: str | Iterable[str] = 'train',
         transform: Callable | None = None,
-        validate_paths: bool = True,
-    ) -> None:
-        dataframe = pd.read_csv(metadata_path)
-        required = {image_column, target_column, split_column}
-        missing = required.difference(dataframe.columns)
-        if missing:
-            raise ValueError(f"Metadata is missing required columns: {', '.join(sorted(missing))}")
+        protected_columns: tuple[str, ...] = FAIRVISION_PROTECTED_ATTRIBUTES,
+        fairvision_data_root: str | Path = RAW_DATA_DIR / "fairvision",
+    ):
+        if disease.lower() not in {'dr', 'glaucoma', 'amd'}:
+            raise ValueError(f"Unsupported disease: {disease}")
 
-        split_dataframe = dataframe[
-            dataframe[split_column].astype(str).str.lower() == split.lower()
-        ]
-        if split_dataframe.empty:
-            available = ", ".join(sorted(dataframe[split_column].dropna().astype(str).unique()))
-            raise ValueError(
-                f"No '{split}' rows in {split_column!r}; available values: {available}"
-            )
-
-        self.records: list[tuple[Path, int]] = []
-        self.row_ids = split_dataframe.index.to_numpy(copy=True)
-        for _, row in split_dataframe.iterrows():
-            image_path = resolve_image_path(
-                image_root, str(row[image_column]), split, check_exists=validate_paths
-            )
-            if validate_paths and not image_path.is_file():
-                raise FileNotFoundError(
-                    f"Image for metadata value {row[image_column]!r} was not found at {image_path}. "
-                    "Pass --image-root or --image-column for a different layout."
-                )
-            label = str(row[target_column])
-            self.records.append((image_path, class_to_index[label]))
+        self.root = Path(fairvision_data_root) / disease.lower()
         self.transform = transform
+        self.class_to_idx = dict(CLASS_TO_IDX[disease.lower()])
 
-    def __len__(self) -> int:
-        return len(self.records)
+        if not self.class_to_idx or set(self.class_to_idx.values()) != set(range(len(self.class_to_idx))):
+            raise ValueError('class_to_idx must map labels bijectively to 0, ..., C-1.')
 
-    def __getitem__(self, index: int) -> tuple[Tensor, int]:
-        image_path, label = self.records[index]
-        image = decode_image(str(image_path), mode=ImageReadMode.RGB)
+        self.classes = [
+            label for label, _ in sorted(self.class_to_idx.items(), key=lambda pair: pair[1])
+        ]
+
+        splits = (split,) if isinstance(split, str) else tuple(split)
+
+        # Make "train" -> "training" and "val" -> "validation"
+        splits = tuple( 'training' if s == 'train' else 'validation' if s == 'val' else s for s in splits )
+
+        if not splits or len(splits) != len(set(splits)) or not set(splits) <= {'training', 'validation', 'test'}:
+            raise ValueError('split must contain only unique values among training (train), validation (val), test.')
+
+
+        metadata_id_column = 'filename'
+        metadata = pd.read_csv(
+            self.root / 'metadata.csv',
+            dtype={metadata_id_column: 'string', disease.lower(): 'string'},
+        )
+
+        # Extract change the id from metadata filename coloumn
+        metadata[metadata_id_column] = metadata[metadata_id_column].apply(
+            lambda x: re.sub(r"^data_(\d+)\.npz$", r"\1", x)
+        )
+
+        required = {metadata_id_column, disease.lower(), *protected_columns}
+        missing = required - set(metadata.columns)
+        if missing:
+            raise ValueError(f'Missing metadata columns: {sorted(missing)}')
+        if metadata[metadata_id_column].isna().any():
+            raise ValueError('Metadata contains missing image IDs.')
+        metadata = metadata.set_index(metadata_id_column, verify_integrity=True)
+
+        self.samples = []
+        self.targets = []
+        seen_ids = set()
+
+        for name in splits:
+            image_dir = self.root / name
+            if not image_dir.is_dir():
+                raise FileNotFoundError(image_dir)
+            paths = sorted(image_dir.glob('*.jpg'))
+            if not paths:
+                raise ValueError(f'No JPEG images found in {image_dir}')
+
+            for path in paths:
+                # Extract the image ID from the path stem (filename without extension and without the "slo_fundus_" prefix)
+                image_id = path.stem.replace("slo_fundus_", "")
+                if image_id in seen_ids:
+                    raise ValueError(f'Duplicate image ID across selected splits: {image_id}')
+                seen_ids.add(image_id)
+                if image_id not in metadata.index:
+                    raise ValueError(f'Missing metadata for image: {image_id}')
+
+                row = metadata.loc[image_id]
+                label = row[disease.lower()]
+                if pd.isna(label) or str(label) not in self.class_to_idx:
+                    raise ValueError(f'Missing or unknown class for {image_id}: {label}')
+
+                target = self.class_to_idx[str(label)]
+                protected = {
+                    col: 'Unknown' if pd.isna(row[col]) else str(row[col])
+                    for col in protected_columns
+                }
+                self.samples.append({
+                    'path': path,
+                    'id': image_id,
+                    'target': target,
+                    'protected': protected,
+                })
+                self.targets.append(target)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        record = self.samples[index]
+
+        image = decode_image(record['path'], mode='RGB')
+
         if self.transform is not None:
             image = self.transform(image)
-        return image, label
+
+        return {
+            'image': image,
+            'target': record['target'],
+            'id': record['id'],
+            'protected': record['protected'],
+        }
 
 
-def resolve_image_path(
-    image_root: Path, image_value: str, split: str, check_exists: bool = True
-) -> Path:
-    """Resolve direct relative paths and FairVision ``data_*.npz`` identifiers.
-
-    FairVision metadata names OCT files (``data_00001.npz``), while this project
-    downloads corresponding SLO JPEGs (``training/slo_fundus_00001.jpg``).
-    """
-    supplied_path = Path(image_value)
-    match = re.fullmatch(r"data_(\d+)\.npz", supplied_path.name)
-    if match:
-        fairvision_path = image_root / split / f"slo_fundus_{match.group(1)}.jpg"
-        if not check_exists or fairvision_path.is_file():
-            return fairvision_path
-    candidates = [
-        supplied_path if supplied_path.is_absolute() else image_root / supplied_path,
-        image_root / split / supplied_path.name,
-    ]
-    if not check_exists:
-        if supplied_path.is_absolute() or supplied_path.parent != Path("."):
-            return candidates[0]
-        return candidates[1]
-    match = re.search(r"(\d+)$", supplied_path.stem)
-    if match:
-        candidates.append(image_root / split / f"slo_fundus_{match.group(1)}.jpg")
-    return next((candidate for candidate in candidates if candidate.is_file()), candidates[-1])
+def get_class_counts(dataset: FairVisionDataset) -> torch.Tensor:
+    targets = torch.as_tensor(dataset.targets, dtype=torch.long)
+    counts = torch.bincount(targets, minlength=len(dataset.classes))
+    missing = torch.where(counts == 0)[0].tolist()
+    if missing:
+        raise ValueError(f'No training samples for classes: {[dataset.classes[i] for i in missing]}')
+    return counts
 
 
-def class_mapping(metadata_path: Path, target_column: str) -> dict[str, int]:
-    """Build a stable class-to-index mapping from all metadata rows."""
-    dataframe = pd.read_csv(metadata_path)
-    if target_column not in dataframe.columns:
-        raise ValueError(f"Metadata has no target column {target_column!r}")
-    labels = sorted(dataframe[target_column].dropna().astype(str).unique())
-    if len(labels) < 2:
-        raise ValueError(f"Expected at least two labels in {target_column!r}, found {labels}")
-    return {label: index for index, label in enumerate(labels)}
+def inverse_frequency_weights(counts: torch.Tensor, power: float = 1.0) -> torch.Tensor:
+    if not 0.0 <= power <= 1.0:
+        raise ValueError('power must be in [0, 1].')
+    weights = counts.to(dtype=torch.float64).pow(-power)
+    return (weights / weights.mean()).float()
