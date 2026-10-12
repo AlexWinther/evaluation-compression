@@ -129,6 +129,7 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: AdamW,
     device: torch.device,
+    debug: int | None = None,
 ):
     model.train()
     running_loss = 0.0
@@ -142,7 +143,7 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         running_loss += loss.item()
-        if i > 5:
+        if debug and i > debug:
             break
 
     return running_loss / len(loader)  # Mean minibatch loss

@@ -76,6 +76,7 @@ class UniformSampleMean(ActiveEvaluationMethod):
 
     def initialize(self, problem: dict) -> dict:
         return {
+            "N": problem["N"],
             "remaining": set(range(problem["N"])),
             "remaining_budget": problem["budget"],
             "observed_losses": [],
@@ -97,7 +98,7 @@ class UniformSampleMean(ActiveEvaluationMethod):
         return SelectionPlan(
             indices=indices,
             selection_probabilities=[1.0 / (len(remaining) - offset) for offset in range(count)],
-            inclusion_probabilities=[count / len(remaining)] * count,
+            inclusion_probabilities=[(len(state['selections']) + offset) / state['N'] for offset in range(1, count + 1)],
             metadata={"design": "uniform_without_replacement"},
         )
 
@@ -114,55 +115,53 @@ class UniformSampleMean(ActiveEvaluationMethod):
         return Estimate(risk=float(np.mean(losses)), n_labels=len(losses))
 
 
-def resolve_budget(value: str, population: int) -> int:
-    """Integer syntax means count; decimal syntax means fraction, rounded up."""
-    value = value.strip()
-    if population < 1:
-        raise ValueError("Test population must be positive")
-    if re.fullmatch(r"[0-9]+", value):
-        budget = int(value)
-    else:
-        fraction = float(value)
-        if not math.isfinite(fraction) or not 0 < fraction <= 1:
-            raise ValueError("Fractional test sizes must be in (0, 1]")
-        budget = math.ceil(fraction * population)
-
-    if not 1 <= budget <= population:
-        raise ValueError(f"Test size must resolve to 1..{population} rows")
-    return budget
-
-
 def run_active_evaluation(
     method: ActiveEvaluationMethod,
     dataset: FairVisionDataset,
     model: nn.Module,
     device: torch.device,
+    loss_fn: nn.Module = nn.CrossEntropyLoss(reduction="sum"),
 ) -> Estimate:
     """Run the label-acquisition loop against a finite-pool label oracle."""
     model.eval()
 
-    X_pool = np.array([])
-    y_pool = np.array([])
+    X_pool = []
+    y_pool = []
+    logger.info(f"Loading {len(dataset):,} samples from the dataset for active evaluation")
     for index in range(len(dataset)):
         sample = dataset[index]
-        X_pool = np.append(X_pool, sample["image"])
-        y_pool = np.append(y_pool, sample["target"])
+
+        X_pool.append(sample["image"])
+        y_pool.append(sample["target"])
+
+    logger.debug(f"image shapes: {X_pool[0].shape}, dtype: {X_pool[0].dtype}")
+    logger.debug(f"y_pool type: {type(y_pool[0])}")
+
+    X_pool = torch.stack(X_pool).to(device, non_blocking=True)
+    logger.debug(f"X_pool shape: {X_pool.shape}, dtype: {X_pool.dtype}")
+
+    y_pool = torch.tensor(y_pool).to(device, non_blocking=True).long()
+    logger.debug(f"y_pool shape: {y_pool.shape}, dtype: {y_pool.dtype}")
+
+    logger.info(f"Loaded {len(X_pool):,} samples for active evaluation with {len(y_pool.unique()):,} unique classes")
 
     problem = {
         "N": len(X_pool),
         "X_pool": X_pool,
         "model": model,
-        "loss_fn": nn.CrossEntropyLoss(),
+        "loss_fn": loss_fn,
         "budget": len(X_pool),
     }
 
     state = method.initialize(problem)
     history = []
 
+    pbar = tqdm(total=problem["budget"], desc="Active evaluation progress", unit="label")
+
     while len(state["selections"]) < problem["budget"]:
         selection = method.acquire(state, history)
         indices = selection.indices
-        logger.info(f"Acquired selection: {indices}")
+        # logger.debug(f"Acquired selection: {indices}")
 
         if not indices or len(indices) != len(set(indices)):
             raise ValueError("A selection must contain unique indices")
@@ -176,11 +175,12 @@ def run_active_evaluation(
         labels = y_pool[indices]
         y_pred = model(X_pool[indices])
 
-        losses = [nn.CrossEntropyLoss(y_pred[i], labels[i]) for i in range(len(indices))]
+        losses = [problem["loss_fn"](y_pred[i], labels[i]).item() for i in range(len(indices))]
 
-        history.append(
-            {"round": len(history), "selection": selection, "labels": labels, "losses": losses, "estimate": method.estimate(state, history)}
-        )
         state = method.observe(state, selection, labels, losses)
+        history.append(
+            {"round": len(history) + 1, "total selections": len(state["selections"]), "selection": selection, "labels": labels, "losses": losses, "estimate": method.estimate(state, history)}
+        )
+        pbar.update(len(indices))
 
-    return history[-1]["estimate"] if history else method.estimate(state, history)
+    return history

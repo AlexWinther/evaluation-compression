@@ -29,7 +29,7 @@ def run_experiment(
     disease: str = "dr",
 ):
     configure_mlflow()
-    
+
     config = TrainConfig(
         batch_size=32,
         num_workers=0,
@@ -91,6 +91,7 @@ def run_experiment(
             criterion=train_criterion,
             optimizer=optimizer,
             device=device,
+            debug=5,
         )
 
         logger.info(f"Training loss at epoch {epoch + 1}: {train_loss:.4f}")
@@ -98,18 +99,23 @@ def run_experiment(
     results = evaluate(model=model, loader=val_loader, device=device)
 
     logger.info(
-        f"Evaluation results for trained model: "
+        f"Evaluation results for the trained model: "
         f"loss={results['loss']:.4f}, "
         f"accuracy={results['accuracy']:.4f}, "
         f"roc_auc={results['roc_auc']:.4f}"
     )
 
     # Run active evaluation on the test dataset
-    active_evaluation_results = run_active_evaluation(method=UniformSampleMean(), model=model, dataset=test_dataset, device=device)
+    active_evaluation_history = run_active_evaluation(
+        method=UniformSampleMean(batch_size=config.batch_size),
+        model=model,
+        dataset=test_dataset,
+        device=device,
+    )
 
-    logger.info(
-        f"Active evaluation results for trained model: "
-        f"{active_evaluation_results}"
+    logger.debug(
+        f"Active evaluation results for the trained model:\n"
+        f"{active_evaluation_history[0]}\n\n"
     )
 
     return "Experiment run successfully"
