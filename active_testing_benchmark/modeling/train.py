@@ -2,14 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import random
-import sys
-import tempfile
-import time
-from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
 
 import mlflow
 import mlflow.pytorch
@@ -132,6 +126,7 @@ def train_one_epoch(
     debug: int | None = None,
 ):
     model.train()
+    logger.info("Model set to train mode")
     running_loss = 0.0
 
     for i, batch in enumerate(tqdm(loader)):
@@ -152,19 +147,21 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
     model.eval()
+    logger.info("Model set to eval mode")
     criterion = nn.CrossEntropyLoss(reduction="sum")
     total_loss = 0.0
     correct = 0
     n = 0
     predictions = []
     for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        targets = batch["target"].to(device, non_blocking=True).long()
-        logits = model(images)
-        probabilities = logits.softmax(dim=1)
-        predicted = logits.argmax(dim=1)
+        with torch.inference_mode():
+            images = batch["image"].to(device, non_blocking=True)
+            targets = batch["target"].to(device, non_blocking=True).long()
+            logits = model(images)
+            probabilities = logits.softmax(dim=1)
+            predicted = logits.argmax(dim=1)
 
-        total_loss += criterion(logits, targets).item()
+            total_loss += criterion(logits, targets).item()
         correct += (predicted == targets).sum().item()
         n += targets.numel()
         for i, image_id in enumerate(batch["id"]):

@@ -30,6 +30,7 @@ dependencies = [
     "remotezip>=0.12",
     "ruff",
     "scikit-learn",
+    "seaborn>=0.13.2",
     "torch",
     "torchcodec>=0.17.0",
     "torchvision",

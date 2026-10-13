@@ -1,9 +1,13 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
 import torch
 from loguru import logger
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from active_testing_benchmark.active_testing import (
+    StratifiedSampleMean,
     UniformSampleMean,
     run_active_evaluation,
 )
@@ -91,33 +95,95 @@ def run_experiment(
             criterion=train_criterion,
             optimizer=optimizer,
             device=device,
-            debug=5,
+            debug=1,
         )
 
         logger.info(f"Training loss at epoch {epoch + 1}: {train_loss:.4f}")
 
-    results = evaluate(model=model, loader=val_loader, device=device)
+    # results = evaluate(model=model, loader=val_loader, device=device)
+    # 
+    # logger.info(
+    #     f"Evaluation results for the trained model: "
+    #     f"loss={results['loss']:.4f}, "
+    #     f"accuracy={results['accuracy']:.4f}, "
+    #     f"roc_auc={results['roc_auc']:.4f}"
+    # )
 
-    logger.info(
-        f"Evaluation results for the trained model: "
-        f"loss={results['loss']:.4f}, "
-        f"accuracy={results['accuracy']:.4f}, "
-        f"roc_auc={results['roc_auc']:.4f}"
-    )
+    methods = [
+        StratifiedSampleMean(allocation="balanced", batch_size=10, seed=42),
+        StratifiedSampleMean(allocation="proportional", batch_size=10, seed=42),
+        UniformSampleMean(batch_size=10, seed=42),
+    ]
 
-    # Run active evaluation on the test dataset
-    active_evaluation_history = run_active_evaluation(
-        method=UniformSampleMean(batch_size=config.batch_size),
-        model=model,
-        dataset=test_dataset,
-        device=device,
-    )
+    histories = {}
 
-    logger.debug(
-        f"Active evaluation results for the trained model:\n"
-        f"{active_evaluation_history[0]}\n\n"
-    )
+    for method in methods:
+        active_evaluation_history = run_active_evaluation(
+            method=method,
+            model=model,
+            dataset=test_dataset,
+            device=device,
+            protected_column=["gender"],
+        )
 
+        method_name = method.__class__.__name__
+        if isinstance(method, StratifiedSampleMean):
+            method_name += f"{method.allocation.capitalize()}"
+
+        logger.debug(
+            f"Active evaluation results for the trained model using {method_name}:\n"
+            f"{active_evaluation_history[0]}\n\n"
+            f"{active_evaluation_history[1]}\n\n"
+            f"{active_evaluation_history[2]}\n\n"
+            f"{active_evaluation_history[-1]}\n\n"
+        )
+
+        histories[method_name] = active_evaluation_history
+
+    dfs = []
+    for method_name, history in histories.items():
+        df = pd.DataFrame([
+            {
+                "n_labels": e.n_labels,
+                "risk": e.risk,
+                "method": method_name,
+                **{
+                    f"risk_{g}": r
+                    for g, r in e.subgroup_risks.items()
+                },
+                **{
+                    f"n_labels_{g}": n
+                    for g, n in e.subgroup_n_labels.items()
+                },
+            }
+            for record in history
+            for e in [record["estimate"]]
+        ])
+        dfs.append(df)
+
+    df = pd.concat(dfs, ignore_index=True)
+    sns.set_style("whitegrid")
+
+    fig, ax = plt.subplots(1, 3, figsize=(10, 6), sharey=True)
+
+    for i, g in enumerate(["", "male", "female"]):
+        sns.lineplot(
+            data=df,
+            x="n_labels",
+            y=f"risk{'_' + g if g else ''}",
+            hue="method",
+            ax=ax[i],
+        )
+
+        ax[i].set_title(f"{g.capitalize() if g else 'Overall'} Risk")
+        ax[i].set_xlabel("Number of Labels")
+        ax[i].set_ylabel("Estimated Risk")
+
+    # fig.suptitle(f"Active Evaluation of {disease.upper()} Model")
+
+    plt.tight_layout()
+    print(df)
+    plt.show()
     return "Experiment run successfully"
 
 
