@@ -1,16 +1,22 @@
+import pprint
+
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
 from loguru import logger
+from torch import nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-from active_testing_benchmark.active_testing import (
+from active_testing_benchmark.active_testing import (  # PredictionPoweredActiveTesting,; ActiveSurrogateEstimator,
+    KossenActiveTesting,
     StratifiedSampleMean,
     UniformSampleMean,
     run_active_evaluation,
 )
+from active_testing_benchmark.active_testing.surrogate import RandomForestModule
 from active_testing_benchmark.modeling.data import FairVisionDataset
 from active_testing_benchmark.modeling.models import (
     create_image_transform,
@@ -26,6 +32,9 @@ from active_testing_benchmark.modeling.train import (
     train_one_epoch,
 )
 
+# set up pretty printer
+pp = pprint.PrettyPrinter(indent=2, sort_dicts=False)
+
 
 def run_experiment(
     dev_splits: str | tuple[str, ...] = "train",
@@ -37,7 +46,7 @@ def run_experiment(
     config = TrainConfig(
         batch_size=32,
         num_workers=0,
-        epochs=1,
+        epochs=2,
         learning_rate=1e-4,
         seed=42,
         image_size=224,
@@ -95,73 +104,148 @@ def run_experiment(
             criterion=train_criterion,
             optimizer=optimizer,
             device=device,
-            debug=1,
+            # debug=1,
         )
 
         logger.info(f"Training loss at epoch {epoch + 1}: {train_loss:.4f}")
 
-    # results = evaluate(model=model, loader=val_loader, device=device)
-    # 
-    # logger.info(
-    #     f"Evaluation results for the trained model: "
-    #     f"loss={results['loss']:.4f}, "
-    #     f"accuracy={results['accuracy']:.4f}, "
-    #     f"roc_auc={results['roc_auc']:.4f}"
+    results = evaluate(
+        model=model, loader=val_loader, device=device, protected_column="gender"
+    )
+
+    logger.info(
+        f"Evaluation results for the trained model:\n"
+        f"{pp.pformat({k: v for k, v in results.items() if k != 'predictions'})}"
+    )
+
+    surrogate_1 = RandomForestModule(
+        num_classes=len(train_dataset.classes),
+        random_state=config.seed,
+    )
+
+    # surrogate_2 = RandomForestModule(
+    #     num_classes=len(train_dataset.classes),
+    #     random_state=config.seed * 2,
     # )
 
-    methods = [
-        StratifiedSampleMean(allocation="balanced", batch_size=10, seed=42),
-        StratifiedSampleMean(allocation="proportional", batch_size=10, seed=42),
-        UniformSampleMean(batch_size=10, seed=42),
+    # proxy_model = RandomForestModule(
+    #     num_classes=len(train_dataset.classes),
+    #     random_state=config.seed * 3,
+    # )
+
+    for i, surrogate in enumerate([surrogate_1]):
+        surrogate.fit(train_loader, device=device)
+
+        eval_results = evaluate(model=surrogate, loader=val_loader, device=device, protected_column="gender")
+        logger.info(
+            f"Surrogate {i + 1} evaluation results:\n"
+            f"{pp.pformat({k: v for k, v in eval_results.items() if k != 'predictions'})}"
+        )
+
+    # surogates = [surrogate_1, surrogate_2]
+
+    # methods = [
+    #     UniformSampleMean(batch_size=1, seed=42),
+    #     # StratifiedSampleMean(allocation="balanced", batch_size=1, seed=42),
+    #     # StratifiedSampleMean(allocation="proportional", batch_size=1, seed=42),
+    #     # KossenActiveTesting(surrogate=surogates[0], seed=42),
+    #     # ActiveSurrogateEstimator(
+    #     #     surrogate=surogates,
+    #     #     acquisition="xwed",
+    #     #     loss_type="cross_entropy",
+    #     #     surrogate_output="logits",
+    #     #     batch_size=1,
+    #     #     seed=42,
+    #     # ),
+    #     # PredictionPoweredActiveTesting(
+    #     #     proxy=proxy_model,
+    #     #     surrogate=surogates,
+    #     #     lambda_value=0.5,
+    #     #     exploration=0.05,
+    #     #     loss_type="cross_entropy",
+    #     #     batch_size=1,
+    #     #     seed=42,
+    #     # ),
+    # ]
+
+    method_classes = [
+        UniformSampleMean,
+        StratifiedSampleMean,
+        StratifiedSampleMean,
+        KossenActiveTesting,
+        # ActiveSurrogateEstimator,
+        # PredictionPoweredActiveTesting,
     ]
 
-    histories = {}
-
-    for method in methods:
-        active_evaluation_history = run_active_evaluation(
-            method=method,
-            model=model,
-            dataset=test_dataset,
-            device=device,
-            protected_column=["gender"],
-        )
-
-        method_name = method.__class__.__name__
-        if isinstance(method, StratifiedSampleMean):
-            method_name += f"{method.allocation.capitalize()}"
-
-        logger.debug(
-            f"Active evaluation results for the trained model using {method_name}:\n"
-            f"{active_evaluation_history[0]}\n\n"
-            f"{active_evaluation_history[1]}\n\n"
-            f"{active_evaluation_history[2]}\n\n"
-            f"{active_evaluation_history[-1]}\n\n"
-        )
-
-        histories[method_name] = active_evaluation_history
+    method_configs = [
+        {"batch_size": 10},
+        {"allocation": "balanced", "batch_size": 10},
+        {"allocation": "proportional", "batch_size": 10},
+        {"surrogate": surrogate_1, "batch_size": 10},
+        # {
+        #     "surrogate": surogates,
+        #     "acquisition": "xwed",
+        #     "loss_type": "cross_entropy",
+        #     "surrogate_output": "logits",
+        #     "batch_size": 10,
+        # },
+        # {
+        #     "proxy": proxy_model,
+        #     "surrogate": surogates,
+        #     "lambda_value": 0.5,
+        #     "exploration": 0.05,
+        #     "loss_type": "cross_entropy",
+        #     "batch_size": 10,
+        # },
+    ]
 
     dfs = []
-    for method_name, history in histories.items():
-        df = pd.DataFrame([
-            {
-                "n_labels": e.n_labels,
-                "risk": e.risk,
-                "method": method_name,
-                **{
-                    f"risk_{g}": r
-                    for g, r in e.subgroup_risks.items()
-                },
-                **{
-                    f"n_labels_{g}": n
-                    for g, n in e.subgroup_n_labels.items()
-                },
-            }
-            for record in history
-            for e in [record["estimate"]]
-        ])
-        dfs.append(df)
+    histories = {}
+    repititions = 10
+    
+    for i, rep in enumerate(range(repititions)):
+        logger.info(f"Starting repetition {rep + 1}/{repititions}")
+
+        methods = [
+            method_class(**method_config, seed=config.seed + i) for method_class, method_config in zip(method_classes, method_configs)
+        ]
+
+        for method in methods:
+            active_evaluation_history = run_active_evaluation(
+                method=method,
+                model=model,
+                dataset=test_dataset,
+                device=device,
+                protected_column=["gender"],
+                budget=990,
+            )
+
+            method_name = method.__class__.__name__
+            if isinstance(method, StratifiedSampleMean):
+                method_name += f"{method.allocation.capitalize()}"
+
+            histories[method_name] = active_evaluation_history
+
+        for method_name, history in histories.items():
+            df = pd.DataFrame(
+                [
+                    {
+                        "n_labels": e.n_labels,
+                        "risk": e.risk,
+                        "method": method_name,
+                        **{f"risk {g}": r for g, r in e.subgroup_risks.items()},
+                        **{f"n_labels_{g}": n for g, n in e.subgroup_n_labels.items()},
+                    }
+                    for record in history
+                    for e in [record["estimate"]]
+                ]
+            )
+            df["repetition"] = rep + 1
+            df["seed"] = config.seed + i
+            dfs.append(df)
 
     df = pd.concat(dfs, ignore_index=True)
+
     sns.set_style("whitegrid")
 
     fig, ax = plt.subplots(1, 3, figsize=(10, 6), sharey=True)
@@ -170,7 +254,7 @@ def run_experiment(
         sns.lineplot(
             data=df,
             x="n_labels",
-            y=f"risk{'_' + g if g else ''}",
+            y=f"risk{' ' + g if g else ''}",
             hue="method",
             ax=ax[i],
         )
@@ -178,12 +262,14 @@ def run_experiment(
         ax[i].set_title(f"{g.capitalize() if g else 'Overall'} Risk")
         ax[i].set_xlabel("Number of Labels")
         ax[i].set_ylabel("Estimated Risk")
+    
+        # ax[i].set_yscale("log")
 
     # fig.suptitle(f"Active Evaluation of {disease.upper()} Model")
 
     plt.tight_layout()
-    print(df)
     plt.show()
+    print(df)
     return "Experiment run successfully"
 
 
