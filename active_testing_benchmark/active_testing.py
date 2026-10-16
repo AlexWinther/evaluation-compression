@@ -276,31 +276,6 @@ class StratifiedSampleMean(ActiveEvaluationMethod):
 
     def estimate(self, state: dict, history: list[dict]) -> Estimate:
         n, N = state["cursor"], state["N"]
-        if n == 0:
-            return Estimate(risk=float("nan"), n_labels=0)
-        if self.allocation == "proportional":
-            risk = state["loss_total"] / n
-        elif n < len(state["sizes"]):
-            # Early design-unbiased Horvitz--Thompson estimate: first
-            # cycle selects n of K strata uniformly without replacement.
-            K = len(state["sizes"])
-            risk = (
-                K
-                / (n * N)
-                * sum(
-                    size * state["loss_sums"][g] for g, size in state["sizes"].items()
-                )
-            )
-        else:
-            # All groups represented after the first complete cycle.
-            risk = sum(
-                (size / N) * (state["loss_sums"][g] / state["counts"][g])
-                for g, size in state["sizes"].items()
-            )
-        return Estimate(risk=float(risk), n_labels=n)
-
-    def estimate(self, state: dict, history: list[dict]) -> Estimate:
-        n, N = state["cursor"], state["N"]
 
         # Estimate mean loss within each protected group.
         subgroup_risks = {
