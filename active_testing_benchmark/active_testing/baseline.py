@@ -1,27 +1,26 @@
-import heapq
-from bisect import bisect_left
 from collections import defaultdict
-from typing import Hashable, Iterable
+import heapq
 
-import numpy as np
 from loguru import logger
+import numpy as np
 
 from active_testing_benchmark.active_testing.interface import (
     ActiveEvaluationMethod,
     Estimate,
+    Problem,
     SelectionPlan,
 )
 
 
 class StratifiedSampleMean(ActiveEvaluationMethod):
-    """Stratified sampling by protected groups, with prefix risk estimates.
+    """Stratified sampling by protected groups, with intermediate risk estimates.
 
     allocation="proportional": population-proportional group order with a
         uniformly random rotation. The ordinary sample mean is unbiased
         at every nonempty prefix.
 
     allocation="balanced": randomized round-robin group order until some
-        groups run out. Use inverse inclusion probability for first K-1
+        groups run out. Use a group-size-weighted estimate for the first K-1
         observations and population-weighted stratum means thereafter.
 
     Within every stratum, indices are sampled uniformly without replacement.
@@ -29,37 +28,44 @@ class StratifiedSampleMean(ActiveEvaluationMethod):
 
     def __init__(
         self,
-        protected_attributes: Iterable[Hashable] | None = None,
         allocation: str = "proportional",
         seed: int = 0,
         batch_size: int | None = 1,
     ) -> None:
         if allocation not in {"proportional", "balanced"}:
             raise ValueError("allocation must be 'proportional' or 'balanced'")
+
         if batch_size is not None and batch_size < 1:
             raise ValueError("batch_size must be positive or None")
-        self.protected_attributes = (
-            None if protected_attributes is None else list(protected_attributes)
-        )
+
         self.allocation = allocation
         self.rng = np.random.default_rng(seed)
         self.batch_size = batch_size
 
-    def _proportional_slots(self, sizes):
-        """Generate a randomized order of subgroup slots sampling proportionally to their size."""
-        rank = self.rng.permutation(len(sizes))
+    def _proportional_slots(self, sizes: dict[str, int]) -> list[str]:
+        """Generate the full list of subgroup slots sampling proportionally to their group size."""
+        # give ranks to each group to break ties
+        ranks = self.rng.permutation(len(sizes))
+
         heap = []
-        for r, (g, size) in zip(rank, sizes.items()):
-            heapq.heappush(heap, (0.5 / size, int(r), g, 1))
+        for rank, (group, size) in zip(ranks, sizes.items()):
+            # add groups to heap with priority inverse to their size
+            priority = 0.5 / size
+            heapq.heappush(heap, (priority, int(rank), group, 1))
 
         slots = []
         while heap:
-            _, r, g, used = heapq.heappop(heap)
-            slots.append(g)
-            if used < sizes[g]:
-                heapq.heappush(heap, ((used + 0.5) / sizes[g], r, g, used + 1))
+            # pick next group to sample from (minheap so lower priority is picked first)
+            _, rank, group, used = heapq.heappop(heap)
+            slots.append(group)
+
+            # If group has been sampled less than group size then add again with updated priority
+            if used < sizes[group]:
+                priority = (used + 0.5) / sizes[group]
+                heapq.heappush(heap, (priority, rank, group, used + 1))
 
         # Offset the slots by a random amount to ensure uniformity across starting points
+        # Ensures not picking largest group first every time
         offset = int(self.rng.integers(len(slots)))
         final_slots = slots[offset:] + slots[:offset]
 
@@ -68,127 +74,103 @@ class StratifiedSampleMean(ActiveEvaluationMethod):
         return final_slots
 
     def _balanced_slots(self, sizes):
-        """Generate a randomized order of subgroup slots sampling in a balanced
-           round-robin manner with uniformity within each cycle."""
-        slots, group_draw_prob, cycle_ends = [], [], []
+        """Generate a randomized order of subgroup slots sampling to visit
+        still-active groups once per cycle, while shufling group order within
+        each cycle."""
+        slots = []
+
+        # At the start all groups are "active" meaning they have remaining samples
         active = list(sizes.keys())
         cycle_number = 0
 
         while active:
+            # Shufle the group order in each cycle
             order = self.rng.permutation(len(active))
-            for j, position in enumerate(order):
+
+            for position in order:
                 slots.append(active[int(position)])
-                group_draw_prob.append(1.0 / (len(active) - j))
-            cycle_ends.append(len(slots))
+
             cycle_number += 1
 
-            # Remove groups from active when they have been fully selected
+            # Update still active groups
             active = [g for g in active if sizes[g] > cycle_number]
 
-        logger.debug(
-            f"Balanced slots: {slots}, group_draw_prob: {group_draw_prob}, cycle_ends: {cycle_ends}"
-        )
-        return slots, group_draw_prob, cycle_ends
+        logger.debug(f"Balanced slots: {slots}")
 
-    def initialize(self, problem: dict) -> dict:
-        N = int(problem["N"])
-        budget = int(problem["budget"])
+        return slots
+
+    def initialize(self, problem: Problem) -> dict:
+        N = int(problem.N)
+        budget = problem.budget
         if not 0 < N or not 0 <= budget <= N:
             raise ValueError("Require N > 0 and 0 <= budget <= N")
-        raw_groups = (
-            self.protected_attributes
-            if self.protected_attributes is not None
-            else problem["protected_attribute"]
-        )
-        groups = list(raw_groups)
-        if len(groups) != N:
+
+        groups = problem.protected_attribute
+        if groups is None or len(groups) != N:
             raise ValueError("Protected attributes must match X_pool order and length")
 
+        # match sample idx to groups
         by_group = defaultdict(list)
         for i, group in enumerate(groups):
-            # Group IDs should be hashable (e.g. int, str, or tuple).
             by_group[group].append(i)
+
         sizes = {g: len(indices) for g, indices in by_group.items()}
-        orders = {
-            g: [int(i) for i in self.rng.permutation(indices)]
-            for g, indices in by_group.items()
+
+        # random ordering of idx in each group to simulate random sampling without replacement
+        selection_orders = {
+            g: [int(i) for i in self.rng.permutation(indices)] for g, indices in by_group.items()
         }
 
         if self.allocation == "balanced":
-            slots, group_draw_prob, cycle_ends = self._balanced_slots(sizes)
+            slots = self._balanced_slots(sizes)
         else:
             slots = self._proportional_slots(sizes)
-            group_draw_prob, cycle_ends = None, None
 
         return {
             "N": N,
-            "remaining": set(range(problem["N"])),
-            "remaining_budget": problem["budget"],
+            "remaining": set(range(problem.N)),
+            "remaining_budget": problem.budget,
             "observed_losses": [],
             "selections": set(),
             "group_by_index": groups,
             "sizes": sizes,
-            "orders": orders,
+            "selection_orders": selection_orders,
             "slots": slots,
-            "group_draw_prob": group_draw_prob,
-            "cycle_ends": cycle_ends,
-            "cursor": 0,
-            "counts": {g: 0 for g in sizes},
-            "loss_sums": {g: 0.0 for g in sizes},
+            "current_pos": 0,
+            "subgroup_counts": {g: 0 for g in sizes},
+            "subgroup_loss_sums": {g: 0.0 for g in sizes},
             "loss_total": 0.0,
         }
 
-    def _balanced_inclusion(self, state, group, n):
-        cycle_index = bisect_left(state["cycle_ends"], n)
-        cycle_start_idx = 0 if cycle_index == 0 else state["cycle_ends"][cycle_index - 1]
-        selections_made_in_cycle = n - cycle_start_idx
-        current_active_groups = state["cycle_ends"][cycle_index] - cycle_start_idx
-        current_group_count = min(state["sizes"][group], cycle_index)
-        if state["sizes"][group] > cycle_index:
-            expected_group_count = current_group_count + selections_made_in_cycle / current_active_groups
-        return expected_group_count / state["sizes"][group]
-
     def acquire(self, state: dict, history: list[dict]) -> SelectionPlan:
+        """Selection of next sample indicies to obtain labels for"""
         selection_count = min(
             self.batch_size or state["remaining_budget"],
             state["remaining_budget"],
-            state["N"] - state["cursor"],
+            state["N"] - state["current_pos"],
         )
         if selection_count < 1:
             raise ValueError("No remaining budget or unlabeled items")
 
-        start_idx = state["cursor"]
+        start_idx = state["current_pos"]
         batch_group_counts = defaultdict(int)
-        indices, selection_probs = [], []
+        selected_indices = []
         selected_groups = []
 
         for t in range(start_idx, start_idx + selection_count):
             group = state["slots"][t]
-            used = state["counts"][group] + batch_group_counts[group]
-            indices.append(state["orders"][group][used])
+            group_sample_idx = state["subgroup_counts"][group] + batch_group_counts[group]
+
+            selected_indices.append(state["selection_orders"][group][group_sample_idx])
             selected_groups.append(group)
-            if self.allocation == "balanced":
-                p_group = state["group_draw_prob"][t]
-                selection_probs.append(p_group / (state["sizes"][group] - used))
             batch_group_counts[group] += 1
 
         n_after = start_idx + selection_count
-        if self.allocation == "proportional":
-            inclusion_probs = [
-                (n_after - offset) / state["N"] for offset in range(selection_count)
-            ]
-        else:
-            inclusion_probs = [
-                self._balanced_inclusion(state, state["group_by_index"][i], offset)
-                for offset, i in enumerate(indices, start_idx + 1)
-            ]
 
         return SelectionPlan(
-            indices=indices,
-            selection_probabilities=(
-                selection_probs if self.allocation == "balanced" else None
-            ),
-            inclusion_probabilities=inclusion_probs,
+            indices=selected_indices,
+            selection_probabilities=None,
+            inclusion_probabilities=None,
             protected_attribute_group=selected_groups,
             metadata={
                 "design": f"stratified_{self.allocation}_without_replacement",
@@ -196,58 +178,36 @@ class StratifiedSampleMean(ActiveEvaluationMethod):
             },
         )
 
-    def observe(self, state: dict, selection: SelectionPlan, labels, losses) -> dict:
-        if len(selection.indices) != len(losses):
+    def observe(self, state: dict, selection: SelectionPlan, new_labels, new_losses) -> dict:
+        if len(selection.indices) != len(new_losses):
             raise ValueError("One loss is required per selected index")
-        for i, loss in zip(selection.indices, losses):
+
+        # Update the loss totals with new observations
+        for i, loss in zip(selection.indices, new_losses):
             group = state["group_by_index"][i]
-            state["counts"][group] += 1
-            state["loss_sums"][group] += float(loss)
+            state["subgroup_counts"][group] += 1
+            state["subgroup_loss_sums"][group] += float(loss)
             state["loss_total"] += float(loss)
+
         state["selections"].update(selection.indices)
-        state["cursor"] += len(selection.indices)
+        state["current_pos"] += len(selection.indices)
         state["remaining_budget"] -= len(selection.indices)
         return state
 
     def estimate(self, state: dict, history: list[dict]) -> Estimate:
-        n, N = state["cursor"], state["N"]
-        if n == 0:
-            return Estimate(risk=float("nan"), n_labels=0)
-        if self.allocation == "proportional":
-            risk = state["loss_total"] / n
-        elif n < len(state["sizes"]):
-            # Early design-unbiased Horvitz--Thompson estimate: first
-            # cycle selects n of K strata uniformly without replacement.
-            K = len(state["sizes"])
-            risk = (
-                K
-                / (n * N)
-                * sum(
-                    size * state["loss_sums"][g] for g, size in state["sizes"].items()
-                )
-            )
-        else:
-            # All groups represented after the first complete cycle.
-            risk = sum(
-                (size / N) * (state["loss_sums"][g] / state["counts"][g])
-                for g, size in state["sizes"].items()
-            )
-        return Estimate(risk=float(risk), n_labels=n)
-
-    def estimate(self, state: dict, history: list[dict]) -> Estimate:
-        n, N = state["cursor"], state["N"]
+        n, N = state["current_pos"], state["N"]
 
         # Estimate mean loss within each protected group.
         subgroup_risks = {
             g: (
-                state["loss_sums"][g] / state["counts"][g]
-                if state["counts"][g] > 0
+                state["subgroup_loss_sums"][g] / state["subgroup_counts"][g]
+                if state["subgroup_counts"][g] > 0
                 else None
             )
             for g in state["sizes"]
         }
 
-        subgroup_n_labels = dict(state["counts"])
+        subgroup_n_labels = dict(state["subgroup_counts"])
 
         # Existing overall risk estimator.
         if n == 0:
@@ -256,18 +216,19 @@ class StratifiedSampleMean(ActiveEvaluationMethod):
         elif self.allocation == "proportional":
             risk = state["loss_total"] / n
 
+        # Horvitz-Thompson estimator when not all subgroups have been seen
         elif n < len(state["sizes"]):
             K = len(state["sizes"])
 
-            risk = K / (n * N) * sum(
-                size * state["loss_sums"][g]
-                for g, size in state["sizes"].items()
+            risk = (
+                K
+                / (n * N)
+                * sum(size * state["subgroup_loss_sums"][g] for g, size in state["sizes"].items())
             )
 
         else:
             risk = sum(
-                (size / N)
-                * (state["loss_sums"][g] / state["counts"][g])
+                (size / N) * (state["subgroup_loss_sums"][g] / state["subgroup_counts"][g])
                 for g, size in state["sizes"].items()
             )
 
@@ -288,18 +249,21 @@ class UniformSampleMean(ActiveEvaluationMethod):
         self.rng = np.random.Generator(np.random.PCG64(seed))
         self.batch_size = batch_size
 
-    def initialize(self, problem: dict) -> dict:
-        groups = list(problem["protected_attribute"])
+    def initialize(self, problem: Problem) -> dict:
+        groups = problem.protected_attribute
+
+        if groups is None or len(groups) != problem.N:
+            raise ValueError("Protected attributes must match X_pool order and length")
 
         state = {
-            "N": int(problem["N"]),
-            "remaining": set(range(problem["N"])),
-            "remaining_budget": int(problem["budget"]),
+            "N": int(problem.N),
+            "remaining": set(range(problem.N)),
+            "remaining_budget": int(problem.budget),
             "observed_losses": [],
             "selections": set(),
             "group_by_index": groups,
             "subgroup_counts": {g: 0 for g in groups},
-            "subgroup_loss_sums": {g: 0.0 for g in groups}
+            "subgroup_loss_sums": {g: 0.0 for g in groups},
         }
 
         return state
@@ -316,28 +280,25 @@ class UniformSampleMean(ActiveEvaluationMethod):
 
         positions = self.rng.choice(len(remaining), size=count, replace=False)
         indices = [int(remaining[int(position)]) for position in positions]
+
         return SelectionPlan(
             indices=indices,
-            selection_probabilities=[
-                1.0 / (len(remaining) - offset) for offset in range(count)
-            ],
-            inclusion_probabilities=[
-                (len(state["selections"]) + offset) / state["N"]
-                for offset in range(1, count + 1)
-            ],
+            selection_probabilities=None,
+            inclusion_probabilities=None,
             protected_attribute_group=[state["group_by_index"][i] for i in indices],
             metadata={"design": "uniform_without_replacement"},
         )
 
     def observe(
-        self, state: dict, selection: SelectionPlan, labels: list, losses: list
+        self, state: dict, selection: SelectionPlan, new_labels: list, new_losses: list
     ) -> dict:
+        # Update remaining to exclude the newly selected indices
         state["remaining"].difference_update(selection.indices)
         state["remaining_budget"] -= len(selection.indices)
-        state["observed_losses"].extend(losses)
+        state["observed_losses"].extend(new_losses)
         state["selections"].update(selection.indices)
 
-        for index, loss in zip(selection.indices, losses):
+        for index, loss in zip(selection.indices, new_losses):
             group = state["group_by_index"][index]
             state["subgroup_counts"][group] += 1
             state["subgroup_loss_sums"][group] += float(loss)
@@ -348,17 +309,15 @@ class UniformSampleMean(ActiveEvaluationMethod):
         losses = state["observed_losses"]
         counts = state["subgroup_counts"]
 
+        overall_risk = float(np.mean(losses)) if losses else float("nan")
+
         subgroup_risks = {
-            g: (
-                state["subgroup_loss_sums"][g] / count
-                if count > 0
-                else None
-            )
+            g: (state["subgroup_loss_sums"][g] / count if count > 0 else None)
             for g, count in counts.items()
         }
 
         return Estimate(
-            risk=float(np.mean(losses)) if losses else float("nan"),
+            risk=overall_risk,
             n_labels=len(losses),
             subgroup_risks=subgroup_risks,
             subgroup_n_labels=dict(counts),

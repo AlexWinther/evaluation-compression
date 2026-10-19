@@ -1,10 +1,12 @@
-import numpy as np
-import torch
 from loguru import logger
+import torch
 from torch import nn
 from tqdm.auto import tqdm
 
-from active_testing_benchmark.active_testing.interface import ActiveEvaluationMethod
+from active_testing_benchmark.active_testing.interface import (
+    ActiveEvaluationMethod,
+    Problem,
+)
 from active_testing_benchmark.modeling.data import FairVisionDataset
 
 
@@ -13,27 +15,27 @@ def run_active_evaluation(
     dataset: FairVisionDataset,
     model: nn.Module,
     device: torch.device,
-    loss_fn: nn.Module = nn.CrossEntropyLoss(reduction="sum"),
-    protected_column: list[str] | str | None = None,
+    loss_fn: nn.Module,
+    protected_column: list[str] | str,
     budget: int | None = None,
 ) -> list[dict]:
-    """Run finite-pool evaluation, returning prefix estimates after each batch."""
+    """Run finite-pool active evaluation, returning risk estimates after each batch."""
+    if loss_fn is None:
+        loss_fn = nn.CrossEntropyLoss(reduction="sum")
+
     model.eval()
     logger.info("Model set to eval mode for active evaluation")
 
-    logger.debug(
-        f"Loading {len(dataset):,} samples from the dataset for active evaluation"
-    )
+    logger.debug(f"Loading {len(dataset):,} samples from the dataset for active evaluation")
+
     X_pool = []
     y_pool = []
-
-    if protected_column is not None:
-        if isinstance(protected_column, str):
-            protected_column = [protected_column]
+    protected_attributes = []
 
     logger.debug(f"Using protected column(s): {protected_column}")
 
-    protected_attributes = []
+    if isinstance(protected_column, str):
+        protected_column = [protected_column]
 
     for index in range(len(dataset)):
         sample = dataset[index]
@@ -43,10 +45,9 @@ def run_active_evaluation(
 
         protected_attribute = ", ".join(
             str(sample["protected"].get(col)) for col in protected_column or []
-        ) if protected_column else None
+        )
 
-        if protected_attribute is not None:
-            protected_attributes.append(protected_attribute)
+        protected_attributes.append(protected_attribute)
 
     logger.debug(f"protected_attributes: {protected_attributes[:10]} (showing first 10)")
 
@@ -67,49 +68,61 @@ def run_active_evaluation(
     if not 0 <= label_budget <= len(X_pool):
         raise ValueError("budget must be between 0 and the pool size")
 
-    problem = {
-        "N": len(X_pool),
-        "X_pool": X_pool,
-        "protected_attribute": protected_attributes,
-        "model": model,
-        "loss_fn": loss_fn,
-        "budget": label_budget,
-    }
-
-    state = method.initialize(problem)
-    history = []
-
-    pbar = tqdm(
-        total=problem["budget"], desc="Active evaluation progress", unit="label"
+    # Note: no labels are given to the method at initialization
+    problem = Problem(
+        N=len(X_pool),
+        budget=label_budget,
+        X_pool=X_pool,
+        protected_attribute=protected_attributes,
+        model=model,
+        loss_fn=loss_fn,
     )
 
-    while len(state["selections"]) < problem["budget"]:
+    # Create the inital state
+    state = method.initialize(problem)
+
+    history = []
+
+    pbar = tqdm(total=problem.budget, desc="Active evaluation progress", unit="label")
+
+    # Loop until the acquired labels reach the budget
+    while len(state["selections"]) < problem.budget:
+        # Ask the method to pick its next samples to reveal using its current state and the known history
         selection = method.acquire(state, history)
         indices = selection.indices
-        # logger.debug(f"Acquired selection: {indices}")
+        logger.trace(f"Acquired selection: {indices}")
 
-        if not indices or len(indices) != len(set(indices)):
-            raise ValueError("A selection must contain unique indices")
-        if any(not isinstance(index, (int, np.integer)) for index in indices):
-            raise ValueError("Selection indices must be integers")
-        if len(state["selections"]) + len(indices) > problem["budget"]:
-            raise ValueError("Selection exceeds the remaining label budget")
-        if any(
-            index < 0 or index >= len(X_pool) or index in state["selections"]
-            for index in indices
+        if (
+            not indices
+            or len(indices) != len(set(indices))
+            or any(
+                index < 0 or index >= len(X_pool) or index in state["selections"]
+                for index in indices
+            )
         ):
-            raise ValueError("Selection indices must be remaining pool indices")
+            raise ValueError(
+                "A selection must contain unique and not previously acquired"
+                "indices from the remaining pool"
+            )
 
+        # Reveal ground-truth labels for the selected indices.
         labels = y_pool[indices]
+
         with torch.inference_mode():
             y_pred = model(X_pool[indices])
 
+            # Compute one loss per selected item
             losses = [
-                problem["loss_fn"](y_pred[i : i + 1], labels[i : i + 1]).item()
+                problem.loss_fn(y_pred[i : i + 1], labels[i : i + 1]).item()
                 for i in range(len(indices))
             ]
 
+        # The selected samples are observed by the model, including the per sample losses and labels
+        # The state is updated, optionally including a learned surrogate model
         state = method.observe(state, selection, labels, losses)
+
+        # Add the current information about the current selection batch
+        # including the current risk estimates to history
         history.append(
             {
                 "round": len(history) + 1,
@@ -123,4 +136,5 @@ def run_active_evaluation(
         )
         pbar.update(len(indices))
 
+    # Return the full history to enable post-hoc analysis of the risk estimates
     return history

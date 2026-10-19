@@ -1,8 +1,7 @@
 import numpy as np
-import torch
-import torch.nn as nn
-from loguru import logger
 from sklearn.ensemble import RandomForestClassifier
+import torch
+from torch import nn
 from tqdm.auto import tqdm
 
 
@@ -10,14 +9,17 @@ class RandomForestModule(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        feature_extractor: nn.Module | None = nn.Sequential(
-            nn.AdaptiveAvgPool2d((16, 16)),
-            nn.Flatten(),
-        ),
+        feature_extractor: nn.Module | None = None,
         n_estimators: int = 200,
         random_state: int = 42,
     ):
         super().__init__()
+
+        if feature_extractor is None:
+            feature_extractor = nn.Sequential(
+                nn.AdaptiveAvgPool2d((16, 16)),
+                nn.Flatten(),
+            )
 
         self.num_classes = num_classes
         self.feature_extractor = feature_extractor

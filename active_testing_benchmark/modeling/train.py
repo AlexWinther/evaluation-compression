@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-import random
 from collections import defaultdict
 from dataclasses import dataclass
+import random
 
-import mlflow
-import mlflow.pytorch
-import numpy as np
-import torch
-import typer
 from loguru import logger
-from mlflow.models import infer_signature
+import numpy as np
 from sklearn.metrics import roc_auc_score
+import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
+import typer
 
 from active_testing_benchmark.modeling.data import (
     FairVisionDataset,
@@ -30,11 +27,6 @@ from active_testing_benchmark.modeling.data import (
 #     build_dataset_provenance,
 #     git_provenance,
 # )
-from active_testing_benchmark.modeling.registry import (
-    configure_mlflow,
-    fairvision_model_name,
-    register_trained_model,
-)
 
 app = typer.Typer(add_completion=False, help=__doc__)
 
@@ -146,7 +138,12 @@ def train_one_epoch(
 
 
 @torch.inference_mode()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, protected_column: str | list[str] | None = None):
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    protected_column: str | list[str] | None = None,
+):
     model.eval()
     logger.info("Model set to eval mode")
     if isinstance(protected_column, str):
@@ -174,11 +171,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, protect
 
         for i, image_id in enumerate(batch["id"]):
             protected = {
-                name: (
-                    values[i].item()
-                    if isinstance(values[i], torch.Tensor)
-                    else values[i]
-                )
+                name: (values[i].item() if isinstance(values[i], torch.Tensor) else values[i])
                 for name, values in batch["protected"].items()
                 if protected_column is None or name in protected_column
             }
@@ -205,18 +198,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, protect
         y_score = [r["probabilities"][1] for r in records]
 
         # Binary ROC-AUC is undefined if only one class is present
-        auc = (
-            float(roc_auc_score(y_true, y_score))
-            if len(set(y_true)) == 2
-            else None
-        )
+        auc = float(roc_auc_score(y_true, y_score)) if len(set(y_true)) == 2 else None
 
         return {
             "n": len(records),
             "loss": sum(r["loss"] for r in records) / len(records),
-            "accuracy": sum(
-                r["target"] == r["prediction"] for r in records
-            ) / len(records),
+            "accuracy": sum(r["target"] == r["prediction"] for r in records) / len(records),
             "roc_auc": auc,
         }
 
@@ -225,19 +212,13 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, protect
 
     # Metrics for each protected attribute and subgroup
     subgroup_metrics = {
-        attribute: {
-            group: compute_metrics(records)
-            for group, records in groups.items()
-        }
+        attribute: {group: compute_metrics(records) for group, records in groups.items()}
         for attribute, groups in subgroups.items()
     }
 
     # Ground-truth risks for comparison with active testing
     subgroup_risks = {
-        attribute: {
-            group: metrics["loss"]
-            for group, metrics in groups.items()
-        }
+        attribute: {group: metrics["loss"] for group, metrics in groups.items()}
         for attribute, groups in subgroup_metrics.items()
     }
 
