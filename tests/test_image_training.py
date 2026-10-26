@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 from PIL import Image
@@ -6,173 +7,237 @@ import pytest
 import torch
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, RandomSampler, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from active_testing_benchmark.modeling.data import ImageClassificationDataset, class_mapping
-from active_testing_benchmark.modeling.models import create_model
+from active_testing_benchmark.modeling.data import (
+    FairVisionDataset,
+    get_class_counts,
+    inverse_frequency_weights,
+)
+from active_testing_benchmark.modeling.models import create_image_transform, create_model
 from active_testing_benchmark.modeling.train import (
-    classification_metrics,
-    inverse_frequency_class_weights,
-    make_loader,
-    run_epoch,
+    TrainConfig,
+    evaluate,
+    make_train_loader_and_loss,
+    train_one_epoch,
 )
 
 
-@pytest.fixture()
-def tiny_image_dataset(tmp_path: Path) -> tuple[Path, Path]:
-    rows = []
-    for split in ("training", "validation", "test"):
-        for index, label in enumerate(("healthy", "disease")):
-            relative_path = Path(split) / f"image_{index}.jpg"
-            path = tmp_path / relative_path
-            path.parent.mkdir(exist_ok=True)
-            Image.new("RGB", (16, 16), color=(index * 100, 20, 40)).save(path)
-            rows.append({"image": str(relative_path), "label": label, "split": split})
-    metadata_path = tmp_path / "metadata.csv"
-    pd.DataFrame(rows).to_csv(metadata_path, index=False)
-    return metadata_path, tmp_path
+@pytest.fixture
+def fairvision_tree(tmp_path: Path) -> Path:
+    return _write_fairvision_tree(tmp_path)
 
 
-def test_dataset_loads_a_batch(tiny_image_dataset: tuple[Path, Path]) -> None:
-    metadata_path, image_root = tiny_image_dataset
-    mapping = class_mapping(metadata_path, "label")
-    dataset = ImageClassificationDataset(
-        metadata_path,
-        image_root,
-        "image",
-        "label",
-        "split",
+def test_torch_dataset_decodes_images_and_maps_labels(fairvision_tree: Path) -> None:
+    dataset = FairVisionDataset(
+        disease="DR",
+        split="train",
+        transform=lambda image: image.to(torch.float32) / 255,
+        protected_columns=("gender", "age"),
+        fairvision_data_root=fairvision_tree,
+    )
+
+    assert len(dataset) == 4
+    assert dataset.classes == ["non-vision threatening dr", "vision threatening dr"]
+    assert get_class_counts(dataset).tolist() == [3, 1]
+
+    sample = dataset[0]
+    assert sample["id"] == "000"
+    assert sample["target"] == 0
+    assert sample["image"].shape == (3, 12, 16)
+    assert sample["image"].dtype == torch.float32
+    assert sample["protected"]["gender"] == "female"
+    assert sample["protected"]["age"] == "Unknown"
+
+
+def test_dataset_aliases_splits_and_combines_requested_splits(fairvision_tree: Path) -> None:
+    dataset = FairVisionDataset(
+        split=("train", "val"),
+        protected_columns=("gender",),
+        fairvision_data_root=fairvision_tree,
+    )
+
+    assert len(dataset) == 6
+    assert {sample["path"].parent.name for sample in dataset.samples} == {
         "training",
-        mapping,
-        transform=lambda image: torch.zeros(3, 32, 32),
-    )
-    images, labels = next(iter(DataLoader(dataset, batch_size=2)))
-    assert images.shape == (2, 3, 32, 32)
-    assert labels.shape == (2,)
+        "validation",
+    }
 
 
-@pytest.mark.parametrize("name", ["resnet18"])
-def test_models_produce_class_logits(name: str) -> None:
-    model = create_model(name, num_classes=3, pretrained=False)
-    model.eval()
-    with torch.no_grad():
-        output = model(torch.zeros(1, 3, 224, 224))
-    assert output.shape == (1, 3)
-
-
-def test_short_training_epoch_runs(tiny_image_dataset: tuple[Path, Path]) -> None:
-    metadata_path, image_root = tiny_image_dataset
-    mapping = class_mapping(metadata_path, "label")
-    dataset = ImageClassificationDataset(
-        metadata_path,
-        image_root,
-        "image",
-        "label",
-        "split",
-        "training",
-        mapping,
-        transform=lambda image: torch.zeros(3, 32, 32),
-    )
-    model = create_model("resnet18", num_classes=2, pretrained=False)
-    loss, accuracy, *_ = run_epoch(
-        model,
-        DataLoader(dataset, batch_size=2),
-        nn.CrossEntropyLoss(),
-        torch.device("cpu"),
-        AdamW(model.parameters(), lr=1e-3),
-    )
-    assert loss >= 0
-    assert 0 <= accuracy <= 1
-
-
-def test_none_imbalance_strategy_keeps_shuffled_loader(
-    tiny_image_dataset: tuple[Path, Path],
+@pytest.mark.parametrize(
+    "disease,split,error",
+    [
+        ("unknown", "train", ValueError),
+        ("dr", (), ValueError),
+        ("dr", ("train", "training"), ValueError),
+        ("dr", "holdout", ValueError),
+        ("dr", "test", FileNotFoundError),
+    ],
+)
+def test_dataset_rejects_invalid_disease_or_split(
+    tmp_path: Path, disease: str, split: tuple[str, ...] | str, error: type[Exception]
 ) -> None:
-    metadata_path, image_root = tiny_image_dataset
-    dataset = ImageClassificationDataset(
-        metadata_path,
-        image_root,
-        "image",
-        "label",
-        "split",
-        "training",
-        class_mapping(metadata_path, "label"),
-        transform=lambda image: torch.zeros(3, 32, 32),
+    root = _write_fairvision_tree(tmp_path, include_test=False)
+    with pytest.raises(error):
+        FairVisionDataset(
+            disease=disease,
+            split=split,
+            protected_columns=("gender",),
+            fairvision_data_root=root,
+        )
+
+
+def test_dataset_rejects_missing_metadata_columns(fairvision_tree: Path) -> None:
+    metadata_path = fairvision_tree / "dr" / "metadata.csv"
+    metadata = pd.read_csv(metadata_path).drop(columns="gender")
+    metadata.to_csv(metadata_path, index=False)
+
+    with pytest.raises(ValueError, match="Missing metadata columns"):
+        FairVisionDataset(
+            split="train",
+            protected_columns=("gender",),
+            fairvision_data_root=fairvision_tree,
+        )
+
+
+def test_class_counts_reject_a_missing_training_class() -> None:
+    dataset = SimpleNamespace(targets=[0, 0], classes=["class 0", "class 1"])
+
+    with pytest.raises(ValueError, match="No training samples for classes"):
+        get_class_counts(dataset)
+
+
+def test_inverse_frequency_weights_are_mean_normalized() -> None:
+    weights = inverse_frequency_weights(torch.tensor([3, 1]))
+
+    assert weights.tolist() == pytest.approx([0.5, 1.5])
+    with pytest.raises(ValueError, match="power must be in \\[0, 1\\]"):
+        inverse_frequency_weights(torch.tensor([3, 1]), power=1.1)
+
+
+def test_weighted_loader_and_loss_use_training_class_counts(fairvision_tree: Path) -> None:
+    dataset = FairVisionDataset(
+        split="train",
+        transform=create_image_transform(image_size=8, training=False),
+        protected_columns=("gender",),
+        fairvision_data_root=fairvision_tree,
+    )
+    config = TrainConfig(
+        batch_size=2,
+        num_workers=0,
+        weighted_sampling=True,
+        weighted_loss=True,
     )
 
-    loader = make_loader(dataset, batch_size=2, workers=0, shuffle=True)
-
-    assert isinstance(loader.sampler, RandomSampler)
-
-
-def test_weighted_sampling_uses_inverse_frequency_sample_weights(tmp_path: Path) -> None:
-    metadata_path, image_root = _imbalanced_image_dataset(tmp_path)
-    dataset = ImageClassificationDataset(
-        metadata_path,
-        image_root,
-        "image",
-        "label",
-        "split",
-        "training",
-        class_mapping(metadata_path, "label"),
-        transform=lambda image: torch.zeros(3, 32, 32),
-    )
-
-    loader = make_loader(
-        dataset, batch_size=2, workers=0, shuffle=True, imbalance_strategy="weighted-sampling"
+    loader, criterion, counts, loss_weights = make_train_loader_and_loss(
+        dataset, config, torch.device("cpu")
     )
 
     assert isinstance(loader.sampler, WeightedRandomSampler)
-    assert loader.sampler.replacement is True
-    assert loader.sampler.weights.tolist() == pytest.approx([2 / 3, 2 / 3, 2 / 3, 2.0])
+    assert loader.sampler.replacement
+    assert loader.sampler.weights.tolist() == pytest.approx([0.5, 0.5, 0.5, 1.5])
+    assert counts.tolist() == [3, 1]
+    assert loss_weights.tolist() == pytest.approx([0.5, 1.5])
+    assert criterion.weight.tolist() == pytest.approx([0.5, 1.5])
 
 
-def test_class_weighted_loss_weights_minority_class_more(tmp_path: Path) -> None:
-    metadata_path, image_root = _imbalanced_image_dataset(tmp_path)
-    dataset = ImageClassificationDataset(
-        metadata_path,
-        image_root,
-        "image",
-        "label",
-        "split",
-        "training",
-        class_mapping(metadata_path, "label"),
-        transform=lambda image: torch.zeros(3, 32, 32),
+def test_torch_training_and_evaluation_use_dataset_records(fairvision_tree: Path) -> None:
+    transform = create_image_transform(image_size=8, training=False)
+    train_dataset = FairVisionDataset(
+        split="train",
+        transform=transform,
+        protected_columns=("gender",),
+        fairvision_data_root=fairvision_tree,
+    )
+    test_dataset = FairVisionDataset(
+        split="test",
+        transform=transform,
+        protected_columns=("gender",),
+        fairvision_data_root=fairvision_tree,
+    )
+    loader = DataLoader(train_dataset, batch_size=2, shuffle=False)
+    model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 8 * 8, 2))
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+
+    loss = train_one_epoch(
+        model,
+        loader,
+        nn.CrossEntropyLoss(),
+        optimizer,
+        torch.device("cpu"),
+    )
+    results = evaluate(
+        model,
+        DataLoader(test_dataset, batch_size=2),
+        torch.device("cpu"),
+        protected_column="gender",
     )
 
-    weights = inverse_frequency_class_weights(dataset, num_classes=2)
-
-    assert weights.tolist() == pytest.approx([2.0, 2 / 3])
-
-
-def test_classification_metrics_include_macro_f1_and_binary_roc_auc() -> None:
-    metrics = classification_metrics(
-        labels=[0, 0, 1, 1],
-        positive_probabilities=[0.1, 0.4, 0.6, 0.9],
-        predictions=[0, 1, 1, 1],
-        num_classes=2,
-    )
-
-    assert metrics["macro_f1"] == pytest.approx(0.7333333333333334)
-    assert metrics["roc_auc"] == pytest.approx(1.0)
-
-
-def test_classification_metrics_omit_undefined_roc_auc() -> None:
-    metrics = classification_metrics(
-        labels=[0, 0], positive_probabilities=[0.1, 0.2], predictions=[0, 0], num_classes=2
-    )
-
-    assert metrics == {"macro_f1": 1.0}
+    assert loss >= 0
+    assert results["loss"] >= 0
+    assert 0 <= results["accuracy"] <= 1
+    assert results["roc_auc"] is None or 0 <= results["roc_auc"] <= 1
+    assert set(results["subgroup_metrics"]["gender"]) == {"female", "male"}
+    assert len(results["predictions"]) == 2
+    assert set(results["predictions"][0]) == {
+        "id",
+        "target",
+        "prediction",
+        "probabilities",
+        "loss",
+        "protected",
+    }
 
 
-def _imbalanced_image_dataset(tmp_path: Path) -> tuple[Path, Path]:
+def test_model_factory_uses_requested_class_count() -> None:
+    model = create_model(num_classes=3, pretrained=False, device="cpu")
+    model.eval()
+
+    with torch.inference_mode():
+        logits = model(torch.zeros(1, 3, 32, 32))
+
+    assert logits.shape == (1, 3)
+
+
+def _write_fairvision_tree(
+    tmp_path: Path, *, include_test: bool = True
+) -> Path:
+    fairvision_root = tmp_path / "fairvision"
+    disease_root = fairvision_root / "dr"
     rows = []
-    for index, label in enumerate(("healthy", "healthy", "healthy", "disease")):
-        relative_path = Path("training") / f"image_{index}.jpg"
-        path = tmp_path / relative_path
-        path.parent.mkdir(exist_ok=True)
-        Image.new("RGB", (16, 16)).save(path)
-        rows.append({"image": str(relative_path), "label": label, "split": "training"})
-    metadata_path = tmp_path / "metadata.csv"
-    pd.DataFrame(rows).to_csv(metadata_path, index=False)
-    return metadata_path, tmp_path
+    split_labels = {
+        "training": [
+            "non-vision threatening dr",
+            "non-vision threatening dr",
+            "non-vision threatening dr",
+            "vision threatening dr",
+        ],
+        "validation": ["non-vision threatening dr", "vision threatening dr"],
+        "test": ["non-vision threatening dr", "vision threatening dr"],
+    }
+    if not include_test:
+        split_labels.pop("test")
+
+    for split_index, (split, labels) in enumerate(split_labels.items()):
+        split_dir = disease_root / split
+        split_dir.mkdir(parents=True)
+        for index, label in enumerate(labels):
+            image_id = f"{split_index}{index:02d}"
+            Image.new("RGB", (16, 12), color=(index * 40, 60, 100)).save(
+                split_dir / f"slo_fundus_{image_id}.jpg"
+            )
+            rows.append(
+                {
+                    "filename": f"data_{image_id}.npz",
+                    "dr": label,
+                    "gender": "female" if index % 2 == 0 else "male",
+                    "age": None if index == 0 else 60 + index,
+                    "race": "Unknown",
+                    "ethnicity": "Unknown",
+                    "language": "Unknown",
+                    "maritalstatus": "Unknown",
+                }
+            )
+
+    pd.DataFrame(rows).to_csv(disease_root / "metadata.csv", index=False)
+    return fairvision_root
