@@ -65,8 +65,10 @@ def run_experiment(
         split=dev_splits,
         transform=create_image_transform(image_size=config.image_size, training=True),
     )
+    dev_split_names = dev_splits if isinstance(dev_splits, str) else ", ".join(dev_splits)
     logger.info(
-        f"Loaded {len(train_dataset):,} samples for development ({dev_splits if isinstance(dev_splits, str) else ', '.join(dev_splits)}) dataset for {disease}"
+        f"Loaded {len(train_dataset):,} samples for development "
+        f"({dev_split_names}) dataset for {disease}"
     )
 
     test_dataset = FairVisionDataset(
@@ -74,8 +76,10 @@ def run_experiment(
         split=eval_splits,
         transform=create_image_transform(image_size=config.image_size, training=False),
     )
+    eval_split_names = eval_splits if isinstance(eval_splits, str) else ", ".join(eval_splits)
     logger.info(
-        f"Loaded {len(test_dataset):,} samples for evaluation ({eval_splits if isinstance(eval_splits, str) else ', '.join(eval_splits)}) dataset for {disease}"
+        f"Loaded {len(test_dataset):,} samples for evaluation "
+        f"({eval_split_names}) dataset for {disease}"
     )
 
     model = create_model(num_classes=len(train_dataset.classes), pretrained=True, device=device)
@@ -142,33 +146,42 @@ def run_experiment(
 
     surogates = [surrogate_1, surrogate_2]
 
-    method_configs = {
-        UniformSampleMean: {"batch_size": 10},
-        StratifiedSampleMean: {"allocation": "balanced", "batch_size": 10},
-        StratifiedSampleMean: {"allocation": "proportional", "batch_size": 10},
-        KossenActiveTesting: {
-            "surrogate": surrogate_1,
-            "num_classes": len(train_dataset.classes),
-            "batch_size": 10,
-        },
-        ActiveSurrogateEstimator: {
-            "surrogate": surogates,
-            "num_classes": len(train_dataset.classes),
-            "acquisition": "xwed",
-            "loss_type": "cross_entropy",
-            "surrogate_output": "logits",
-            "batch_size": 10,
-        },
-        PredictionPoweredActiveTesting: {
-            "num_classes": len(train_dataset.classes),
-            "proxy": proxy_model,
-            "surrogate": surogates,
-            "lambda_value": 0.5,
-            "exploration": 0.05,
-            "loss_type": "cross_entropy",
-            "batch_size": 10,
-        },
-    }
+    method_configs = [
+        (UniformSampleMean, {"batch_size": 10}),
+        (StratifiedSampleMean, {"allocation": "balanced", "batch_size": 10}),
+        (StratifiedSampleMean, {"allocation": "proportional", "batch_size": 10}),
+        (
+            KossenActiveTesting,
+            {
+                "surrogate": surrogate_1,
+                "num_classes": len(train_dataset.classes),
+                "batch_size": 10,
+            },
+        ),
+        (
+            ActiveSurrogateEstimator,
+            {
+                "surrogate": surogates,
+                "num_classes": len(train_dataset.classes),
+                "acquisition": "xwed",
+                "loss_type": "cross_entropy",
+                "surrogate_output": "logits",
+                "batch_size": 10,
+            },
+        ),
+        (
+            PredictionPoweredActiveTesting,
+            {
+                "num_classes": len(train_dataset.classes),
+                "proxy": proxy_model,
+                "surrogate": surogates,
+                "lambda_value": 0.5,
+                "exploration": 0.05,
+                "loss_type": "cross_entropy",
+                "batch_size": 10,
+            },
+        ),
+    ]
 
     dfs = []
     histories = {}
@@ -179,7 +192,7 @@ def run_experiment(
 
         methods = [
             method_class(**method_config, seed=config.seed + i)
-            for method_class, method_config in method_configs.items()
+            for method_class, method_config in method_configs
         ]
 
         for method in methods:
@@ -252,7 +265,8 @@ def run_dev_experiment():
 
 def run_final_experiment():
     assert False, (
-        "This function is not to be run yet. It should only be ran when ready for the final experiment using the full development dataset and the test dataset."
+        "This function is not to be run yet. It should only be ran when ready for the final "
+        "experiment using the full development dataset and the test dataset."
     )
 
     dev_dataset = FairVisionDataset(disease="dr", split=("train", "val"))
