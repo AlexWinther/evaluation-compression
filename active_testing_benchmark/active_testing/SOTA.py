@@ -63,7 +63,7 @@ def _to_probabilities(output: np.ndarray, kind: str) -> np.ndarray:
     return values / values.sum(axis=-1, keepdims=True)
 
 
-def _at_surrogate_members(
+def _predict_surrogate_members(
     surrogate: nn.Module | list[nn.Module] | tuple[nn.Module, ...],
     X: torch.Tensor,
     batch_size: int,
@@ -115,7 +115,9 @@ def _at_surrogate_members(
     return result
 
 
-def _at_class_loss_matrix(logits: np.ndarray, loss_fn: nn.Module, loss_type: str) -> np.ndarray:
+def _compute_hypothetical_class_losses(
+    logits: np.ndarray, loss_fn: nn.Module, loss_type: str
+) -> np.ndarray:
     """
     [N, num_classes] loss L(f(x_i), y), for every hypothetical class y.
 
@@ -169,7 +171,9 @@ def _initialize_common_state(
         raise ValueError("Require a tensor X_pool of length N > 0 and 0 <= budget <= N")
 
     mut_logits = _predict_logits(problem.model, X, prediction_batch_size, num_classes)
-    hypothetical_losses = _at_class_loss_matrix(mut_logits, problem.loss_fn, loss_type)
+    hypothetical_losses = _compute_hypothetical_class_losses(
+        mut_logits, problem.loss_fn, loss_type
+    )
 
     groups = problem.protected_attribute
     if groups and len(groups) != N:
@@ -195,7 +199,7 @@ def _initialize_common_state(
     }
 
 
-def _at_validate_observation(
+def _validate_observation(
     state: dict, selection: SelectionPlan, labels, losses
 ) -> tuple[list[int], list[int], np.ndarray]:
     """
@@ -230,7 +234,7 @@ def _at_validate_observation(
     return indices, [int(v) for v in observed_labels], observed_losses
 
 
-def _at_record_observation(
+def _record_observation(
     state: dict, indices: list[int], labels: list[int], losses: np.ndarray
 ) -> dict:
     """Shared state updates across PPAT and ASE"""
@@ -253,7 +257,7 @@ def _at_record_observation(
     return state
 
 
-def _at_lure_weights(N: int, q: list[float], horizon: int) -> np.ndarray:
+def _compute_lure_weights(N: int, q: list[float], horizon: int) -> np.ndarray:
     """LURE weights at the current horizon"""
     if horizon == N:
         return np.ones(N, dtype=np.float64)
@@ -320,7 +324,7 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         self.rng = np.random.default_rng(seed)
 
     def _refresh_predictions(self, state: dict) -> dict:
-        members = _at_surrogate_members(
+        members = _predict_surrogate_members(
             self.surrogate,
             state["X_pool"],
             self.prediction_batch_size,
@@ -401,11 +405,11 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
 
     def observe(self, state: dict, selection: SelectionPlan, new_labels, new_losses) -> dict:
         # Shared validation step with PPAT
-        indices, y, l = _at_validate_observation(state, selection, new_labels, new_losses)
+        indices, y, l = _validate_observation(state, selection, new_labels, new_losses)
 
         # Update state
         previous_count = len(state["selections"])
-        state = _at_record_observation(state, indices, y, l)
+        state = _record_observation(state, indices, y, l)
 
         # Update the surrogate if enabled
         if (
@@ -540,7 +544,7 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
             members = _to_probabilities(state["target_logits"], "logits")[None, ...]
         else:
             # Surrogate predictions at members
-            members = _at_surrogate_members(
+            members = _predict_surrogate_members(
                 self.surrogate,
                 state["X_pool"],
                 self.prediction_batch_size,
@@ -693,7 +697,7 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
     def observe(self, state: dict, selection: SelectionPlan, new_labels, new_losses) -> dict:
         """Update the state of PPAT, refit the surrogate and update lambda if enabled"""
         # Shared validation with ASE
-        indices, y, l = _at_validate_observation(state, selection, new_labels, new_losses)
+        indices, y, l = _validate_observation(state, selection, new_labels, new_losses)
 
         # Note down the selection probabilities
         q = selection.selection_probabilities
@@ -708,7 +712,7 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
 
         # Save the count before and after updating state
         previous_count = len(state["selections"])
-        state = _at_record_observation(state, indices, y, l)
+        state = _record_observation(state, indices, y, l)
         current_count = len(state["selections"])
 
         # handle updating of surrogate
@@ -736,7 +740,7 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
             denom = state["centered_proxy_second_moment"]
             if denom > 0:
                 # get current LURE weights
-                v = _at_lure_weights(state["N"], state["selection_probs"], current_count)
+                v = _compute_lure_weights(state["N"], state["selection_probs"], current_count)
 
                 new_losses = np.asarray(state["observed_losses"], dtype=float)
                 correction = state["centered_proxy_losses"][state["selected_order"]]
@@ -758,7 +762,7 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
                 subgroup_n_labels=dict(state["subgroup_counts"]),
             )
 
-        lure_weights = _at_lure_weights(N, state["selection_probs"], n)
+        lure_weights = _compute_lure_weights(N, state["selection_probs"], n)
         selected = np.asarray(state["selected_order"], dtype=int)
         observed_losses = np.asarray(state["observed_losses"], dtype=np.float64)
         lambda_ = state["lambda"]
