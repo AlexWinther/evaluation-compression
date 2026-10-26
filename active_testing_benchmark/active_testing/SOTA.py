@@ -55,7 +55,7 @@ def _to_probabilities(output: np.ndarray, kind: str) -> np.ndarray:
         raise ValueError("Non-finite surrogate predictions")
 
     if kind == "logits":
-        return softmax(values, axis=1)
+        return softmax(values, axis=-1)
 
     if np.any(values < 0) or np.any(values.sum(axis=-1) <= 0):
         raise ValueError("Surrogate probabilities must be nonnegative with nonzero sums")
@@ -425,7 +425,7 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         return state
 
     def estimate(self, state: dict, history: list[dict]) -> Estimate:
-        """Estimate the image's loss using the current surrogate's predictions as a proxy for labels"""
+        """Estimate image loss using current surrogate predictions as a proxy for labels."""
 
         # Expected losses with current surrogate
         expected_losses = (
