@@ -76,7 +76,9 @@ class FairVisionDataset(Dataset):
             raise ValueError(f"Missing metadata columns: {sorted(missing)}")
         if metadata[metadata_id_column].isna().any():
             raise ValueError("Metadata contains missing image IDs.")
-        metadata = metadata.set_index(metadata_id_column, verify_integrity=True)
+        metadata = metadata.set_index(metadata_id_column)
+        if not metadata.index.is_unique:
+            raise ValueError("Metadata contains duplicates in index coloumn")
 
         self.samples = []
         self.targets = []
