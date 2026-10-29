@@ -185,50 +185,16 @@ def run_experiment(
 
     dfs = []
     histories = {}
-    repititions = 2
+    repititions = 3
 
     for i, rep in enumerate(range(repititions)):
         logger.info(f"Starting repetition {rep + 1}/{repititions}")
 
-        methods = [
-            method_class(**method_config, seed=config.seed + i)
-            for method_class, method_config in method_configs
-        ]
+        repition_dfs = execute_active_evaluation(
+            config, device, test_dataset, model, method_configs, histories, rep
+        )
 
-        for method in methods:
-            active_evaluation_history = run_active_evaluation(
-                method=method,
-                model=model,
-                dataset=test_dataset,
-                device=device,
-                loss_fn=nn.CrossEntropyLoss(reduction="sum"),
-                protected_column=["gender"],
-                budget=990,
-            )
-
-            method_name = method.__class__.__name__
-            if isinstance(method, StratifiedSampleMean):
-                method_name += f"{method.allocation.capitalize()}"
-
-            histories[method_name] = active_evaluation_history
-
-        for method_name, history in histories.items():
-            df = pd.DataFrame(
-                [
-                    {
-                        "n_labels": e.n_labels,
-                        "risk": e.risk,
-                        "method": method_name,
-                        **{f"risk {g}": r for g, r in e.subgroup_risks.items()},
-                        **{f"n_labels_{g}": n for g, n in e.subgroup_n_labels.items()},
-                    }
-                    for record in history
-                    for e in [record["estimate"]]
-                ]
-            )
-            df["repetition"] = rep + 1
-            df["seed"] = config.seed + i
-            dfs.append(df)
+        dfs.extend(repition_dfs)
 
     df = pd.concat(dfs, ignore_index=True)
 
@@ -257,6 +223,53 @@ def run_experiment(
     plt.show()
     print(df)
     return "Experiment run successfully"
+
+
+def execute_active_evaluation(
+    config, device, test_dataset, model, method_configs, histories, repitition
+):
+    repition_dfs = []
+
+    methods = [
+        method_class(**method_config, seed=config.seed + repitition)
+        for method_class, method_config in method_configs
+    ]
+
+    for method in methods:
+        active_evaluation_history = run_active_evaluation(
+            method=method,
+            model=model,
+            dataset=test_dataset,
+            device=device,
+            loss_fn=nn.CrossEntropyLoss(reduction="sum"),
+            protected_column=["gender"],
+            budget=990,
+        )
+
+        method_name = method.__class__.__name__
+        if isinstance(method, StratifiedSampleMean):
+            method_name += f"{method.allocation.capitalize()}"
+
+        histories[method_name] = active_evaluation_history
+
+    for method_name, history in histories.items():
+        df = pd.DataFrame(
+            [
+                {
+                    "n_labels": e.n_labels,
+                    "risk": e.risk,
+                    "method": method_name,
+                    **{f"risk {g}": r for g, r in e.subgroup_risks.items()},
+                    **{f"n_labels_{g}": n for g, n in e.subgroup_n_labels.items()},
+                }
+                for record in history
+                for e in [record["estimate"]]
+            ]
+        )
+        df["repetition"] = repitition + 1
+        df["seed"] = config.seed + repitition
+        repition_dfs.append(df)
+    return repition_dfs
 
 
 def run_dev_experiment():

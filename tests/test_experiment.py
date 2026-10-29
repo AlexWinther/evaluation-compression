@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import torch
 from torch import nn
 
+from active_testing_benchmark import experiment
 from active_testing_benchmark.active_testing import (
     ActiveSurrogateEstimator,
     KossenActiveTesting,
@@ -9,7 +12,6 @@ from active_testing_benchmark.active_testing import (
     UniformSampleMean,
 )
 from active_testing_benchmark.active_testing.interface import Estimate
-from active_testing_benchmark import experiment
 
 
 class FakeDataset:
@@ -35,22 +37,13 @@ class FakeClassifier(nn.Module):
         return self.linear(inputs.reshape(len(inputs), -1)[:, :1])
 
 
-def test_experiment_builds_and_runs_all_current_methods(monkeypatch) -> None:
-    datasets = []
+def test_execute_active_evaluation_runs_all_current_methods(monkeypatch) -> None:
     active_methods = []
-    plot_targets = []
-    model_class_counts = []
-
-    def make_dataset(*, disease, split, transform):
-        datasets.append((disease, split, transform))
-        return FakeDataset()
-
-    def make_model(*, num_classes, pretrained, device):
-        model_class_counts.append(num_classes)
-        return FakeClassifier(num_classes)
+    active_calls = []
 
     def run_active(method, **kwargs):
         active_methods.append(method)
+        active_calls.append(kwargs)
         estimate = Estimate(
             risk=0.25,
             n_labels=1,
@@ -59,30 +52,57 @@ def test_experiment_builds_and_runs_all_current_methods(monkeypatch) -> None:
         )
         return [{"estimate": estimate}]
 
-    monkeypatch.setattr(experiment, "configure_mlflow", lambda: None)
-    monkeypatch.setattr(experiment, "select_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(experiment, "set_seed", lambda *args, **kwargs: None)
-    monkeypatch.setattr(experiment, "FairVisionDataset", make_dataset)
-    monkeypatch.setattr(experiment, "create_image_transform", lambda **kwargs: kwargs)
-    monkeypatch.setattr(experiment, "create_model", make_model)
-    monkeypatch.setattr(
-        experiment,
-        "make_train_loader_and_loss",
-        lambda **kwargs: (object(), nn.CrossEntropyLoss(), None, None),
-    )
-    monkeypatch.setattr(experiment, "DataLoader", lambda dataset, **kwargs: dataset)
-    monkeypatch.setattr(experiment, "train_one_epoch", lambda **kwargs: 0.5)
-    monkeypatch.setattr(experiment, "evaluate", lambda **kwargs: {"predictions": []})
-    monkeypatch.setattr(experiment, "RandomForestModule", FakeClassifier)
     monkeypatch.setattr(experiment, "run_active_evaluation", run_active)
-    monkeypatch.setattr(
-        experiment.sns,
-        "lineplot",
-        lambda *, data, x, y, hue, ax: plot_targets.append((y, set(data["method"]))),
-    )
-    monkeypatch.setattr(experiment.plt, "show", lambda: None)
 
-    result = experiment.run_experiment(dev_splits="train", eval_splits="test", disease="dr")
+    dataset = FakeDataset()
+    model = FakeClassifier(num_classes=2)
+    surrogate_1 = FakeClassifier(num_classes=2)
+    surrogate_2 = FakeClassifier(num_classes=2)
+    proxy_model = FakeClassifier(num_classes=2)
+    method_configs = [
+        (UniformSampleMean, {"batch_size": 10}),
+        (StratifiedSampleMean, {"allocation": "balanced", "batch_size": 10}),
+        (StratifiedSampleMean, {"allocation": "proportional", "batch_size": 10}),
+        (
+            KossenActiveTesting,
+            {"surrogate": surrogate_1, "num_classes": 2, "batch_size": 10},
+        ),
+        (
+            ActiveSurrogateEstimator,
+            {
+                "surrogate": [surrogate_1, surrogate_2],
+                "num_classes": 2,
+                "acquisition": "xwed",
+                "loss_type": "cross_entropy",
+                "surrogate_output": "logits",
+                "batch_size": 10,
+            },
+        ),
+        (
+            PredictionPoweredActiveTesting,
+            {
+                "num_classes": 2,
+                "proxy": proxy_model,
+                "surrogate": [surrogate_1, surrogate_2],
+                "lambda_value": 0.5,
+                "exploration": 0.05,
+                "loss_type": "cross_entropy",
+                "batch_size": 10,
+            },
+        ),
+    ]
+    histories = {}
+    repetition_index = 7
+
+    result = experiment.execute_active_evaluation(
+        config=SimpleNamespace(seed=42),
+        device=torch.device("cpu"),
+        test_dataset=dataset,
+        model=model,
+        method_configs=method_configs,
+        histories=histories,
+        repitition=repetition_index,
+    )
 
     expected_types = [
         UniformSampleMean,
@@ -92,21 +112,34 @@ def test_experiment_builds_and_runs_all_current_methods(monkeypatch) -> None:
         ActiveSurrogateEstimator,
         PredictionPoweredActiveTesting,
     ]
-    assert result == "Experiment run successfully"
-    assert len(datasets) == 2
-    assert [split for _, split, _ in datasets] == ["train", "test"]
-    assert model_class_counts == [2]
-    assert len(active_methods) == 2 * len(expected_types)
+    expected_names = [
+        "UniformSampleMean",
+        "StratifiedSampleMeanBalanced",
+        "StratifiedSampleMeanProportional",
+        "KossenActiveTesting",
+        "ActiveSurrogateEstimator",
+        "PredictionPoweredActiveTesting",
+    ]
 
-    for repetition in range(2):
-        start = repetition * len(expected_types)
-        methods = active_methods[start : start + len(expected_types)]
-        assert [type(method) for method in methods] == expected_types
-        assert methods[1].allocation == "balanced"
-        assert methods[2].allocation == "proportional"
-        assert [method.num_classes for method in methods[3:]] == [2, 2, 2]
+    assert [type(method) for method in active_methods] == expected_types
+    assert active_methods[1].allocation == "balanced"
+    assert active_methods[2].allocation == "proportional"
+    assert [method.num_classes for method in active_methods[3:]] == [2, 2, 2]
+    assert len(active_calls) == len(expected_types)
+    assert all(call["model"] is model for call in active_calls)
+    assert all(call["dataset"] is dataset for call in active_calls)
+    assert all(call["device"] == torch.device("cpu") for call in active_calls)
+    assert all(call["protected_column"] == ["gender"] for call in active_calls)
+    assert all(call["budget"] == 990 for call in active_calls)
+    assert all(isinstance(call["loss_fn"], nn.CrossEntropyLoss) for call in active_calls)
+    assert all(call["loss_fn"].reduction == "sum" for call in active_calls)
 
-    assert {target for target, _ in plot_targets} == {"risk", "risk female", "risk male"}
-    plotted_methods = set.union(*(methods for _, methods in plot_targets))
-    assert "StratifiedSampleMeanBalanced" in plotted_methods
-    assert "StratifiedSampleMeanProportional" in plotted_methods
+    assert len(result) == len(expected_types)
+    assert [frame["method"].iloc[0] for frame in result] == expected_names
+    assert set(histories) == set(expected_names)
+    for frame in result:
+        assert frame["repetition"].tolist() == [repetition_index + 1]
+        assert frame["seed"].tolist() == [42 + repetition_index]
+        assert frame["risk"].tolist() == [0.25]
+        assert frame["risk female"].tolist() == [0.2]
+        assert frame["risk male"].tolist() == [0.3]
