@@ -32,8 +32,8 @@ CLASS_TO_IDX = {
 MODELS_DIR = PROJ_ROOT / "models"
 MLFLOW_DB_PATH = PROJ_ROOT / "mlflow.db"
 
-REPORTS_DIR = PROJ_ROOT / "reports"
-FIGURES_DIR = REPORTS_DIR / "figures"
+RESULTS_DIR = PROJ_ROOT / "results"
+FIGURES_DIR = RESULTS_DIR / "figures"
 
 # If tqdm is installed, configure loguru with tqdm.write
 # https://github.com/Delgan/loguru/issues/135

@@ -1,5 +1,7 @@
 import argparse
+import datetime
 import pprint
+import uuid
 
 from loguru import logger
 import matplotlib.pyplot as plt
@@ -18,6 +20,7 @@ from active_testing_benchmark.active_testing import (
     run_active_evaluation,
 )
 from active_testing_benchmark.active_testing.surrogate import RandomForestModule
+from active_testing_benchmark.config import RESULTS_DIR
 from active_testing_benchmark.modeling.data import FairVisionDataset
 from active_testing_benchmark.modeling.models import (
     create_image_transform,
@@ -43,6 +46,14 @@ def run_experiment(
     disease: str = "dr",
     repetitions: int = 1,
 ):
+    output_dir = RESULTS_DIR / "active-testing"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = f"{datetime.datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex}"
+    output_path = output_dir / f"{disease}-budget-curves-{run_id}.csv"
+    while output_path.exists():
+        run_id = f"{datetime.datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex}"
+        output_path = output_dir / f"{disease}-budget-curves-{run_id}.csv"
+
     configure_mlflow()
 
     config = TrainConfig(
@@ -198,6 +209,8 @@ def run_experiment(
         dfs.extend(repition_dfs)
 
     df = pd.concat(dfs, ignore_index=True)
+    df.to_csv(output_path, index=False, mode="x")
+    logger.info(f"Saved experiment budget curves to {output_path}")
 
     sns.set_style("whitegrid")
 
