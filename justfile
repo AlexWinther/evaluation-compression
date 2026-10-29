@@ -25,5 +25,6 @@ test:
     uv run pytest tests
 
 # Run experiment (currently only dev)
-experiment: requirements
-    uv run active_testing_benchmark/experiment.py
+[arg("repititions", long="repititions")]
+experiment repititions="1": requirements
+    uv run active_testing_benchmark/experiment.py --repetitions {{repititions}}

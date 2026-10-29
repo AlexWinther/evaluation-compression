@@ -1,3 +1,4 @@
+import argparse
 import pprint
 
 from loguru import logger
@@ -40,6 +41,7 @@ def run_experiment(
     dev_splits: str | tuple[str, ...] = "train",
     eval_splits: str | tuple[str, ...] = "val",
     disease: str = "dr",
+    repetitions: int = 1,
 ):
     configure_mlflow()
 
@@ -185,10 +187,9 @@ def run_experiment(
 
     dfs = []
     histories = {}
-    repititions = 3
 
-    for i, rep in enumerate(range(repititions)):
-        logger.info(f"Starting repetition {rep + 1}/{repititions}")
+    for rep in range(repetitions):
+        logger.info(f"Starting repetition {rep + 1}/{repetitions}")
 
         repition_dfs = execute_active_evaluation(
             config, device, test_dataset, model, method_configs, histories, rep
@@ -272,24 +273,28 @@ def execute_active_evaluation(
     return repition_dfs
 
 
-def run_dev_experiment():
-    run_experiment(dev_splits="train", eval_splits="val")
+def run_dev_experiment(repetitions: int = 1):
+    run_experiment(dev_splits="train", eval_splits="val", repetitions=repetitions)
 
 
-def run_final_experiment():
+def run_final_experiment(repetitions: int = 1):
     assert False, (
         "This function is not to be run yet. It should only be ran when ready for the final "
         "experiment using the full development dataset and the test dataset."
     )
 
-    dev_dataset = FairVisionDataset(disease="dr", split=("train", "val"))
-    test_dataset = FairVisionDataset(disease="dr", split="test")
-
-    return run_experiment(dev_dataset=dev_dataset, eval_dataset=test_dataset)
+    return run_experiment(dev_splits=("train", "val"), eval_splits="test", repetitions=repetitions)
 
 
 def main():
-    run_dev_experiment()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repetitions", type=int, default=1)
+    args = parser.parse_args()
+
+    if args.repetitions < 1:
+        parser.error("--repetitions must be at least 1")
+
+    run_dev_experiment(repetitions=args.repetitions)
 
 
 if __name__ == "__main__":
