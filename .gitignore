@@ -239,3 +239,4 @@ deploy/mlflow/*.sql
 deploy/mlflow/*.tar
 deploy/mlflow/*.tar.gz
 deploy/mlflow/backups/
+/results/active-testing

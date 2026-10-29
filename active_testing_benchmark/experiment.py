@@ -1,10 +1,12 @@
 import argparse
 import datetime
 import pprint
+import secrets
 import uuid
 
 from loguru import logger
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
@@ -45,7 +47,14 @@ def run_experiment(
     eval_splits: str | tuple[str, ...] = "val",
     disease: str = "dr",
     repetitions: int = 1,
+    seed: int | None = None,
 ):
+    if seed is None:
+        seed = secrets.randbits(32)
+    if not 0 <= seed < 2**32:
+        raise ValueError("seed must be between 0 and 4294967295")
+    logger.info(f"Experiment master seed: {seed}")
+
     output_dir = RESULTS_DIR / "active-testing"
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = f"{datetime.datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex}"
@@ -61,7 +70,7 @@ def run_experiment(
         num_workers=0,
         epochs=2,
         learning_rate=1e-4,
-        seed=42,
+        seed=seed,
         image_size=224,
         weighted_sampling=False,
         weighted_loss=True,
@@ -131,19 +140,23 @@ def run_experiment(
         f"{pp.pformat({k: v for k, v in results.items() if k != 'predictions'})}"
     )
 
+    model_seeds = [
+        int(child.generate_state(1)[0]) for child in np.random.SeedSequence(config.seed).spawn(3)
+    ]
+
     surrogate_1 = RandomForestModule(
         num_classes=len(train_dataset.classes),
-        random_state=config.seed,
+        random_state=model_seeds[0],
     )
 
     surrogate_2 = RandomForestModule(
         num_classes=len(train_dataset.classes),
-        random_state=config.seed * 2,
+        random_state=model_seeds[1],
     )
 
     proxy_model = RandomForestModule(
         num_classes=len(train_dataset.classes),
-        random_state=config.seed * 3,
+        random_state=model_seeds[2],
     )
 
     for i, surrogate in enumerate([surrogate_1, surrogate_2, proxy_model]):
@@ -286,8 +299,8 @@ def execute_active_evaluation(
     return repition_dfs
 
 
-def run_dev_experiment(repetitions: int = 1):
-    run_experiment(dev_splits="train", eval_splits="val", repetitions=repetitions)
+def run_dev_experiment(repetitions: int = 1, seed: int | None = None):
+    run_experiment(dev_splits="train", eval_splits="val", repetitions=repetitions, seed=seed)
 
 
 def run_final_experiment(repetitions: int = 1):
@@ -302,12 +315,15 @@ def run_final_experiment(repetitions: int = 1):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     if args.repetitions < 1:
         parser.error("--repetitions must be at least 1")
+    if args.seed is not None and not 0 <= args.seed < 2**32:
+        parser.error("--seed must be between 0 and 4294967295")
 
-    run_dev_experiment(repetitions=args.repetitions)
+    run_dev_experiment(repetitions=args.repetitions, seed=args.seed)
 
 
 if __name__ == "__main__":

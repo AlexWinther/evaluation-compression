@@ -26,5 +26,8 @@ test:
 
 # Run experiment (currently only dev)
 [arg("repititions", long="repititions")]
-experiment repititions="1": requirements
-    uv run active_testing_benchmark/experiment.py --repetitions {{repititions}}
+[arg("seed", long="seed")]
+experiment repititions="1" seed="": requirements
+    uv run active_testing_benchmark/experiment.py \
+        --repetitions {{repititions}} \
+        {{ if seed != "" { "--seed " + seed } else { "" } }}
