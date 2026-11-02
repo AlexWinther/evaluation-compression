@@ -5,10 +5,8 @@ import secrets
 import uuid
 
 from loguru import logger
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -237,30 +235,6 @@ def run_experiment(
     df.to_csv(output_path, index=False, mode="x")
     logger.info(f"Saved experiment budget curves to {output_path}")
 
-    sns.set_style("whitegrid")
-
-    _, ax = plt.subplots(1, 3, figsize=(10, 6), sharey=True)
-
-    for i, g in enumerate(["", "male", "female"]):
-        sns.lineplot(
-            data=df,
-            x="n_labels",
-            y=f"risk{' ' + g if g else ''}",
-            hue="method",
-            ax=ax[i],
-        )
-
-        ax[i].set_title(f"{g.capitalize() if g else 'Overall'} Risk")
-        ax[i].set_xlabel("Number of Labels")
-        ax[i].set_ylabel("Estimated Risk")
-
-        # ax[i].set_yscale("log")
-
-    # fig.suptitle(f"Active Evaluation of {disease.upper()} Model")
-
-    plt.tight_layout()
-    plt.show()
-    print(df)
     return "Experiment run successfully"
 
 
