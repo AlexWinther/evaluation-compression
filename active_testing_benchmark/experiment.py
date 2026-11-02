@@ -12,6 +12,7 @@ import seaborn as sns
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from active_testing_benchmark.active_testing import (
     ActiveSurrogateEstimator,
@@ -133,13 +134,6 @@ def run_experiment(
 
         logger.info(f"Training loss at epoch {epoch + 1}: {train_loss:.4f}")
 
-    results = evaluate(model=model, loader=val_loader, device=device, protected_column="gender")
-
-    logger.info(
-        f"Evaluation results for the trained model:\n"
-        f"{pp.pformat({k: v for k, v in results.items() if k != 'predictions'})}"
-    )
-
     model_seeds = [
         int(child.generate_state(1)[0]) for child in np.random.SeedSequence(config.seed).spawn(3)
     ]
@@ -159,16 +153,8 @@ def run_experiment(
         random_state=model_seeds[2],
     )
 
-    for i, surrogate in enumerate([surrogate_1, surrogate_2, proxy_model]):
+    for surrogate in [surrogate_1, surrogate_2, proxy_model]:
         surrogate.fit(train_loader)
-
-        eval_results = evaluate(
-            model=surrogate, loader=val_loader, device=device, protected_column="gender"
-        )
-        logger.info(
-            f"Surrogate {i + 1} evaluation results:\n"
-            f"{pp.pformat({k: v for k, v in eval_results.items() if k != 'predictions'})}"
-        )
 
     surogates = [surrogate_1, surrogate_2]
 
@@ -212,16 +198,42 @@ def run_experiment(
     dfs = []
     histories = {}
 
-    for rep in range(repetitions):
+    show_repetition_progress = repetitions > 1
+    for rep in tqdm(
+        range(repetitions),
+        desc="Repetitions",
+        unit="repetition",
+        position=0,
+        leave=True,
+        disable=not show_repetition_progress,
+    ):
         logger.info(f"Starting repetition {rep + 1}/{repetitions}")
 
         repition_dfs = execute_active_evaluation(
-            config, device, test_dataset, model, method_configs, histories, rep
+            config,
+            device,
+            test_dataset,
+            model,
+            method_configs,
+            histories,
+            rep,
+            method_position=1 if show_repetition_progress else 0,
+            budget_position=2 if show_repetition_progress else 1,
+            leave_method_progress=not show_repetition_progress,
         )
 
         dfs.extend(repition_dfs)
 
+    # Full finite pool reference risk
+    results = evaluate(model=model, loader=val_loader, device=device, protected_column="gender")
+    logger.info(
+        f"Evaluation results for the trained model:\n"
+        f"{pp.pformat({k: v for k, v in results.items() if k != 'predictions'})}"
+    )
+
     df = pd.concat(dfs, ignore_index=True)
+    df["full_pool_risk"] = results["loss"]
+    df["full_pool_size"] = len(test_dataset)
     df.to_csv(output_path, index=False, mode="x")
     logger.info(f"Saved experiment budget curves to {output_path}")
 
@@ -253,7 +265,16 @@ def run_experiment(
 
 
 def execute_active_evaluation(
-    config, device, test_dataset, model, method_configs, histories, repitition
+    config,
+    device,
+    test_dataset,
+    model,
+    method_configs,
+    histories,
+    repitition,
+    method_position=0,
+    budget_position=1,
+    leave_method_progress=True,
 ):
     repition_dfs = []
 
@@ -262,7 +283,20 @@ def execute_active_evaluation(
         for method_class, method_config in method_configs
     ]
 
-    for method in methods:
+    method_progress = tqdm(
+        methods,
+        desc=f"Methods (repetition {repitition + 1})",
+        unit="method",
+        position=method_position,
+        leave=leave_method_progress,
+    )
+
+    for method in method_progress:
+        method_name = method.__class__.__name__
+        if isinstance(method, StratifiedSampleMean):
+            method_name += f"{method.allocation.capitalize()}"
+        method_progress.set_postfix_str(method_name)
+
         active_evaluation_history = run_active_evaluation(
             method=method,
             model=model,
@@ -270,12 +304,9 @@ def execute_active_evaluation(
             device=device,
             loss_fn=nn.CrossEntropyLoss(reduction="sum"),
             protected_column=["gender"],
-            budget=990,
+            budget=1000,
+            progress_position=budget_position,
         )
-
-        method_name = method.__class__.__name__
-        if isinstance(method, StratifiedSampleMean):
-            method_name += f"{method.allocation.capitalize()}"
 
         histories[method_name] = active_evaluation_history
 

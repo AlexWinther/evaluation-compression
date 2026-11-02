@@ -18,6 +18,7 @@ def run_active_evaluation(
     loss_fn: nn.Module,
     protected_column: list[str] | str,
     budget: int | None = None,
+    progress_position: int = 0,
 ) -> list[dict]:
     """Run finite-pool active evaluation, returning risk estimates after each batch."""
     if loss_fn is None:
@@ -83,7 +84,13 @@ def run_active_evaluation(
 
     history = []
 
-    pbar = tqdm(total=problem.budget, desc="Active evaluation progress", unit="label")
+    pbar = tqdm(
+        total=problem.budget,
+        desc="Active evaluation budget",
+        unit="label",
+        position=progress_position,
+        leave=False,
+    )
 
     # Loop until the acquired labels reach the budget
     while len(state["selections"]) < problem.budget:
@@ -135,6 +142,8 @@ def run_active_evaluation(
             }
         )
         pbar.update(len(indices))
+
+    pbar.close()
 
     # Return the full history to enable post-hoc analysis of the risk estimates
     return history

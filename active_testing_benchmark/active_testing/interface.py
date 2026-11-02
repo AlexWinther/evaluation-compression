@@ -1,4 +1,4 @@
-from collections.abc import Hashable
+from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
 
 import torch
@@ -71,7 +71,7 @@ class ActiveEvaluationMethod:
     # Incorporate ONLY the new labels/losses for the chosen indices
     # Here sampling state or learned surrogate can be updated
     def observe(
-        self, state: dict, selection: SelectionPlan, new_labels: list, new_losses: list
+        self, state: dict, selection: SelectionPlan, new_labels: Iterable, new_losses: Iterable
     ) -> dict:
         raise NotImplementedError
 
