@@ -138,12 +138,37 @@ class KossenActiveTesting(ActiveEvaluationMethod):
         # acquisition requires supplying a matching 0-1 loss to the runner.
         if self.acquisition == "error_rate" and isinstance(problem.loss_fn, nn.CrossEntropyLoss):
             raise ValueError("error_rate requires a 0-1 loss_fn, not CrossEntropyLoss")
+        if self.acquisition == "cross_entropy" and not isinstance(
+            problem.loss_fn, nn.CrossEntropyLoss
+        ):
+            raise TypeError("cross_entropy acquisition requires nn.CrossEntropyLoss")
 
         logits = self._predict(model, X)
         if not np.isfinite(logits).all():
             raise ValueError("Expected finite logits")
 
         log_probs = log_softmax(logits, axis=1)
+        if isinstance(problem.loss_fn, nn.CrossEntropyLoss):
+            class_weights = (
+                np.ones(self.num_classes, dtype=np.float64)
+                if problem.loss_fn.weight is None
+                else problem.loss_fn.weight.detach().cpu().double().numpy()
+            )
+            if class_weights.shape != (self.num_classes,):
+                raise ValueError("Cross-entropy class weights must match num_classes")
+            label_smoothing = float(problem.loss_fn.label_smoothing)
+            if problem.loss_fn.reduction == "mean" and problem.loss_fn.weight is not None:
+                if np.any(class_weights <= 0):
+                    raise ValueError(
+                        "Weighted mean cross entropy needs positive class weights"
+                    )
+                loss_denominators = class_weights
+            else:
+                loss_denominators = np.ones(self.num_classes, dtype=np.float64)
+        else:
+            class_weights = np.ones(self.num_classes, dtype=np.float64)
+            label_smoothing = 0.0
+            loss_denominators = np.ones(self.num_classes, dtype=np.float64)
 
         groups = problem.protected_attribute
         # TODO: add the posibility of no protected attributes being given for all AT methods
@@ -155,6 +180,9 @@ class KossenActiveTesting(ActiveEvaluationMethod):
             "X_pool": X,
             "model": model,
             "log_probs": log_probs,
+            "class_weights": class_weights,
+            "loss_denominators": loss_denominators,
+            "label_smoothing": label_smoothing,
             "predicted_classes": np.argmax(logits, axis=1),
             "scores": None,  # Recomputed after any surrogate refit.
             "remaining": set(range(N)),
@@ -194,7 +222,20 @@ class KossenActiveTesting(ActiveEvaluationMethod):
                 surrogate_probs = surrogate_predictions / row_sums
 
         if self.acquisition == "cross_entropy":
-            scores = -np.sum(surrogate_probs * state["log_probs"], axis=1)
+            weighted_log_probs = state["log_probs"] * state["class_weights"][None, :]
+            target_log_loss = weighted_log_probs / state["loss_denominators"][None, :]
+            expected_target_loss = np.sum(surrogate_probs * target_log_loss, axis=1)
+            smoothing = state["label_smoothing"]
+            if smoothing:
+                smoothed_target_loss = (
+                    np.sum(weighted_log_probs, axis=1, keepdims=True)
+                    / self.num_classes
+                    / state["loss_denominators"][None, :]
+                )
+                smoothed_loss = np.sum(surrogate_probs * smoothed_target_loss, axis=1)
+                scores = -((1.0 - smoothing) * expected_target_loss + smoothing * smoothed_loss)
+            else:
+                scores = -expected_target_loss
         else:
             scores = 1 - surrogate_probs[np.arange(state["N"]), state["predicted_classes"]]
 

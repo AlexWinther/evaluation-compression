@@ -110,6 +110,18 @@ def make_train_loader_and_loss(
     return train_loader, train_criterion, counts, loss_weights
 
 
+def make_class_balanced_weights(class_counts: torch.Tensor) -> torch.Tensor:
+    """Return inverse-prevalence weights whose weighted risk is macro-averaged CE."""
+    counts = class_counts.to(dtype=torch.float64)
+    if counts.ndim != 1 or counts.numel() < 2 or not torch.isfinite(counts).all():
+        raise ValueError("Class counts must be a finite one-dimensional tensor for 2+ classes")
+    if torch.any(counts <= 0):
+        raise ValueError("Every class needs at least one training example")
+
+    return inverse_frequency_weights(class_counts, power=1.0, normalization="sample_mean")
+
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -143,6 +155,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     protected_column: str | list[str] | None = None,
+    class_weights: torch.Tensor | None = None,
 ):
     model.eval()
     logger.info("Model set to eval mode")
@@ -150,6 +163,11 @@ def evaluate(
         protected_column = [protected_column]
 
     criterion = nn.CrossEntropyLoss(reduction="none")
+    weighted_criterion = (
+        nn.CrossEntropyLoss(weight=class_weights.to(device), reduction="none")
+        if class_weights is not None
+        else None
+    )
 
     predictions = []
     subgroups = defaultdict(lambda: defaultdict(list))
@@ -162,12 +180,17 @@ def evaluate(
         probabilities = logits.softmax(dim=1)
         predicted = logits.argmax(dim=1)
         losses = criterion(logits, targets)
+        weighted_losses = (
+            weighted_criterion(logits, targets) if weighted_criterion is not None else None
+        )
 
         # Move batch outputs to CPU once
         targets = targets.cpu().tolist()
         predicted = predicted.cpu().tolist()
         probabilities = probabilities.cpu().tolist()
         losses = losses.cpu().tolist()
+        if weighted_losses is not None:
+            weighted_losses = weighted_losses.cpu().tolist()
 
         for i, image_id in enumerate(batch["id"]):
             protected = {
@@ -184,28 +207,39 @@ def evaluate(
                 "loss": losses[i],
                 "protected": protected,
             }
+            if weighted_losses is not None:
+                record["weighted_loss"] = weighted_losses[i]
             predictions.append(record)
 
             # Group each image by every protected attribute
             for attribute, value in protected.items():
                 subgroups[attribute][str(value)].append(record)
 
-    def compute_metrics(records):
-        if not records:
-            return None
+    def compute_metrics(records) -> dict:
+        y_true = np.asarray([r["target"] for r in records])
+        probabilities = np.asarray([r["probabilities"] for r in records])
+        n_classes = probabilities.shape[1]
+        observed_classes = np.unique(y_true)
 
-        y_true = [r["target"] for r in records]
-        y_score = [r["probabilities"][1] for r in records]
+        if n_classes == 2 and len(observed_classes) == 2:
+            auc = float(roc_auc_score(y_true, probabilities[:, 1]))
+        elif np.array_equal(observed_classes, np.arange(n_classes)):
+            auc = float(roc_auc_score(y_true, probabilities, multi_class="ovr", average="macro"))
+        else:
+            auc = None
 
-        # Binary ROC-AUC is undefined if only one class is present
-        auc = float(roc_auc_score(y_true, y_score)) if len(set(y_true)) == 2 else None
-
-        return {
+        metrics = {
             "n": len(records),
             "loss": sum(r["loss"] for r in records) / len(records),
             "accuracy": sum(r["target"] == r["prediction"] for r in records) / len(records),
             "roc_auc": auc,
         }
+        metrics["weighted_loss"] = (
+            sum(r["weighted_loss"] for r in records) / len(records)
+            if weighted_criterion is not None
+            else None
+        )
+        return metrics
 
     # Overall metrics
     overall = compute_metrics(predictions)
@@ -221,12 +255,18 @@ def evaluate(
         attribute: {group: metrics["loss"] for group, metrics in groups.items()}
         for attribute, groups in subgroup_metrics.items()
     }
+    subgroup_weighted_risks = {
+        attribute: {group: metrics["weighted_loss"] for group, metrics in groups.items()}
+        for attribute, groups in subgroup_metrics.items()
+    }
 
     return {
         "loss": overall["loss"],
+        "weighted_loss": overall["weighted_loss"],
         "accuracy": overall["accuracy"],
         "roc_auc": overall["roc_auc"],
         "subgroup_risks": subgroup_risks,
+        "subgroup_weighted_risks": subgroup_weighted_risks,
         "subgroup_metrics": subgroup_metrics,
         "predictions": predictions,
     }

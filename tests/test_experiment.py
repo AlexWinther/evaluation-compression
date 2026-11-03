@@ -130,7 +130,7 @@ def test_execute_active_evaluation_runs_all_current_methods(monkeypatch) -> None
     assert all(call["dataset"] is dataset for call in active_calls)
     assert all(call["device"] == torch.device("cpu") for call in active_calls)
     assert all(call["protected_column"] == ["gender"] for call in active_calls)
-    assert all(call["budget"] == 990 for call in active_calls)
+    assert all(call["budget"] == 1000 for call in active_calls)
     assert all(isinstance(call["loss_fn"], nn.CrossEntropyLoss) for call in active_calls)
     assert all(call["loss_fn"].reduction == "sum" for call in active_calls)
 

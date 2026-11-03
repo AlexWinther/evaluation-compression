@@ -151,8 +151,20 @@ def get_class_counts(dataset: FairVisionDataset) -> torch.Tensor:
     return counts
 
 
-def inverse_frequency_weights(counts: torch.Tensor, power: float = 1.0) -> torch.Tensor:
+def inverse_frequency_weights(
+    counts: torch.Tensor,
+    power: float = 1.0,
+    normalization: str = "class_mean",
+) -> torch.Tensor:
+    """Compute inverse-frequency weights with an explicit normalization convention."""
     if not 0.0 <= power <= 1.0:
         raise ValueError("power must be in [0, 1].")
-    weights = counts.to(dtype=torch.float64).pow(-power)
-    return (weights / weights.mean()).float()
+    counts = counts.to(dtype=torch.float64)
+    weights = counts.pow(-power)
+    if normalization == "class_mean":
+        scale = weights.mean()
+    elif normalization == "sample_mean":
+        scale = torch.sum(weights * counts) / counts.sum()
+    else:
+        raise ValueError("normalization must be 'class_mean' or 'sample_mean'.")
+    return (weights / scale).float()

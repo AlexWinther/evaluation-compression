@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import json
 import pprint
 import secrets
 import uuid
@@ -31,6 +32,7 @@ from active_testing_benchmark.modeling.registry import configure_mlflow
 from active_testing_benchmark.modeling.train import (
     TrainConfig,
     evaluate,
+    make_class_balanced_weights,
     make_train_loader_and_loss,
     select_device,
     set_seed,
@@ -47,6 +49,7 @@ def run_experiment(
     disease: str = "dr",
     repetitions: int = 1,
     seed: int | None = None,
+    class_balanced_at: bool = True,
 ):
     if seed is None:
         seed = secrets.randbits(32)
@@ -106,7 +109,7 @@ def run_experiment(
     model = create_model(num_classes=len(train_dataset.classes), pretrained=True, device=device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
-    train_loader, train_criterion, _, _ = make_train_loader_and_loss(
+    train_loader, train_criterion, train_class_counts, _ = make_train_loader_and_loss(
         dataset=train_dataset,
         config=config,
         device=device,
@@ -131,6 +134,13 @@ def run_experiment(
         )
 
         logger.info(f"Training loss at epoch {epoch + 1}: {train_loss:.4f}")
+
+    class_risk_weights = make_class_balanced_weights(train_class_counts).to(device)
+    weighted_loss_fn = (
+        nn.CrossEntropyLoss(weight=class_risk_weights, reduction="sum")
+        if class_balanced_at
+        else None
+    )
 
     model_seeds = [
         int(child.generate_state(1)[0]) for child in np.random.SeedSequence(config.seed).spawn(3)
@@ -218,12 +228,19 @@ def run_experiment(
             method_position=1 if show_repetition_progress else 0,
             budget_position=2 if show_repetition_progress else 1,
             leave_method_progress=not show_repetition_progress,
+            weighted_loss_fn=weighted_loss_fn,
         )
 
         dfs.extend(repition_dfs)
 
     # Full finite pool reference risk
-    results = evaluate(model=model, loader=val_loader, device=device, protected_column="gender")
+    results = evaluate(
+        model=model,
+        loader=val_loader,
+        device=device,
+        protected_column="gender",
+        class_weights=class_risk_weights if class_balanced_at else None,
+    )
     logger.info(
         f"Evaluation results for the trained model:\n"
         f"{pp.pformat({k: v for k, v in results.items() if k != 'predictions'})}"
@@ -231,7 +248,27 @@ def run_experiment(
 
     df = pd.concat(dfs, ignore_index=True)
     df["full_pool_risk"] = results["loss"]
+    df["full_pool_class_balanced_risk"] = results["weighted_loss"]
+    df["full_pool_weighted_risk"] = results["weighted_loss"]
     df["full_pool_size"] = len(test_dataset)
+    df["class_balanced_at"] = class_balanced_at
+    df["class_balanced_risk_weights"] = json.dumps(
+        {
+            class_name: float(weight)
+            for class_name, weight in zip(train_dataset.classes, class_risk_weights.cpu())
+        }
+    )
+    df["training_class_prevalences"] = json.dumps(
+        {
+            class_name: float(count / train_class_counts.sum())
+            for class_name, count in zip(train_dataset.classes, train_class_counts)
+        }
+    )
+    for group, risk in results["subgroup_risks"]["gender"].items():
+        df[f"full_pool_risk {group}"] = risk
+    for group, risk in results["subgroup_weighted_risks"]["gender"].items():
+        df[f"full_pool_class_balanced_risk {group}"] = risk
+        df[f"full_pool_weighted_risk {group}"] = risk
     df.to_csv(output_path, index=False, mode="x")
     logger.info(f"Saved experiment budget curves to {output_path}")
 
@@ -249,52 +286,62 @@ def execute_active_evaluation(
     method_position=0,
     budget_position=1,
     leave_method_progress=True,
+    weighted_loss_fn=None,
 ):
     repition_dfs = []
 
-    methods = [
-        method_class(**method_config, seed=config.seed + repitition)
+    loss_objectives = [("unweighted_cross_entropy", nn.CrossEntropyLoss(reduction="sum"))]
+    if weighted_loss_fn is not None:
+        loss_objectives.append(("class_balanced_cross_entropy", weighted_loss_fn))
+    evaluations = [
+        (objective_name, loss_fn, method_class, method_config)
+        for objective_name, loss_fn in loss_objectives
         for method_class, method_config in method_configs
     ]
 
     method_progress = tqdm(
-        methods,
+        evaluations,
         desc=f"Methods (repetition {repitition + 1})",
         unit="method",
         position=method_position,
         leave=leave_method_progress,
     )
 
-    for method in method_progress:
+    for objective_name, loss_fn, method_class, method_config in method_progress:
+        method = method_class(**method_config, seed=config.seed + repitition)
         method_name = method.__class__.__name__
         if isinstance(method, StratifiedSampleMean):
             method_name += f"{method.allocation.capitalize()}"
-        method_progress.set_postfix_str(method_name)
+        method_progress.set_postfix_str(f"{method_name}: {objective_name}")
 
         active_evaluation_history = run_active_evaluation(
             method=method,
             model=model,
             dataset=test_dataset,
             device=device,
-            loss_fn=nn.CrossEntropyLoss(reduction="sum"),
+            loss_fn=loss_fn,
             protected_column=["gender"],
             budget=1000,
             progress_position=budget_position,
         )
 
-        histories[method_name] = active_evaluation_history
-
-    for method_name, history in histories.items():
+        history_key = (
+            method_name
+            if objective_name == "unweighted_cross_entropy"
+            else f"{method_name} [{objective_name}]"
+        )
+        histories[history_key] = active_evaluation_history
         df = pd.DataFrame(
             [
                 {
                     "n_labels": e.n_labels,
                     "risk": e.risk,
                     "method": method_name,
+                    "risk_objective": objective_name,
                     **{f"risk {g}": r for g, r in e.subgroup_risks.items()},
                     **{f"n_labels_{g}": n for g, n in e.subgroup_n_labels.items()},
                 }
-                for record in history
+                for record in active_evaluation_history
                 for e in [record["estimate"]]
             ]
         )
@@ -304,23 +351,44 @@ def execute_active_evaluation(
     return repition_dfs
 
 
-def run_dev_experiment(repetitions: int = 1, seed: int | None = None):
-    run_experiment(dev_splits="train", eval_splits="val", repetitions=repetitions, seed=seed)
+def run_dev_experiment(
+    repetitions: int = 1,
+    seed: int | None = None,
+    class_balanced_at: bool = True,
+):
+    run_experiment(
+        dev_splits="train",
+        eval_splits="val",
+        repetitions=repetitions,
+        seed=seed,
+        class_balanced_at=class_balanced_at,
+    )
 
 
-def run_final_experiment(repetitions: int = 1):
+def run_final_experiment(repetitions: int = 1, class_balanced_at: bool = True):
     assert False, (
         "This function is not to be run yet. It should only be ran when ready for the final "
         "experiment using the full development dataset and the test dataset."
     )
 
-    return run_experiment(dev_splits=("train", "val"), eval_splits="test", repetitions=repetitions)
+    return run_experiment(
+        dev_splits=("train", "val"),
+        eval_splits="test",
+        repetitions=repetitions,
+        class_balanced_at=class_balanced_at,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--class-balanced-at",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Estimate class-balanced cross-entropy alongside unweighted cross-entropy",
+    )
     args = parser.parse_args()
 
     if args.repetitions < 1:
@@ -328,7 +396,11 @@ def main():
     if args.seed is not None and not 0 <= args.seed < 2**32:
         parser.error("--seed must be between 0 and 4294967295")
 
-    run_dev_experiment(repetitions=args.repetitions, seed=args.seed)
+    run_dev_experiment(
+        repetitions=args.repetitions,
+        seed=args.seed,
+        class_balanced_at=args.class_balanced_at,
+    )
 
 
 if __name__ == "__main__":
