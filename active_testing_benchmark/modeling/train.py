@@ -1,35 +1,92 @@
-"""Train one image classifier and log the run to MLflow."""
+"""Training routines for the image classifier and auxiliary models used for AT."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, field
+from itertools import islice
+import math
 import random
 
-from loguru import logger
 import numpy as np
-from sklearn.metrics import roc_auc_score
 import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm.auto import tqdm
-import typer
 
+from active_testing_benchmark.active_testing.surrogate import RandomForestModule
 from active_testing_benchmark.modeling.data import (
     FairVisionDataset,
     get_class_counts,
     get_dataset_targets,
     inverse_frequency_weights,
 )
+from active_testing_benchmark.modeling.evaluation import evaluate
+from active_testing_benchmark.modeling.models import create_model
+from active_testing_benchmark.modeling.preparation import PreparedData
 
-# from active_testing_benchmark.modeling.provenance import (
-#     FAIRVISION_SOURCE,
-#     build_dataset_provenance,
-#     git_provenance,
-# )
 
-app = typer.Typer(add_completion=False, help=__doc__)
+@dataclass(frozen=True)
+class TrainingConfig:
+    batch_size: int = 32
+    num_workers: int = 0
+    epochs: int = 10
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
+    seed: int = 42
+    image_size: int = 224
+    weighted_sampling: bool = False
+    weighted_loss: bool = True
+    sampling_power: float = 1.0
+    loss_power: float = 1.0
+    selection_objective: str = "class_balanced_cross_entropy"
+    pretrained: bool = True
+
+    def __post_init__(self) -> None:
+        if self.batch_size < 1 or self.num_workers < 0 or self.epochs < 1:
+            raise ValueError(
+                "batch_size and epochs must be positive; num_workers cannot be negative"
+            )
+        if self.learning_rate <= 0 or self.weight_decay < 0:
+            raise ValueError("learning_rate must be positive and weight_decay cannot be negative")
+        if not math.isfinite(self.learning_rate) or not math.isfinite(self.weight_decay):
+            raise ValueError("learning_rate and weight_decay must be finite")
+        if self.image_size < 1:
+            raise ValueError("image_size must be positive")
+        if not math.isfinite(self.sampling_power) or not 0.0 <= self.sampling_power <= 1.0:
+            raise ValueError("sampling_power must be finite and in [0, 1]")
+        if not math.isfinite(self.loss_power) or not 0.0 <= self.loss_power <= 1.0:
+            raise ValueError("loss_power must be finite and in [0, 1]")
+        if self.selection_objective not in {
+            "class_balanced_cross_entropy",
+            "unweighted_cross_entropy",
+        }:
+            raise ValueError(
+                "selection_objective must be class_balanced_cross_entropy or unweighted_cross_entropy"
+            )
+        if not 0 <= self.seed < 2**32:
+            raise ValueError("seed must be between 0 and 4294967295")
+
+
+# Compatibility alias for callers that have not yet adopted the new name.
+TrainConfig = TrainingConfig
+
+
+@dataclass
+class TrainingResult:
+    model: nn.Module
+    class_counts: torch.Tensor
+    risk_weights: torch.Tensor
+    selected_epochs: int
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class AuxiliaryModels:
+    surrogates: tuple[RandomForestModule, RandomForestModule]
+    proxy: RandomForestModule
+    seeds: tuple[int, int, int]
 
 
 def set_seed(seed: int, device: torch.device) -> None:
@@ -62,23 +119,10 @@ def select_device(requested: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
-@dataclass(frozen=True)
-class TrainConfig:
-    batch_size: int = 32
-    num_workers: int = 0
-    epochs: int = 10
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-4
-    seed: int = 42
-    image_size: int = 224
-    weighted_sampling: bool = False
-    weighted_loss: bool = True
-    sampling_power: float = 1.0
-    loss_power: float = 1.0
-
-
 def make_train_loader_and_loss(
-    dataset: FairVisionDataset | Subset, config: TrainConfig, device: torch.device
+    dataset: FairVisionDataset | Subset,
+    config: TrainingConfig,
+    device: torch.device,
 ):
     counts = get_class_counts(dataset)
     sampler = None
@@ -93,7 +137,7 @@ def make_train_loader_and_loss(
             generator=torch.Generator().manual_seed(config.seed),
         )
 
-    train_loader = DataLoader(
+    loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         sampler=sampler,
@@ -102,14 +146,12 @@ def make_train_loader_and_loss(
         pin_memory=device.type == "cuda",
         generator=torch.Generator().manual_seed(config.seed),
     )
-
-    loss_weights = (
+    weights = (
         inverse_frequency_weights(counts, config.loss_power).to(device)
         if config.weighted_loss
         else None
     )
-    train_criterion = nn.CrossEntropyLoss(weight=loss_weights)
-    return train_loader, train_criterion, counts, loss_weights
+    return loader, nn.CrossEntropyLoss(weight=weights), counts, weights
 
 
 def make_class_balanced_weights(class_counts: torch.Tensor) -> torch.Tensor:
@@ -119,30 +161,23 @@ def make_class_balanced_weights(class_counts: torch.Tensor) -> torch.Tensor:
         raise ValueError("Class counts must be a finite one-dimensional tensor for 2+ classes")
     if torch.any(counts <= 0):
         raise ValueError("Every class needs at least one training example")
-
     return inverse_frequency_weights(class_counts, power=1.0, normalization="sample_mean")
 
 
 def train_one_epoch(
     model: nn.Module,
-    loader: DataLoader,
+    loader: Iterable,
     criterion: nn.Module,
     optimizer: AdamW,
     device: torch.device,
     progress_position: int = 0,
-):
+) -> float:
     model.train()
-    logger.info("Model set to train mode")
     running_loss = 0.0
-    loss_denominator_total = 0.0
+    denominator_total = 0.0
     sample_count = 0
-
     for batch in tqdm(
-        loader,
-        desc="Training batches",
-        unit="batch",
-        position=progress_position,
-        leave=False,
+        loader, desc="Training batches", unit="batch", position=progress_position, leave=False
     ):
         images = batch["image"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
@@ -153,146 +188,196 @@ def train_one_epoch(
         optimizer.step()
         batch_size = len(targets)
         sample_count += batch_size
-        loss_denominator = batch_size
-        if isinstance(criterion, nn.CrossEntropyLoss):
-            valid_targets = targets[targets != criterion.ignore_index]
-            if criterion.weight is None:
-                loss_denominator = valid_targets.numel()
-            else:
-                loss_denominator = criterion.weight[valid_targets].sum().item()
-
+        valid_targets = (
+            targets[targets != criterion.ignore_index]
+            if isinstance(criterion, nn.CrossEntropyLoss)
+            else targets
+        )
+        denominator = (
+            valid_targets.numel()
+            if not isinstance(criterion, nn.CrossEntropyLoss) or criterion.weight is None
+            else criterion.weight[valid_targets].sum().item()
+        )
         batch_loss = loss.item()
         if getattr(criterion, "reduction", "mean") != "sum":
-            batch_loss *= loss_denominator
+            batch_loss *= denominator
         running_loss += batch_loss
-        loss_denominator_total += loss_denominator
-
+        denominator_total += denominator
     if sample_count == 0:
         raise ValueError("Cannot train on an empty data loader")
-    if loss_denominator_total == 0:
+    if denominator_total == 0:
         raise ValueError("Cannot aggregate training loss with a zero criterion denominator")
+    return running_loss / denominator_total
 
-    return running_loss / loss_denominator_total
 
-
-@torch.inference_mode()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
+def _train_classifier(
+    data: PreparedData,
+    config: TrainingConfig,
     device: torch.device,
-    protected_column: str | list[str] | None = None,
-    class_weights: torch.Tensor | None = None,
-):
-    model.eval()
-    logger.info("Model set to eval mode")
-    if isinstance(protected_column, str):
-        protected_column = [protected_column]
+    *,
+    fast: bool,
+    model_factory: Callable | None = None,
+) -> TrainingResult:
+    model_factory = model_factory or create_model
+    if len(data.pilot_fit) == 0 or len(data.pilot_validation) == 0 or len(data.development) == 0:
+        raise ValueError("Pilot fit, pilot validation, and development datasets must be non-empty")
+    if len(data.classes) < 2:
+        raise ValueError("Training requires at least two classes")
 
-    criterion = nn.CrossEntropyLoss(reduction="none")
-    weighted_criterion = (
-        nn.CrossEntropyLoss(weight=class_weights.to(device), reduction="none")
-        if class_weights is not None
-        else None
+    set_seed(config.seed, device)
+    pilot_model = model_factory(
+        num_classes=len(data.classes), pretrained=config.pretrained, device=device
     )
-
-    predictions = []
-    subgroups = defaultdict(lambda: defaultdict(list))
-
-    for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        targets = batch["target"].to(device, non_blocking=True).long()
-
-        logits = model(images)
-        probabilities = logits.softmax(dim=1)
-        predicted = logits.argmax(dim=1)
-        losses = criterion(logits, targets)
-        weighted_losses = (
-            weighted_criterion(logits, targets) if weighted_criterion is not None else None
+    pilot_loader, pilot_criterion, pilot_counts, _ = make_train_loader_and_loss(
+        data.pilot_fit, config, device
+    )
+    pilot_weights = make_class_balanced_weights(pilot_counts).to(device)
+    validation_loader = DataLoader(
+        data.pilot_validation,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+    pilot_epochs = 1 if fast else config.epochs
+    best_score = float("inf")
+    best_epoch = 1
+    history = []
+    pilot_batches = []
+    optimizer = AdamW(
+        pilot_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=pilot_epochs, eta_min=1e-6
+    )
+    for epoch in range(pilot_epochs):
+        epoch_loader = islice(pilot_loader, 10) if fast else pilot_loader
+        training_loss = train_one_epoch(
+            pilot_model, epoch_loader, pilot_criterion, optimizer, device, progress_position=1
         )
-
-        # Move batch outputs to CPU once
-        targets = targets.cpu().tolist()
-        predicted = predicted.cpu().tolist()
-        probabilities = probabilities.cpu().tolist()
-        losses = losses.cpu().tolist()
-        if weighted_losses is not None:
-            weighted_losses = weighted_losses.cpu().tolist()
-
-        for i, image_id in enumerate(batch["id"]):
-            protected = {
-                name: (values[i].item() if isinstance(values[i], torch.Tensor) else values[i])
-                for name, values in batch["protected"].items()
-                if protected_column is None or name in protected_column
-            }
-
-            record = {
-                "id": image_id,
-                "target": targets[i],
-                "prediction": predicted[i],
-                "probabilities": probabilities[i],
-                "loss": losses[i],
-                "protected": protected,
-            }
-            if weighted_losses is not None:
-                record["weighted_loss"] = weighted_losses[i]
-            predictions.append(record)
-
-            # Group each image by every protected attribute
-            for attribute, value in protected.items():
-                subgroups[attribute][str(value)].append(record)
-
-    def compute_metrics(records) -> dict:
-        y_true = np.asarray([r["target"] for r in records])
-        probabilities = np.asarray([r["probabilities"] for r in records])
-        n_classes = probabilities.shape[1]
-        observed_classes = np.unique(y_true)
-
-        if n_classes == 2 and len(observed_classes) == 2:
-            auc = float(roc_auc_score(y_true, probabilities[:, 1]))
-        elif np.array_equal(observed_classes, np.arange(n_classes)):
-            auc = float(roc_auc_score(y_true, probabilities, multi_class="ovr", average="macro"))
-        else:
-            auc = None
-
-        metrics = {
-            "n": len(records),
-            "loss": sum(r["loss"] for r in records) / len(records),
-            "accuracy": sum(r["target"] == r["prediction"] for r in records) / len(records),
-            "roc_auc": auc,
+        # The limit is known without consuming the loader a second time.
+        pilot_batches.append(min(len(pilot_loader), 10) if fast else len(pilot_loader))
+        metrics = evaluate(
+            pilot_model,
+            validation_loader,
+            device,
+            protected_column="gender",
+            class_weights=pilot_weights,
+        )
+        row = {
+            "epoch": epoch + 1,
+            "training_loss": float(training_loss),
+            "unweighted_cross_entropy": float(metrics["loss"]),
+            "class_balanced_cross_entropy": float(metrics["weighted_loss"]),
         }
-        metrics["weighted_loss"] = (
-            sum(r["weighted_loss"] for r in records) / len(records)
-            if weighted_criterion is not None
-            else None
+        history.append(row)
+        score = row[config.selection_objective]
+        if not math.isfinite(score):
+            raise ValueError(
+                f"Pilot selection objective {config.selection_objective!r} was non-finite "
+                f"at epoch {epoch + 1}: {score}"
+            )
+        if score < best_score:
+            best_score = score
+            best_epoch = epoch + 1
+        scheduler.step()
+
+    # Release the pilot and its optimizer state before allocating the refit model.
+    del pilot_model, optimizer, scheduler
+    # Use a distinct random stream so the refit starts from fresh parameters.
+    refit_seed = (config.seed + 1) % 2**32
+    set_seed(refit_seed, device)
+    model = model_factory(
+        num_classes=len(data.classes), pretrained=config.pretrained, device=device
+    )
+    loader, criterion, counts, _ = make_train_loader_and_loss(data.development, config, device)
+    risk_weights = make_class_balanced_weights(counts)
+    optimizer = AdamW(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=1 if fast else best_epoch, eta_min=1e-6
+    )
+    refit_epochs = 1 if fast else best_epoch
+    refit_batches = []
+    refit_history = []
+    for _epoch in range(refit_epochs):
+        epoch_loader = islice(loader, 10) if fast else loader
+        training_loss = train_one_epoch(
+            model, epoch_loader, criterion, optimizer, device, progress_position=1
         )
-        return metrics
+        refit_history.append(float(training_loss))
+        refit_batches.append(min(len(loader), 10) if fast else len(loader))
+        scheduler.step()
 
-    # Overall metrics
-    overall = compute_metrics(predictions)
+    metadata = {
+        "mode": "fast" if fast else "full",
+        "config": asdict(config),
+        "pilot": {
+            "fit_size": len(data.pilot_fit),
+            "validation_size": len(data.pilot_validation),
+            "epochs": pilot_epochs,
+            "batches_per_epoch": pilot_batches,
+            "history": history,
+            "selected_epoch": best_epoch,
+            "selection_objective": config.selection_objective,
+            "selection_score": float(best_score),
+            "class_counts": pilot_counts.tolist(),
+            "risk_weights": pilot_weights.cpu().tolist(),
+        },
+        "refit": {
+            "size": len(data.development),
+            "epochs": refit_epochs,
+            "batches_per_epoch": refit_batches,
+            "training_loss": refit_history,
+            "class_counts": counts.tolist(),
+            "risk_weights": risk_weights.tolist(),
+            "seed": refit_seed,
+        },
+    }
+    return TrainingResult(model, counts, risk_weights, best_epoch, metadata)
 
-    # Metrics for each protected attribute and subgroup
-    subgroup_metrics = {
-        attribute: {group: compute_metrics(records) for group, records in groups.items()}
-        for attribute, groups in subgroups.items()
-    }
 
-    # Ground-truth risks for comparison with active testing
-    subgroup_risks = {
-        attribute: {group: metrics["loss"] for group, metrics in groups.items()}
-        for attribute, groups in subgroup_metrics.items()
-    }
-    subgroup_weighted_risks = {
-        attribute: {group: metrics["weighted_loss"] for group, metrics in groups.items()}
-        for attribute, groups in subgroup_metrics.items()
-    }
+def train_classifier(
+    data: PreparedData,
+    config: TrainingConfig,
+    device: torch.device,
+    *,
+    model_factory: Callable | None = None,
+) -> TrainingResult:
+    """Select a duration on the pilot partition, then refit on all development data."""
+    return _train_classifier(data, config, device, fast=False, model_factory=model_factory)
 
-    return {
-        "loss": overall["loss"],
-        "weighted_loss": overall["weighted_loss"],
-        "accuracy": overall["accuracy"],
-        "roc_auc": overall["roc_auc"],
-        "subgroup_risks": subgroup_risks,
-        "subgroup_weighted_risks": subgroup_weighted_risks,
-        "subgroup_metrics": subgroup_metrics,
-        "predictions": predictions,
-    }
+
+def train_classifier_fast(
+    data: PreparedData,
+    config: TrainingConfig,
+    device: torch.device,
+    *,
+    model_factory: Callable | None = None,
+) -> TrainingResult:
+    """Run a one-epoch pilot/refit loop capped at ten batches per training phase."""
+    return _train_classifier(data, config, device, fast=True, model_factory=model_factory)
+
+
+def fit_auxiliary_models(
+    data: PreparedData,
+    config: TrainingConfig,
+    device: torch.device,
+) -> AuxiliaryModels:
+    """Fit the two active-testing surrogates and proxy on all development images."""
+    children = np.random.SeedSequence(config.seed).spawn(3)
+    seeds = tuple(int(child.generate_state(1)[0]) for child in children)
+    loader = DataLoader(
+        data.development_deterministic,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    forests = tuple(
+        RandomForestModule(num_classes=len(data.classes), random_state=seed).fit(
+            loader, device=device
+        )
+        for seed in seeds
+    )
+    return AuxiliaryModels((forests[0], forests[1]), forests[2], seeds)

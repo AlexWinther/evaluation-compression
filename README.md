@@ -6,6 +6,19 @@
 
 Benchmarking of active-testing approaches on medical imaging
 
+## Project commands
+
+Install [uv](https://docs.astral.sh/uv/) and [just](https://just.systems/), then use
+`just` to list the available commands. Commands run Python tools through uv.
+
+```bash
+just requirements              # Sync dependencies from uv.lock
+just test                      # Run the test suite
+just test tests/test_experiment.py -q
+just lint                      # Check formatting and lint rules
+just format                    # Apply formatting and lint fixes
+```
+
 ## FairVision raw data
 
 The FairVision downloader retains the standalone, original-resolution SLO fundus
@@ -13,14 +26,13 @@ JPEGs and the disease metadata CSVs only; it does not download or retain the 3D
 OCT-containing NPZ files. For example:
 
 ```bash
-uv run active_testing_benchmark/dataset.py --disease glaucoma --metadata-only
-uv run active_testing_benchmark/dataset.py --disease glaucoma
+just fairvision-metadata glaucoma
+just data glaucoma
 ```
-or 
-```bash
-make fairvision-metadata DISEASE=glaucoma
-make data DISEASE=glaucoma
-```
+
+The disease defaults to `dr`; pass `amd`, `glaucoma`, or `all` as the first
+argument. Additional downloader flags follow it, for example
+`just data glaucoma --output-dir /path/to/fairvision`.
 
 Files are written below `data/raw/fairvision/` by default. The image command uses
 HTTP byte ranges to retrieve selected JPEG members from the upstream ZIP rather
@@ -37,156 +49,68 @@ and `test` splits. The default command reads
 `data_09382.npz` to `test/slo_fundus_09382.jpg`, and uses `dr` as the binary
 target. Raw images are never copied or changed.
 
-Install dependencies once with `make requirements`, then train ResNet-18 (the
-first pretrained run downloads published weights):
+Run the development benchmark (the recipe first syncs dependencies):
 
 ```bash
-uv run python -m active_testing_benchmark.modeling.train --model resnet18 --epochs 30 --patience 5 --batch-size 32 --learning-rate 1e-4
+just experiment --seed 42
 ```
 
-The default imbalance strategy is `--imbalance-strategy class-weighted-loss`,
-which weights cross-entropy inversely to each class's frequency in the training
-split. This keeps each training image in the epoch while giving the minority
-class more influence. `--imbalance-strategy weighted-sampling` instead draws a
-balanced epoch with replacement, which can repeat minority images and omit some
-majority images; `none` keeps ordinary shuffled training. Weighted loss is also
-used for validation checkpoint selection, while test loss remains unweighted.
-Each epoch reports macro-F1 and, for binary splits containing both classes,
-ROC-AUC.
+The experiment uses `train` for development and `val` for active evaluation.
+A seeded, stratified 20% of development data selects the pilot duration; a fresh
+ResNet-18 is then refitted on all development data. Training defaults to ten pilot
+epochs, inverse-frequency weighted loss, and earliest-minimum class-balanced
+validation cross-entropy. The evaluation pool never determines model selection.
+Final experiments involving the test split remain blocked.
 
-ResNet-18 uses ImageNet weights by default. Pass `--no-pretrained` to avoid
-weight downloads. Each run records metrics,
-configuration, classes, test confusion matrix, and the best-validation model in
-the remote MLflow server. Training does not persist a local checkpoint.
-
-Training stops early after 5 consecutive epochs without lower validation loss
-by default. Set `--patience` to change that threshold and `--epochs` to set the
-maximum number of epochs (30 by default). The checkpoint with the lowest
-validation loss is restored before evaluating the test split.
-
-For normal laptop development, copy `.env.example` to the ignored `.env`, replace
-the credential placeholders, and restrict its permissions:
+For pipeline development, replace classifier training with a bounded real loop:
 
 ```bash
-cp .env.example .env
-chmod 600 .env
+just experiment-fast --seed 42
 ```
 
-The standard tracking server is `https://mlflow.alwn.dev`. The required client
-variables are `MLFLOW_TRACKING_URI`, `MLFLOW_TRACKING_USERNAME`, and
-`MLFLOW_TRACKING_PASSWORD`. `MLFLOW_REGISTRY_URI` is optional; when omitted, the
-registry uses the tracking URI.
+Fast mode runs one pilot epoch and one fresh refit epoch, each capped at ten
+batches. Counts and weights still use the complete relevant training partition.
+Ten batches do not guarantee observing every class. Validation, surrogate/proxy
+forest fitting, reference inference, and active testing still run in full.
+This mode checks the pipeline; its results should not be used as trained-model
+benchmark evidence.
 
-On HPC jobs, inject the same variables through the scheduler's protected
-secret/environment mechanism. Do not put credentials in committed job scripts or
-scheduler command history. Confirm compute nodes can resolve the MLflow hostname
-and make outbound HTTPS connections before starting long jobs.
+Use `--epochs`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--image-size`,
+and `--num-workers` to configure training. `--no-weighted-loss` and
+`--selection-objective unweighted_cross_entropy` independently control fitting
+and epoch selection. `--weighted-sampling` enables inverse-frequency sampling.
+ResNet-18 uses pretrained ImageNet weights by default; `--no-pretrained` avoids
+the weight download. `--device cpu` bypasses accelerator selection.
 
-The remote UI is available at `https://mlflow.alwn.dev` using the same Basic Auth
-credentials.
+The benchmark retains uniform, balanced/proportional stratified, Kossen,
+active-surrogate, and prediction-powered methods. Each runs for `--repetitions`
+(default 1) with `--budget` labels (default 1000, no greater than the evaluation
+pool size). `--no-class-balanced-at` disables the additional balanced-risk
+objective without changing training or selection.
 
-Each run records sanitized dataset lineage for the training, validation, and test
-splits: FairVision source, metadata checksum, selected-record manifest checksum,
-schema, and aggregate split counts. It never uploads raw images or metadata rows.
-The native MLflow model artifact includes a tensor signature, representative input,
-configuration, and class mapping. A completed training run is automatically
-registered as `fairvision-{disease-type}-resnet18`. MLflow reserves the alias
-name `latest`, so its native latest-version selector is used. For example, the
-default DR ResNet-18 is available at `models:/fairvision-dr-resnet18/latest`. Pass
-`--disease-type` when the target column is not the desired disease identifier.
-Project commands also accept `fairvision-dr-resnet18@latest` as shorthand and convert
-it to MLflow's native selector.
-
-After reviewing a run, promote its latest version to the curated
-`baseline` alias with:
+Both experiment recipes forward CLI flags, for example:
 
 ```bash
-uv run python -m active_testing_benchmark.modeling.registry \
-  --registry-name fairvision-dr-resnet18
+just experiment --repetitions 5 --seed 42 --epochs 20
+just experiment-fast --seed 42 --device cpu --budget 100 --no-pretrained
+just experiment --help
 ```
 
-This moves `@baseline` to the latest registered version without creating a
-duplicate. To promote an older training run instead, add `--run-id <run-id>` (or
-`RUN_ID=<run-id>` when using `make mlflow-model-promote`). Load the curated model
-through `models:/fairvision-dr-resnet18@baseline`.
+Each run writes a uniquely named CSV and JSON sidecar beneath
+`results/active-testing/`, configurable with `--output-dir`. CSV rows contain
+method, objective, repetition, seed, label counts, and risk estimates. JSON stores
+resolved configuration and seeds, training history and mode, class counts and
+weights, and full-pool reference metrics. No MLflow credentials are required.
+`--data-root` selects an alternative FairVision root and `--disease` selects
+`dr`, `glaucoma`, or `amd`.
 
-Training resolves FairVision metadata paths without eagerly probing every image,
-avoiding thousands of metadata operations on HPC shared filesystems. Add
-`--validate-images` when a complete preflight check is worth that startup cost.
-Startup messages identify device initialization, dataset indexing, and the first
-MLflow server connection separately. Use `--device cpu` to bypass CUDA discovery
-or `--device cuda` to require a working CUDA allocation instead of auto-detection.
-
-For another layout, pass `--metadata-path`, `--image-root`, `--image-column`,
-`--target-column`, and `--split-column`. Split values must be `training`,
-`validation`, and `test` (case-insensitive).
-
-radT is intentionally not installed or enabled yet. Its current published
-materials describe an MLflow extension but do not document a stable minimal
-in-process API for this loop. It can later be evaluated separately (`uv add
-radt`) without affecting normal MLflow training.
-
-## Active finite-pool risk estimation
-
-The active-testing interface separates acquisition, observation, and estimation.
-Methods receive the pool size, unlabeled pool, model, and loss function at
-initialization. The benchmark reveals labels and losses only for acquired rows.
-`UniformSampleMean` samples without replacement and estimates finite-pool
-classification error with the observed mean loss. Its `SelectionPlan` records
-conditional selection probabilities and item inclusion probabilities.
-
-The MLflow command currently runs this method against saved classifiers. Bare
-registry names default to MLflow's `/latest` selector; use `name@alias` or
-`run:<run-id>` / `runs:/<run-id>/model` for a training run:
-
-```bash
-uv run python -m active_testing_benchmark.active_testing \
-  --model fairvision-dr-resnet18@baseline \
-  --model run:<run-id> \
-  --test-size 25 --test-size 0.1 --test-size 1.0 \
-  --runs 5 --seed 42
-
-make active-testing ACTIVE_TESTING_FLAGS="--model fairvision-dr-resnet18 --test-size 0.1"
-```
-
-Integer sizes are counts (`1` means one row); decimal or exponent sizes are
-fractions in `(0, 1]`, rounded up (`1.0` means the whole test split). Oversized or
-empty budgets are rejected. Each size/repetition gets an independent seeded
-sample without replacement. By default, uniform acquisition selects the whole
-budget in one batch. Set `--acquisition-batch-size` to divide acquisition into
-smaller batches.
-
-The command loads the project's native MLflow PyTorch classifiers with their
-saved configuration and class mapping. It performs one full-test inference pass
-per model on CPU and retains row IDs, labels, predictions, and probabilities in
-memory for the offline label-oracle simulation. The method only sees acquired
-labels and losses. Registry aliases are resolved to recorded version IDs.
-Preprocessing and image size follow each saved model, with an optional
-`--image-size` override.
-The dataset options are `--metadata-path`, `--image-root`, `--image-column`,
-`--target-column`, `--split-column`, and `--dataset-source`; batching uses `--batch-size` and
-`--num-workers`.
-
-Each invocation writes `reports/active-testing/<mlflow-run-id>/` (or beneath
-`--output-dir`) containing `config.json`, `results.csv`, and
-`selection_manifest.csv`. Results compare the sample-mean classification error
-with the full finite-pool classification error and include signed and absolute
-error. Manifests contain source CSV row IDs, budget, repetition, seed, selection
-round and order, both probability fields, and label-reveal state. The metadata
-CSV checksum is recorded; raw images are not copied. Configuration, results,
-and manifests are logged as artifacts in one MLflow run.
-
-Visualize the estimates and their absolute error across subset sizes with:
-
-```bash
-uv run python -m active_testing_benchmark.plots reports/active-testing/<mlflow-run-id>
-
-make active-testing-plot EXPERIMENT_DIR=reports/active-testing/<mlflow-run-id>
-```
-
-The figure is written to `active-testing-results.png` inside the experiment
-directory. It shows the classification-error estimate and absolute error across
-budgets, with the full-pool value marked for reference.
+Python callers use `run_experiment(ExperimentConfig(...))`, which returns an
+`ExperimentResult` with curves, reference metrics, training metadata, resolved
+configuration, and artifact paths. `modeling.preparation` prepares partitions;
+`modeling.train` owns classifier and auxiliary fitting; `modeling.evaluation`
+computes reference metrics; `benchmark` constructs methods and runs repetitions.
+The full and fast classifier trainers accept the same prepared data,
+`TrainingConfig`, and device and return the same `TrainingResult` type.
 
 ## Acknowledgment
 
@@ -198,7 +122,7 @@ repository. We thank its makers for sharing their approach.
 
 ```
 ├── LICENSE            <- Open-source license if one is chosen
-├── Makefile           <- Makefile with convenience commands like `make data` or `make train`
+├── justfile           <- Recipes for data, experiments, tests, linting, and formatting
 ├── README.md          <- The top-level README for developers using this project.
 ├── data
 │   ├── external       <- Data from third party sources.
@@ -222,8 +146,7 @@ repository. We thank its makers for sharing their approach.
 ├── reports            <- Generated analysis as HTML, PDF, LaTeX, etc.
 │   └── figures        <- Generated graphics and figures to be used in reporting
 │
-├── requirements.txt   <- The requirements file for reproducing the analysis environment, e.g.
-│                         generated with `pip freeze > requirements.txt`
+├── uv.lock            <- Locked dependencies, installed with `just requirements`
 │
 └── active_testing_benchmark   <- Source code for use in this project.
     │

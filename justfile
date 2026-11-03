@@ -1,3 +1,6 @@
+# Forward recipe arguments to commands without shell interpolation.
+set positional-arguments
+
 _list:
     just --list
 
@@ -12,22 +15,30 @@ clean:
 
 # Ruff linting checks
 lint:
-    ruff format --check
-    ruff check
+    uv run ruff format --check
+    uv run ruff check
 
 # Ruff linting and formatting
 format:
-    ruff check --fix
-    ruff format
+    uv run ruff check --fix
+    uv run ruff format
 
 # Run all tests
-test:
-    uv run pytest tests
+test *args:
+    uv run pytest "$@"
 
-# Run experiment (currently only dev)
-[arg("repititions", long="repititions")]
-[arg("seed", long="seed")]
-experiment repititions="1" seed="": requirements
-    uv run active_testing_benchmark/experiment.py \
-        --repetitions {{repititions}} \
-        {{ if seed != "" { "--seed " + seed } else { "" } }}
+# Download FairVision SLO images and metadata for one disease (default: dr)
+data disease="dr" *args: requirements
+    dataset_disease="$1"; shift; uv run python -m active_testing_benchmark.dataset --disease "$dataset_disease" "$@"
+
+# Download FairVision metadata without images (default: dr)
+fairvision-metadata disease="dr" *args: requirements
+    dataset_disease="$1"; shift; uv run python -m active_testing_benchmark.dataset --disease "$dataset_disease" --metadata-only "$@"
+
+# Run the development experiment with full classifier training; accepts experiment CLI flags
+experiment *args: requirements
+    uv run python -m active_testing_benchmark.experiment "$@"
+
+# Run the development experiment with classifier training capped at ten batches per phase
+experiment-fast *args: requirements
+    uv run python -m active_testing_benchmark.experiment --training-mode fast "$@"

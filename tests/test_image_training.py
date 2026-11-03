@@ -14,10 +14,10 @@ from active_testing_benchmark.modeling.data import (
     get_class_counts,
     inverse_frequency_weights,
 )
+from active_testing_benchmark.modeling.evaluation import evaluate
 from active_testing_benchmark.modeling.models import create_image_transform, create_model
 from active_testing_benchmark.modeling.train import (
     TrainConfig,
-    evaluate,
     make_train_loader_and_loss,
     train_one_epoch,
 )

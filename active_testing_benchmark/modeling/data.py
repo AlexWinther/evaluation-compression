@@ -140,19 +140,24 @@ class FairVisionDataset(Dataset):
         }
 
 
-def get_dataset_targets(dataset: FairVisionDataset | Subset) -> list[int]:
-    """Return labels in dataset order, including for a PyTorch ``Subset``."""
+def get_dataset_targets(dataset: Dataset) -> list[int]:
+    """Return labels in dataset order, including for nested PyTorch ``Subset`` objects."""
     if isinstance(dataset, Subset):
-        source = dataset.dataset
-        if not isinstance(source, FairVisionDataset):
-            raise TypeError("FairVision subsets must wrap a FairVisionDataset")
-        return [source.targets[index] for index in dataset.indices]
-    return dataset.targets
+        source_targets = get_dataset_targets(dataset.dataset)
+        return [source_targets[index] for index in dataset.indices]
+    if not hasattr(dataset, "targets"):
+        raise TypeError("Dataset must expose targets in dataset order")
+    return list(dataset.targets)
 
 
-def get_class_counts(dataset: FairVisionDataset | Subset) -> torch.Tensor:
+def get_class_counts(dataset: Dataset) -> torch.Tensor:
     targets = torch.as_tensor(get_dataset_targets(dataset), dtype=torch.long)
-    classes = dataset.dataset.classes if isinstance(dataset, Subset) else dataset.classes
+    source = dataset
+    while isinstance(source, Subset):
+        source = source.dataset
+    if not hasattr(source, "classes"):
+        raise TypeError("Dataset must expose its ordered classes")
+    classes = source.classes
     counts = torch.bincount(targets, minlength=len(classes))
     missing = torch.where(counts == 0)[0].tolist()
     if missing:

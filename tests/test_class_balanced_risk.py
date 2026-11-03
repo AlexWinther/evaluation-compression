@@ -1,5 +1,4 @@
 import sys
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,7 +6,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-from active_testing_benchmark import experiment
+from active_testing_benchmark import benchmark, experiment
 from active_testing_benchmark.active_testing import (
     KossenActiveTesting,
     UniformSampleMean,
@@ -64,22 +63,20 @@ def test_execute_active_evaluation_adds_class_balanced_objective(monkeypatch) ->
         calls.append(kwargs)
         return [{"estimate": Estimate(risk=0.5, n_labels=1)}]
 
-    monkeypatch.setattr(experiment, "run_active_evaluation", run_active)
-    histories = {}
+    monkeypatch.setattr(benchmark, "run_active_evaluation", run_active)
     balanced_loss = nn.CrossEntropyLoss(
         weight=torch.tensor([5 / 9, 5.0]),
         reduction="sum",
     )
 
-    results = experiment.execute_active_evaluation(
-        config=SimpleNamespace(seed=17),
+    results = benchmark.run_repetition(
+        seed=17,
         device=torch.device("cpu"),
-        test_dataset=SimpleNamespace(),
+        dataset=[],
         model=nn.Identity(),
         method_configs=[(UniformSampleMean, {"batch_size": 1})],
-        histories=histories,
-        repitition=0,
-        weighted_loss_fn=balanced_loss,
+        repetition=0,
+        class_weights=balanced_loss.weight,
     )
 
     assert [call["loss_fn"].reduction for call in calls] == ["sum", "sum"]
@@ -89,7 +86,6 @@ def test_execute_active_evaluation_adds_class_balanced_objective(monkeypatch) ->
         "unweighted_cross_entropy",
         "class_balanced_cross_entropy",
     ]
-    assert "UniformSampleMean [class_balanced_cross_entropy]" in histories
 
 
 @pytest.mark.parametrize(
@@ -101,8 +97,8 @@ def test_cli_controls_class_balanced_at(monkeypatch, arguments, enabled: bool) -
     monkeypatch.setattr(sys, "argv", ["experiment.py", *arguments])
     monkeypatch.setattr(
         experiment,
-        "run_dev_experiment",
-        lambda **kwargs: received.update(kwargs),
+        "run_experiment",
+        lambda config: received.update(class_balanced_at=config.class_balanced_at),
     )
 
     experiment.main()
