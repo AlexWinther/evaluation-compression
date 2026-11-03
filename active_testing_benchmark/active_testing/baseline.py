@@ -69,7 +69,7 @@ class StratifiedSampleMean(ActiveEvaluationMethod):
         offset = int(self.rng.integers(len(slots)))
         final_slots = slots[offset:] + slots[:offset]
 
-        logger.debug(f"Proportional slots: {final_slots}, offset: {offset}")
+        logger.trace(f"Proportional slots: {final_slots}, offset: {offset}")
 
         return final_slots
 
@@ -95,7 +95,7 @@ class StratifiedSampleMean(ActiveEvaluationMethod):
             # Update still active groups
             active = [g for g in active if sizes[g] > cycle_number]
 
-        logger.debug(f"Balanced slots: {slots}")
+        logger.trace(f"Balanced slots: {slots}")
 
         return slots
 

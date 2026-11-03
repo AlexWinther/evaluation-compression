@@ -159,9 +159,7 @@ class KossenActiveTesting(ActiveEvaluationMethod):
             label_smoothing = float(problem.loss_fn.label_smoothing)
             if problem.loss_fn.reduction == "mean" and problem.loss_fn.weight is not None:
                 if np.any(class_weights <= 0):
-                    raise ValueError(
-                        "Weighted mean cross entropy needs positive class weights"
-                    )
+                    raise ValueError("Weighted mean cross entropy needs positive class weights")
                 loss_denominators = class_weights
             else:
                 loss_denominators = np.ones(self.num_classes, dtype=np.float64)

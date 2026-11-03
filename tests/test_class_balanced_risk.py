@@ -72,7 +72,7 @@ def test_execute_active_evaluation_adds_class_balanced_objective(monkeypatch) ->
     results = benchmark.run_repetition(
         seed=17,
         device=torch.device("cpu"),
-        dataset=[],
+        dataset=TinyPool(),
         model=nn.Identity(),
         method_configs=[(UniformSampleMean, {"batch_size": 1})],
         repetition=0,

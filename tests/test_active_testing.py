@@ -180,3 +180,77 @@ def test_surrogate_draws_are_normalized_over_classes() -> None:
 
     assert members.shape == (2, len(dataset), 2)
     np.testing.assert_allclose(members.sum(axis=2), 1.0)
+
+
+@pytest.mark.parametrize("entry_point", ["run_benchmark", "run_repetition"])
+def test_benchmark_loads_pool_once_and_keeps_runs_independent(monkeypatch, entry_point):
+    from active_testing_benchmark import benchmark
+
+    class CountingPool(TinyEvaluationDataset):
+        reads = 0
+
+        def __getitem__(self, index):
+            self.reads += 1
+            return super().__getitem__(index)
+
+    problems = []
+    states = []
+
+    class TrackingMethod(UniformSampleMean):
+        def initialize(self, problem):
+            problems.append(problem)
+            state = super().initialize(problem)
+            assert not state["selections"]
+            assert not hasattr(problem, "y_pool")
+            states.append(state)
+            return state
+
+    configs = [(TrackingMethod, {"batch_size": 2})] * 2
+    dataset = CountingPool()
+    kwargs = dict(
+        seed=7,
+        device=torch.device("cpu"),
+        dataset=dataset,
+        model=nn.Identity(),
+        budget=4,
+        class_weights=torch.tensor([0.5, 2.0]),
+        include_accuracy=True,
+    )
+    if entry_point == "run_benchmark":
+        monkeypatch.setattr(benchmark, "build_method_configs", lambda *_: configs)
+        result = benchmark.run_benchmark(**kwargs, auxiliary=None, num_classes=2, repetitions=2)
+        assert set(result.repetition) == {1, 2}
+        expected_runs = 12
+    else:
+        frames = benchmark.run_repetition(**kwargs, method_configs=configs)
+        assert len(frames) == 6
+        expected_runs = 6
+
+    assert dataset.reads == len(dataset)
+    assert len(problems) == expected_runs
+    assert all(problem.X_pool is problems[0].X_pool for problem in problems)
+    assert len({id(state) for state in states}) == expected_runs
+    assert all(len(state["selections"]) == 4 for state in states)
+
+
+@pytest.mark.parametrize("method_index", range(6))
+def test_prepared_pool_preserves_histories(method_index):
+    from active_testing_benchmark.active_testing.runner import prepare_evaluation_pool
+
+    dataset = TinyEvaluationDataset()
+    device = torch.device("cpu")
+    pool = prepare_evaluation_pool(dataset, device, "gender")
+    histories = []
+    for source in (dataset, pool):
+        histories.append(
+            run_active_evaluation(
+                method=_methods()[method_index],
+                dataset=source,
+                model=nn.Identity(),
+                device=device,
+                loss_fn=nn.CrossEntropyLoss(reduction="sum"),
+                protected_column="gender",
+                budget=4,
+            )
+        )
+    assert histories[0] == histories[1]

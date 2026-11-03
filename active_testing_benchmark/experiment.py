@@ -39,6 +39,7 @@ class ExperimentConfig:
     repetitions: int = 1
     budget: int = 1000
     class_balanced_at: bool = True
+    include_accuracy: bool = False
     device: str = "auto"
     data_root: Path = RAW_DATA_DIR / "fairvision"
     output_dir: Path = RESULTS_DIR / "active-testing"
@@ -133,6 +134,7 @@ def run_experiment(
         repetitions=config.repetitions,
         budget=config.budget,
         class_weights=trained.risk_weights if config.class_balanced_at else None,
+        include_accuracy=config.include_accuracy,
     )
 
     metadata = {
@@ -183,6 +185,7 @@ def main(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--class-balanced-at", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-accuracy", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--data-root", type=Path, default=RAW_DATA_DIR / "fairvision")
     parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR / "active-testing")
     args = parser.parse_args(argv)
@@ -216,6 +219,7 @@ def main(argv=None):
                     "seed",
                     "device",
                     "class_balanced_at",
+                    "include_accuracy",
                     "data_root",
                     "output_dir",
                 )

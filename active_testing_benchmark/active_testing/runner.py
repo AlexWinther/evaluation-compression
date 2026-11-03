@@ -1,31 +1,49 @@
+from dataclasses import dataclass
+
 from loguru import logger
 import torch
 from torch import nn
+from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
 from active_testing_benchmark.active_testing.interface import (
     ActiveEvaluationMethod,
     Problem,
 )
-from active_testing_benchmark.modeling.data import FairVisionDataset
 
 
-def run_active_evaluation(
-    method: ActiveEvaluationMethod,
-    dataset: FairVisionDataset,
-    model: nn.Module,
+@dataclass(frozen=True)
+class EvaluationPool:
+    """Materialized inputs and runner-only labels shared across evaluation runs.
+
+    Methods must treat the shared input tensors as read-only. Labels are never
+    included in the Problem passed to methods.
+    """
+
+    X_pool: torch.Tensor
+    y_pool: torch.Tensor
+    protected_attributes: list[str]
+    protected_columns: tuple[str, ...]
+
+    def __len__(self) -> int:
+        return len(self.X_pool)
+
+
+def prepare_evaluation_pool(
+    dataset: Dataset | EvaluationPool,
     device: torch.device,
-    loss_fn: nn.Module,
     protected_column: list[str] | str,
-    budget: int | None = None,
-    progress_position: int = 0,
-) -> list[dict]:
-    """Run finite-pool active evaluation, returning risk estimates after each batch."""
-    if loss_fn is None:
-        loss_fn = nn.CrossEntropyLoss(reduction="sum")
-
-    model.eval()
-    logger.info("Model set to eval mode for active evaluation")
+) -> EvaluationPool:
+    """Load and transfer a fixed evaluation pool once, or reuse a prepared pool."""
+    protected_column = (
+        [protected_column] if isinstance(protected_column, str) else list(protected_column)
+    )
+    if isinstance(dataset, EvaluationPool):
+        if tuple(protected_column) != dataset.protected_columns:
+            raise ValueError("Prepared pool uses different protected columns")
+        return dataset
+    if len(dataset) == 0:
+        raise ValueError("Evaluation pool must be nonempty")
 
     logger.debug(f"Loading {len(dataset):,} samples from the dataset for active evaluation")
 
@@ -34,9 +52,6 @@ def run_active_evaluation(
     protected_attributes = []
 
     logger.debug(f"Using protected column(s): {protected_column}")
-
-    if isinstance(protected_column, str):
-        protected_column = [protected_column]
 
     for index in range(len(dataset)):
         sample = dataset[index]
@@ -64,6 +79,32 @@ def run_active_evaluation(
     logger.debug(
         f"Loaded {len(X_pool):,} samples for active evaluation with {len(y_pool.unique()):,} unique classes"
     )
+
+    return EvaluationPool(X_pool, y_pool, protected_attributes, tuple(protected_column))
+
+
+def run_active_evaluation(
+    method: ActiveEvaluationMethod,
+    dataset: Dataset | EvaluationPool,
+    model: nn.Module,
+    device: torch.device,
+    loss_fn: nn.Module,
+    protected_column: list[str] | str,
+    budget: int | None = None,
+    progress_position: int = 0,
+) -> list[dict]:
+    """Run finite-pool active evaluation, returning risk estimates after each batch."""
+    if loss_fn is None:
+        loss_fn = nn.CrossEntropyLoss(reduction="sum")
+
+    model.eval()
+    logger.info("Model set to eval mode for active evaluation")
+
+    pool = prepare_evaluation_pool(dataset, device, protected_column)
+    X_pool = pool.X_pool
+    y_pool = pool.y_pool
+    # Each run gets its own group list; image tensors are shared read-only.
+    protected_attributes = list(pool.protected_attributes)
 
     label_budget = len(X_pool) if budget is None else int(budget)
     if not 0 <= label_budget <= len(X_pool):
