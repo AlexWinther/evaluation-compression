@@ -12,13 +12,14 @@ from sklearn.metrics import roc_auc_score
 import torch
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from tqdm.auto import tqdm
 import typer
 
 from active_testing_benchmark.modeling.data import (
     FairVisionDataset,
     get_class_counts,
+    get_dataset_targets,
     inverse_frequency_weights,
 )
 
@@ -65,8 +66,9 @@ def select_device(requested: str = "auto") -> torch.device:
 class TrainConfig:
     batch_size: int = 32
     num_workers: int = 0
-    epochs: int = 5
+    epochs: int = 10
     learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
     seed: int = 42
     image_size: int = 224
     weighted_sampling: bool = False
@@ -76,14 +78,14 @@ class TrainConfig:
 
 
 def make_train_loader_and_loss(
-    dataset: FairVisionDataset, config: TrainConfig, device: torch.device
+    dataset: FairVisionDataset | Subset, config: TrainConfig, device: torch.device
 ):
     counts = get_class_counts(dataset)
     sampler = None
     if config.weighted_sampling:
         per_class_weights = inverse_frequency_weights(counts, config.sampling_power)
-        targets = torch.as_tensor(dataset.targets, dtype=torch.long)
-        sample_weights = per_class_weights[targets].double()
+        targets = torch.as_tensor(get_dataset_targets(dataset), dtype=torch.long)
+        sample_weights = per_class_weights[targets].double().tolist()
         sampler = WeightedRandomSampler(
             weights=sample_weights,
             num_samples=len(dataset),
@@ -121,20 +123,27 @@ def make_class_balanced_weights(class_counts: torch.Tensor) -> torch.Tensor:
     return inverse_frequency_weights(class_counts, power=1.0, normalization="sample_mean")
 
 
-
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: AdamW,
     device: torch.device,
-    debug: int | None = None,
+    progress_position: int = 0,
 ):
     model.train()
     logger.info("Model set to train mode")
     running_loss = 0.0
+    loss_denominator_total = 0.0
+    sample_count = 0
 
-    for i, batch in enumerate(tqdm(loader)):
+    for batch in tqdm(
+        loader,
+        desc="Training batches",
+        unit="batch",
+        position=progress_position,
+        leave=False,
+    ):
         images = batch["image"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -142,11 +151,28 @@ def train_one_epoch(
         loss = criterion(logits, targets)
         loss.backward()
         optimizer.step()
-        running_loss += loss.item()
-        if debug and i > debug:
-            break
+        batch_size = len(targets)
+        sample_count += batch_size
+        loss_denominator = batch_size
+        if isinstance(criterion, nn.CrossEntropyLoss):
+            valid_targets = targets[targets != criterion.ignore_index]
+            if criterion.weight is None:
+                loss_denominator = valid_targets.numel()
+            else:
+                loss_denominator = criterion.weight[valid_targets].sum().item()
 
-    return running_loss / len(loader)  # Mean minibatch loss
+        batch_loss = loss.item()
+        if getattr(criterion, "reduction", "mean") != "sum":
+            batch_loss *= loss_denominator
+        running_loss += batch_loss
+        loss_denominator_total += loss_denominator
+
+    if sample_count == 0:
+        raise ValueError("Cannot train on an empty data loader")
+    if loss_denominator_total == 0:
+        raise ValueError("Cannot aggregate training loss with a zero criterion denominator")
+
+    return running_loss / loss_denominator_total
 
 
 @torch.inference_mode()

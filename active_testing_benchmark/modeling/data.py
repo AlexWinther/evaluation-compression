@@ -8,7 +8,7 @@ import re
 
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from torchcodec.decoders import decode_image
 
 from active_testing_benchmark.config import (
@@ -140,14 +140,23 @@ class FairVisionDataset(Dataset):
         }
 
 
-def get_class_counts(dataset: FairVisionDataset) -> torch.Tensor:
-    targets = torch.as_tensor(dataset.targets, dtype=torch.long)
-    counts = torch.bincount(targets, minlength=len(dataset.classes))
+def get_dataset_targets(dataset: FairVisionDataset | Subset) -> list[int]:
+    """Return labels in dataset order, including for a PyTorch ``Subset``."""
+    if isinstance(dataset, Subset):
+        source = dataset.dataset
+        if not isinstance(source, FairVisionDataset):
+            raise TypeError("FairVision subsets must wrap a FairVisionDataset")
+        return [source.targets[index] for index in dataset.indices]
+    return dataset.targets
+
+
+def get_class_counts(dataset: FairVisionDataset | Subset) -> torch.Tensor:
+    targets = torch.as_tensor(get_dataset_targets(dataset), dtype=torch.long)
+    classes = dataset.dataset.classes if isinstance(dataset, Subset) else dataset.classes
+    counts = torch.bincount(targets, minlength=len(classes))
     missing = torch.where(counts == 0)[0].tolist()
     if missing:
-        raise ValueError(
-            f"No training samples for classes: {[dataset.classes[i] for i in missing]}"
-        )
+        raise ValueError(f"No training samples for classes: {[classes[i] for i in missing]}")
     return counts
 
 
