@@ -16,6 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "huggingface-hub>=0.30",
+    "ipywidgets>=8.1.9",
     "loguru",
     "matplotlib>=3.10",
     "mkdocs",
@@ -64,3 +65,7 @@ torchvision = [
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
 explicit = true
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+pythonPlatform = "Darwin"

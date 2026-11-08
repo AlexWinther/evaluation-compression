@@ -4,22 +4,26 @@ from collections.abc import Callable
 
 import torch
 from torch import nn
-from torchvision.models import resnet18
+from torchvision.models.efficientnet import EfficientNet_B0_Weights, efficientnet_b0
+from torchvision.models.resnet import ResNet18_Weights, resnet18
 from torchvision.transforms import v2
 
 
-def create_model(
-    num_classes: int,
-    pretrained: bool = True,
-    device: torch.device | str = "cpu",
-) -> nn.Module:
-    """Create the supported ResNet-18 classifier."""
-    if isinstance(device, str):
-        device = torch.device(device)
+def create_model(model_type="resnet", out_dim=1, use_pretrained=True):
+    """Create model of specified type with or without pretrained weights"""
 
-    model = resnet18(weights="DEFAULT" if pretrained else None)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    model.to(device)
+    if model_type == "resnet":
+        model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if use_pretrained else None)
+        model.fc = nn.Linear(model.fc.in_features, out_dim)
+
+    elif model_type == "efficientnet":
+        model = efficientnet_b0(
+            weights=EfficientNet_B0_Weights.IMAGENET1K_V1 if use_pretrained else None
+        )
+        model.classifier[1] = nn.Linear(in_features=1280, out_features=out_dim, bias=False)
+
+    else:
+        raise ValueError("Only 'resnet' and 'efficientnet'")
 
     return model
 

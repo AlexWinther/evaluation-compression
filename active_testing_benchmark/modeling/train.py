@@ -69,10 +69,6 @@ class TrainingConfig:
             raise ValueError("seed must be between 0 and 4294967295")
 
 
-# Compatibility alias for callers that have not yet adopted the new name.
-TrainConfig = TrainingConfig
-
-
 @dataclass
 class TrainingResult:
     model: nn.Module
@@ -171,13 +167,20 @@ def train_one_epoch(
     optimizer: AdamW,
     device: torch.device,
     progress_position: int = 0,
+    progress_total: int | None = None,
 ) -> float:
     model.train()
     running_loss = 0.0
     denominator_total = 0.0
     sample_count = 0
+
     for batch in tqdm(
-        loader, desc="Training batches", unit="batch", position=progress_position, leave=False
+        loader,
+        total=progress_total,
+        desc="Training batches",
+        unit="batch",
+        position=progress_position,
+        leave=False,
     ):
         images = batch["image"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
@@ -203,6 +206,7 @@ def train_one_epoch(
             batch_loss *= denominator
         running_loss += batch_loss
         denominator_total += denominator
+
     if sample_count == 0:
         raise ValueError("Cannot train on an empty data loader")
     if denominator_total == 0:
@@ -225,9 +229,9 @@ def _train_classifier(
         raise ValueError("Training requires at least two classes")
 
     set_seed(config.seed, device)
-    pilot_model = model_factory(
-        num_classes=len(data.classes), pretrained=config.pretrained, device=device
-    )
+    pilot_model = model_factory(out_dim=len(data.classes), use_pretrained=config.pretrained)
+    pilot_model = pilot_model.to(device)
+
     pilot_loader, pilot_criterion, pilot_counts, _ = make_train_loader_and_loss(
         data.pilot_fit, config, device
     )
@@ -249,10 +253,18 @@ def _train_classifier(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=pilot_epochs, eta_min=1e-6
     )
-    for epoch in range(pilot_epochs):
+
+    epoch_progress = tqdm(range(pilot_epochs), desc="Pilot epochs", unit="epoch", position=0)
+    for epoch in epoch_progress:
         epoch_loader = islice(pilot_loader, 10) if fast else pilot_loader
         training_loss = train_one_epoch(
-            pilot_model, epoch_loader, pilot_criterion, optimizer, device, progress_position=1
+            pilot_model,
+            epoch_loader,
+            pilot_criterion,
+            optimizer,
+            device,
+            progress_position=1,
+            progress_total=min(len(pilot_loader), 10) if fast else len(pilot_loader),
         )
         # The limit is known without consuming the loader a second time.
         pilot_batches.append(min(len(pilot_loader), 10) if fast else len(pilot_loader))
@@ -279,16 +291,17 @@ def _train_classifier(
         if score < best_score:
             best_score = score
             best_epoch = epoch + 1
+        epoch_progress.set_postfix(loss=training_loss, validation=score)
         scheduler.step()
+    epoch_progress.close()
 
     # Release the pilot and its optimizer state before allocating the refit model.
     del pilot_model, optimizer, scheduler
     # Use a distinct random stream so the refit starts from fresh parameters.
     refit_seed = (config.seed + 1) % 2**32
     set_seed(refit_seed, device)
-    model = model_factory(
-        num_classes=len(data.classes), pretrained=config.pretrained, device=device
-    )
+    model = model_factory(out_dim=len(data.classes), use_pretrained=config.pretrained)
+    model.to(device)
     loader, criterion, counts, _ = make_train_loader_and_loss(data.development, config, device)
     risk_weights = make_class_balanced_weights(counts)
     optimizer = AdamW(
@@ -300,14 +313,23 @@ def _train_classifier(
     refit_epochs = 1 if fast else best_epoch
     refit_batches = []
     refit_history = []
-    for _epoch in range(refit_epochs):
+    epoch_progress = tqdm(range(refit_epochs), desc="Refit epochs", unit="epoch", position=0)
+    for _epoch in epoch_progress:
         epoch_loader = islice(loader, 10) if fast else loader
         training_loss = train_one_epoch(
-            model, epoch_loader, criterion, optimizer, device, progress_position=1
+            model,
+            epoch_loader,
+            criterion,
+            optimizer,
+            device,
+            progress_position=1,
+            progress_total=min(len(loader), 10) if fast else len(loader),
         )
         refit_history.append(float(training_loss))
         refit_batches.append(min(len(loader), 10) if fast else len(loader))
+        epoch_progress.set_postfix(loss=training_loss)
         scheduler.step()
+    epoch_progress.close()
 
     metadata = {
         "mode": "fast" if fast else "full",
