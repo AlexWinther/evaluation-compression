@@ -9,6 +9,32 @@ from torchvision.models.resnet import ResNet18_Weights, resnet18
 from torchvision.transforms import v2
 
 
+class FrozenImageNetFeatures(nn.Module):
+    """Return 512 pooled ResNet-18 features without fitting any backbone weights.
+
+    Expects RGB float BCHW inputs already resized and ImageNet-normalized by
+    create_image_transform. We retain that shared image area instead of applying
+    the weights' standard resize/center crop a second time. The weights are
+    downloaded by torchvision on first use. Batch normalization always uses its
+    pretrained running statistics, including when a parent forest enters train mode.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.backbone.fc = nn.Identity()
+        self.requires_grad_(False)
+        self.eval()
+
+    def train(self, mode: bool = True) -> "FrozenImageNetFeatures":
+        """Keep the frozen backbone in inference mode when a parent is trained."""
+        return super().train(False)
+
+    @torch.no_grad()
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.backbone(images)
+
+
 def create_model(model_type="resnet", out_dim=1, use_pretrained=True):
     """Create model of specified type with or without pretrained weights"""
 

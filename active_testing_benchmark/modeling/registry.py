@@ -1,4 +1,4 @@
-"""Explicit MLflow run setup and metric logging for the three experiment types."""
+"""Explicit MLflow parent/child run setup and metric logging for experiments."""
 
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -31,7 +31,7 @@ def configure_mlflow() -> str:
 
 
 @contextmanager
-def experiment_run(kind, config, disease, device, *, enabled=True):
+def experiment_run(kind, config, disease, device, *, enabled=True, nested=False, role=None):
     """Keep run ownership here so exceptions mark the run failed and always close it."""
     if not enabled:
         yield None
@@ -39,10 +39,14 @@ def experiment_run(kind, config, disease, device, *, enabled=True):
     configure_mlflow()
     experiment = mlflow.set_experiment(EXPERIMENT_NAMES[kind])
     with mlflow.start_run(
-        experiment_id=experiment.experiment_id, run_name=f"{disease}-{config.model_type}"
+        experiment_id=experiment.experiment_id,
+        run_name=f"{disease}-{config.model_type}",
+        nested=nested,
     ) as run:
         mlflow.log_params({**asdict(config), "disease": disease, "device": str(device)})
         mlflow.set_tag("stage", "preparing")
+        if role is not None:
+            mlflow.set_tag("run_role", role)
         log_code_provenance()
         logger.info(f"MLflow experiment: {EXPERIMENT_NAMES[kind]}; run: {run.info.run_id}")
         yield run

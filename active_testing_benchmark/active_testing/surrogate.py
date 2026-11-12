@@ -5,6 +5,8 @@ from torch import nn
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
+from active_testing_benchmark.modeling.models import FrozenImageNetFeatures
+
 
 class SpatialTextureFeatures(nn.Module):
     """Summarize intensity, contrast, and edges at two spatial resolutions.
@@ -88,7 +90,7 @@ class RandomForestModule(nn.Module):
         super().__init__()
 
         if feature_extractor is None:
-            feature_extractor = SpatialTextureFeatures()
+            feature_extractor = FrozenImageNetFeatures()
 
         self.num_classes = num_classes
         self.feature_extractor = feature_extractor

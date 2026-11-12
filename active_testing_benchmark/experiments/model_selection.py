@@ -69,68 +69,104 @@ def run_model_selection_experiment(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows, histories = [], {}
-    for model_type in ("resnet", "efficientnet"):
-        model_config = replace(config, model_type=model_type)
-        with experiment_run(
-            "model_selection", model_config, disease, device, enabled=track
-        ) as run:
-            if run is not None:
-                log_dataset_provenance(train=fit, validation=holdout, evaluation=data.test)
-                mlflow.log_params(
-                    {
-                        "train_size": len(fit),
-                        "validation_size": len(holdout),
-                        "evaluation_size": len(data.test),
-                        "checkpoint_selection": "max_validation_auc",
-                    }
-                )
-            model, checkpoint = _train_or_load(
-                model_config,
-                data.classes,
-                fit,
-                holdout,
-                device,
-                Path(checkpoint_dir) / "model_selection" / disease.lower() / f"{model_type}.pt",
-                reuse_trained_model,
-            )
-            history = checkpoint["history"]
-            best = max(
-                (row for row in history if row["roc_auc"] is not None),
-                key=lambda row: row["roc_auc"],
-            )
-
-            # PreparedData.test contains "val" here, not the final FairVision test set.
-            if run is not None:
-                mlflow.set_tag("stage", "evaluation")
-            metrics = evaluate_model(model, data.test, config.batch_size, device)
-            _log_evaluation(metrics)
-            rows.append(
+    with experiment_run(
+        "model_selection",
+        replace(config, model_type="comparison"),
+        disease,
+        device,
+        enabled=track,
+        role="parent",
+    ) as parent:
+        if parent is not None:
+            mlflow.log_param("models", ["resnet", "efficientnet"])
+            mlflow.log_params(
                 {
-                    "model": model_type,
-                    "mlflow_run_id": run.info.run_id if run is not None else None,
-                    "best_epoch": best["epoch"],
-                    "holdout_auc": best["roc_auc"],
-                    "training_seconds": checkpoint["training_seconds"],
-                    "training_seed": checkpoint["config"]["random_state"],
-                    **metrics,
+                    "train_size": len(fit),
+                    "validation_size": len(holdout),
+                    "evaluation_size": len(data.test),
                 }
             )
-            histories[model_type] = history
-            logger.info(f"{model_type}: {rows[-1]}")
-            del model, checkpoint
+            log_dataset_provenance(train=fit, validation=holdout, evaluation=data.test)
+        for model_type in ("resnet", "efficientnet"):
+            model_config = replace(config, model_type=model_type)
+            with experiment_run(
+                "model_selection",
+                model_config,
+                disease,
+                device,
+                enabled=track,
+                nested=True,
+                role="child",
+            ) as run:
+                if run is not None:
+                    log_dataset_provenance(train=fit, validation=holdout, evaluation=data.test)
+                    mlflow.log_params(
+                        {
+                            "train_size": len(fit),
+                            "validation_size": len(holdout),
+                            "evaluation_size": len(data.test),
+                            "checkpoint_selection": "max_validation_auc",
+                        }
+                    )
+                model, checkpoint = _train_or_load(
+                    model_config,
+                    data.classes,
+                    fit,
+                    holdout,
+                    device,
+                    Path(checkpoint_dir)
+                    / "model_selection"
+                    / disease.lower()
+                    / f"{model_type}.pt",
+                    reuse_trained_model,
+                )
+                history = checkpoint["history"]
+                best = max(
+                    (row for row in history if row["roc_auc"] is not None),
+                    key=lambda row: row["roc_auc"],
+                )
 
-    results = pd.DataFrame(rows).sort_values("auc", ascending=False).reset_index(drop=True)
-    results.to_csv(output_dir / "comparison.csv", index=False)
-    (output_dir / "history.json").write_text(
-        json.dumps(
-            {"disease": disease, "device": device, "config": asdict(config), "history": histories},
-            indent=2,
-            allow_nan=False,
+                # PreparedData.test contains "val" here, not the final FairVision test set.
+                if run is not None:
+                    mlflow.set_tag("stage", "evaluation")
+                metrics = evaluate_model(model, data.test, config.batch_size, device)
+                _log_evaluation(metrics)
+                rows.append(
+                    {
+                        "model": model_type,
+                        "mlflow_run_id": run.info.run_id if run is not None else None,
+                        "mlflow_parent_run_id": parent.info.run_id if parent else None,
+                        "best_epoch": best["epoch"],
+                        "holdout_auc": best["roc_auc"],
+                        "training_seconds": checkpoint["training_seconds"],
+                        "training_seed": checkpoint["config"]["random_state"],
+                        **metrics,
+                    }
+                )
+                histories[model_type] = history
+                logger.info(f"{model_type}: {rows[-1]}")
+                del model, checkpoint
+
+        results = pd.DataFrame(rows).sort_values("auc", ascending=False).reset_index(drop=True)
+        results.to_csv(output_dir / "comparison.csv", index=False)
+        (output_dir / "history.json").write_text(
+            json.dumps(
+                {
+                    "disease": disease,
+                    "device": device,
+                    "config": asdict(config),
+                    "history": histories,
+                },
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
         )
-        + "\n"
-    )
-    logger.info(f"Comparison saved to {output_dir}")
-    return results
+        logger.info(f"Comparison saved to {output_dir}")
+        if parent is not None:
+            mlflow.log_artifact(str(output_dir / "comparison.csv"))
+            mlflow.log_artifact(str(output_dir / "history.json"))
+        return results
 
 
 def main():
