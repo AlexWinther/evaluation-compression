@@ -95,7 +95,7 @@ before running the experiment). All available CLI flags and arguments can be
 found with `--help`. Additional training settings, such as image size and
 learning rate, are configured through `modeling.train.TrainingConfig`.
 
-Best checkpoints are saved under `models/new-experiment/`, separated by
+Best checkpoints are saved under `models/experiment/`, separated by
 `model_selection`, `AT_dev`, or `AT_final`, then disease and model name. A fresh
 training run replaces the checkpoint at its corresponding path. To load an
 existing checkpoint and skip classifier training:
@@ -137,6 +137,53 @@ reference metrics. Model selection returns a comparison DataFrame. They accept
 `reuse_trained_model`. AT functions also accept `repetitions`. `modeling.data`
 owns the dataset, `modeling.train` owns training and auxiliary fitting, and
 `benchmark` owns repeated active evaluation.
+
+## MLflow tracking
+
+Tracking is enabled by default. Set `MLFLOW_TRACKING_URI`,
+`MLFLOW_TRACKING_USERNAME`, and `MLFLOW_TRACKING_PASSWORD` in `.env`, using
+`.env.example` as a template. The existing `just experiment` and
+`just model-selection` commands then send results to that server.
+
+| Experiment | MLflow experiment name | Runs |
+|---|---|---|
+| Model selection | `FairVision/model_selection` | One run per model |
+| Development AT | `FairVision/AT_dev` | One run per invocation |
+| Final AT | `FairVision/AT_final` | One run per confirmed invocation |
+
+Each epoch logs loss, accuracy, F1, and ROC AUC under separate MLflow paths:
+`training/train/{metric}` and `training/validation/{metric}`, where the metric
+names are `loss`, `accuracy`, `f1`, and `roc_auc`. Training metrics aggregate
+predictions from the optimization pass, while validation uses the updated model
+in evaluation mode after the epoch. No extra training-set inference pass is
+needed. Checkpoint selection continues to maximize validation AUC.
+
+During AT, the `stage`,
+`AT.method`, and `AT.repetition` tags show progress. Risk and label-count metrics
+are logged after each method/repetition. Overall and subgroup reference metrics
+are logged after evaluation. Full AT curves remain available in the CSV artifact.
+
+Each run records its configuration and seeds, best checkpoint and training
+history, reference metrics, and AT CSV/JSON outputs. Reused checkpoints retain
+their original training configuration and, when trained with tracking, source
+run ID. Older checkpoints remain reusable. Local outputs are still
+saved, and the metadata/comparison CSV includes the corresponding MLflow run ID.
+
+For reproducibility, runs also save the current Python source as `source.zip`,
+the Git commit and dirty status, `pyproject.toml`, `uv.lock`, installed package
+versions, and hashes of the metadata CSV and each partition's ordered sample IDs
+and labels. Dataset provenance uses metadata only. Images are not uploaded.
+
+Use `--no-mlflow` for local-only runs, or `track=False` when calling the experiment
+functions from Python:
+
+```bash
+just experiment --no-mlflow --seed 42
+```
+
+The final-experiment confirmation is required with or without tracking. Failed
+runs are marked as failed in MLflow. Tracking errors propagate rather than
+silently producing an untracked run.
 
 ## Acknowledgment
 

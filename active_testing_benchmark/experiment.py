@@ -13,6 +13,7 @@ from time import perf_counter
 import uuid
 
 from loguru import logger
+import mlflow
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
@@ -26,6 +27,8 @@ from active_testing_benchmark.benchmark import run_benchmark
 from active_testing_benchmark.config import CLASS_TO_IDX, MODELS_DIR, PROJ_ROOT, RAW_DATA_DIR
 from active_testing_benchmark.modeling.data import FairVisionData, prepare_data
 from active_testing_benchmark.modeling.models import create_image_transform, create_model
+from active_testing_benchmark.modeling.provenance import log_dataset_provenance
+from active_testing_benchmark.modeling.registry import experiment_run, log_metrics
 from active_testing_benchmark.modeling.train import (
     TrainingConfig,
     TrainingSetup,
@@ -111,8 +114,11 @@ def _train_or_load(config, classes, train, validation, device, checkpoint_path, 
         logger.info(
             f"Loaded {checkpoint_path} (training seed: {checkpoint['config']['random_state']})"
         )
+        _log_training(checkpoint, checkpoint_path, reused=True)
         return model, checkpoint
 
+    if mlflow.active_run() is not None:
+        mlflow.set_tag("stage", "training")
     random.seed(config.random_state)
     np.random.seed(config.random_state)
     torch.manual_seed(config.random_state)
@@ -134,12 +140,47 @@ def _train_or_load(config, classes, train, validation, device, checkpoint_path, 
         "classes": list(classes),
         "history": json.loads(json.dumps(history)),
         "training_seconds": perf_counter() - start,
+        "training_run_id": mlflow.active_run().info.run_id if mlflow.active_run() else None,
     }
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, checkpoint_path)
     logger.info(f"Saved best checkpoint to {checkpoint_path}")
+    _log_training(checkpoint, checkpoint_path, reused=False)
 
     return model, checkpoint
+
+
+def _log_training(checkpoint, checkpoint_path, *, reused):
+    if mlflow.active_run() is None:
+        return
+    mlflow.log_params({f"training.{name}": value for name, value in checkpoint["config"].items()})
+    mlflow.log_param("reused_checkpoint", reused)
+    if checkpoint.get("training_run_id"):
+        mlflow.set_tag("training.source_run_id", checkpoint["training_run_id"])
+    mlflow.log_dict(
+        {name: value for name, value in checkpoint.items() if name != "model_state_dict"},
+        "training.json",
+    )
+    mlflow.log_artifact(str(checkpoint_path), "checkpoints")
+    best = max(
+        (row for row in checkpoint["history"] if row["roc_auc"] is not None),
+        key=lambda row: row["roc_auc"],
+    )
+    log_metrics({"best_epoch": best["epoch"], "best_validation_auc": best["roc_auc"]})
+
+
+def _log_evaluation(metrics):
+    if mlflow.active_run() is None:
+        return
+    mlflow.set_tag("stage", "evaluation")
+    mlflow.log_dict(metrics, "reference_metrics.json")
+    log_metrics(
+        {name: value for name, value in metrics.items() if name != "subgroup_metrics"},
+        prefix="evaluation",
+    )
+    for attribute, groups in metrics["subgroup_metrics"].items():
+        for group, values in groups.items():
+            log_metrics(values, prefix=f"evaluation/{attribute}/{group}")
 
 
 def run_model_selection_experiment(
@@ -150,6 +191,7 @@ def run_model_selection_experiment(
     output_dir: Path = PROJ_ROOT / "reports" / "active-testing" / "model-comparison",
     reuse_trained_model: bool = False,
     checkpoint_dir: Path = MODELS_DIR / "experiment",
+    track: bool = True,
 ) -> pd.DataFrame:
     """Select checkpoints on 20% of train, then compare models on FairVision validation."""
     config = replace(
@@ -179,41 +221,59 @@ def run_model_selection_experiment(
             random_state=config.random_state,
         )
     )
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows, histories = [], {}
     for model_type in ("resnet", "efficientnet"):
         model_config = replace(config, model_type=model_type)
-        model, checkpoint = _train_or_load(
-            model_config,
-            data.classes,
-            fit,
-            holdout,
-            device,
-            Path(checkpoint_dir) / "model_selection" / disease.lower() / f"{model_type}.pt",
-            reuse_trained_model,
-        )
-        history = checkpoint["history"]
-        best = max(
-            (row for row in history if row["roc_auc"] is not None),
-            key=lambda row: row["roc_auc"],
-        )
+        with experiment_run(
+            "model_selection", model_config, disease, device, enabled=track
+        ) as run:
+            if run is not None:
+                log_dataset_provenance(train=fit, validation=holdout, evaluation=data.test)
+                mlflow.log_params(
+                    {
+                        "train_size": len(fit),
+                        "validation_size": len(holdout),
+                        "evaluation_size": len(data.test),
+                        "checkpoint_selection": "max_validation_auc",
+                    }
+                )
+            model, checkpoint = _train_or_load(
+                model_config,
+                data.classes,
+                fit,
+                holdout,
+                device,
+                Path(checkpoint_dir) / "model_selection" / disease.lower() / f"{model_type}.pt",
+                reuse_trained_model,
+            )
+            history = checkpoint["history"]
+            best = max(
+                (row for row in history if row["roc_auc"] is not None),
+                key=lambda row: row["roc_auc"],
+            )
 
-        # PreparedData.test contains "val" here, not the final FairVision test set.
-        metrics = evaluate_model(model, data.test, config.batch_size, device)
-        rows.append(
-            {
-                "model": model_type,
-                "best_epoch": best["epoch"],
-                "holdout_auc": best["roc_auc"],
-                "training_seconds": checkpoint["training_seconds"],
-                "training_seed": checkpoint["config"]["random_state"],
-                **metrics,
-            }
-        )
-        histories[model_type] = history
-        logger.info(f"{model_type}: {rows[-1]}")
-        del model, checkpoint
+            # PreparedData.test contains "val" here, not the final FairVision test set.
+            if run is not None:
+                mlflow.set_tag("stage", "evaluation")
+            metrics = evaluate_model(model, data.test, config.batch_size, device)
+            _log_evaluation(metrics)
+            rows.append(
+                {
+                    "model": model_type,
+                    "mlflow_run_id": run.info.run_id if run is not None else None,
+                    "best_epoch": best["epoch"],
+                    "holdout_auc": best["roc_auc"],
+                    "training_seconds": checkpoint["training_seconds"],
+                    "training_seed": checkpoint["config"]["random_state"],
+                    **metrics,
+                }
+            )
+            histories[model_type] = history
+            logger.info(f"{model_type}: {rows[-1]}")
+            del model, checkpoint
 
     results = pd.DataFrame(rows).sort_values("auc", ascending=False).reset_index(drop=True)
     results.to_csv(output_dir / "comparison.csv", index=False)
@@ -257,6 +317,7 @@ def _run_experiment(
     output_dir: Path = PROJ_ROOT / "reports" / "active-testing" / "AT_benchmarking",
     experiment: str = "AT_dev",
     repetitions: int = 25,
+    track: bool = True,
 ):
     device = device or (
         "cuda"
@@ -271,60 +332,86 @@ def _run_experiment(
         f"val ({len(validation)}), "
         f"test ({len(test)})"
     )
-    model, checkpoint = _train_or_load(
-        config, test.classes, train, validation, device, checkpoint_path, reuse_trained_model
-    )
+    with experiment_run(experiment, config, test.disease, device, enabled=track) as run:
+        if run is not None:
+            log_dataset_provenance(train=train, validation=validation, evaluation=test)
+            mlflow.log_params(
+                {
+                    "repetitions": repetitions,
+                    "budget": len(test),
+                    "train_size": len(train),
+                    "validation_size": len(validation),
+                    "evaluation_size": len(test),
+                    "checkpoint_selection": "max_validation_auc",
+                }
+            )
+        model, checkpoint = _train_or_load(
+            config, test.classes, train, validation, device, checkpoint_path, reuse_trained_model
+        )
 
-    reference_metrics = evaluate_model(model, test, config.batch_size, device)
+        if run is not None:
+            mlflow.set_tag("stage", "evaluation")
+        reference_metrics = evaluate_model(model, test, config.batch_size, device)
+        _log_evaluation(reference_metrics)
+        if run is not None:
+            mlflow.set_tag("stage", "auxiliary_fit")
 
-    auxiliary = fit_auxiliary_models(train, test.classes, config, device)
+        auxiliary = fit_auxiliary_models(train, test.classes, config, device)
 
-    curves = run_benchmark(
-        model=model,
-        dataset=test,
-        auxiliary=auxiliary,
-        num_classes=len(test.classes),
-        device=device,
-        seed=config.random_state,
-        protected_columns=tuple(reference_metrics["subgroup_metrics"]),
-        repetitions=repetitions,
-        budget=len(test),
-    )
+        curves = run_benchmark(
+            model=model,
+            dataset=test,
+            auxiliary=auxiliary,
+            num_classes=len(test.classes),
+            device=device,
+            seed=config.random_state,
+            protected_columns=tuple(reference_metrics["subgroup_metrics"]),
+            repetitions=repetitions,
+            budget=len(test),
+        )
 
-    metadata = {
-        "configuration": {
-            "experiment": experiment,
-            "disease": test.disease,
-            "training": asdict(config),
-            "seed": config.random_state,
-            "data_root": str(test.root_dir.parent),
-            "output_dir": str(output_dir),
-            "resolved_device": str(device),
-            "reuse_trained_model": reuse_trained_model,
-            "protected_columns": list(reference_metrics["subgroup_metrics"]),
-            "repetitions": repetitions,
-            "budget": len(test),
-        },
-        "training": {
-            "configuration": checkpoint["config"],
-            "history": checkpoint["history"],
-            "training_seconds": checkpoint["training_seconds"],
-            "checkpoint_path": str(checkpoint_path),
-        },
-        "selected_epochs": max(
-            (row for row in checkpoint["history"] if row["roc_auc"] is not None),
-            key=lambda row: row["roc_auc"],
-        )["epoch"],
-        "classes": test.classes,
-        "auxiliary_seeds": list(auxiliary.seeds),
-        "train_size": len(train),
-        "validation_size": len(validation),
-        "evaluation_size": len(test),
-        "reference_metrics": reference_metrics,
-    }
-    save_results(curves, metadata, output_dir)
+        metadata = {
+            "mlflow_run_id": run.info.run_id if run is not None else None,
+            "configuration": {
+                "experiment": experiment,
+                "disease": test.disease,
+                "training": asdict(config),
+                "seed": config.random_state,
+                "data_root": str(test.root_dir.parent),
+                "output_dir": str(output_dir),
+                "resolved_device": str(device),
+                "reuse_trained_model": reuse_trained_model,
+                "protected_columns": list(reference_metrics["subgroup_metrics"]),
+                "repetitions": repetitions,
+                "budget": len(test),
+            },
+            "training": {
+                "configuration": checkpoint["config"],
+                "history": checkpoint["history"],
+                "training_seconds": checkpoint["training_seconds"],
+                "checkpoint_path": str(checkpoint_path),
+                "source_run_id": checkpoint.get("training_run_id"),
+            },
+            "selected_epochs": max(
+                (row for row in checkpoint["history"] if row["roc_auc"] is not None),
+                key=lambda row: row["roc_auc"],
+            )["epoch"],
+            "classes": test.classes,
+            "auxiliary_seeds": list(auxiliary.seeds),
+            "train_size": len(train),
+            "validation_size": len(validation),
+            "evaluation_size": len(test),
+            "reference_metrics": reference_metrics,
+        }
+        curves_path, metadata_path = save_results(curves, metadata, output_dir)
+        if run is not None:
+            mlflow.log_artifact(str(curves_path), "results")
+            mlflow.log_artifact(str(metadata_path), "results")
+            mlflow.log_params(
+                {f"auxiliary_seed_{i}": seed for i, seed in enumerate(auxiliary.seeds)}
+            )
 
-    return reference_metrics
+        return reference_metrics
 
 
 def run_dev_experiment(
@@ -336,6 +423,7 @@ def run_dev_experiment(
     reuse_trained_model: bool = False,
     checkpoint_dir: Path = MODELS_DIR / "experiment",
     repetitions: int = 25,
+    track: bool = True,
 ):
     # Set defaults if no training config is given
     config = training_config or TrainingConfig(random_state=secrets.randbits(32))
@@ -377,6 +465,7 @@ def run_dev_experiment(
         output_dir=output_dir,
         experiment="AT_dev",
         repetitions=repetitions,
+        track=track,
     )
 
 
@@ -389,6 +478,7 @@ def run_final_experiment(
     reuse_trained_model: bool = False,
     checkpoint_dir: Path = MODELS_DIR / "experiment",
     repetitions: int = 25,
+    track: bool = True,
 ):
     try:
         confirmation = input(
@@ -440,6 +530,7 @@ def run_final_experiment(
         output_dir=output_dir,
         experiment="AT_final",
         repetitions=repetitions,
+        track=track,
     )
 
 
@@ -465,6 +556,9 @@ def main():
         help="Load the saved best checkpoint instead of training",
     )
     parser.add_argument("--checkpoint-dir", type=Path, default=MODELS_DIR / "experiment")
+    parser.add_argument(
+        "--no-mlflow", action="store_true", help="Run locally without MLflow tracking"
+    )
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("--repetitions must be positive")
@@ -485,6 +579,7 @@ def main():
         device=args.device,
         reuse_trained_model=args.reuse_trained_model,
         checkpoint_dir=args.checkpoint_dir,
+        track=not args.no_mlflow,
         **({"repetitions": args.repetitions} if args.experiment == "AT_benchmarking" else {}),
     )
     if not isinstance(results, pd.DataFrame):

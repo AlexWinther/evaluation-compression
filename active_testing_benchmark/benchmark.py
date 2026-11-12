@@ -1,5 +1,6 @@
 """Benchmark method configuration and repeated finite-pool evaluation."""
 
+import mlflow
 import pandas as pd
 from torch import nn
 from tqdm.auto import tqdm
@@ -14,9 +15,10 @@ from active_testing_benchmark.active_testing import (
 )
 from active_testing_benchmark.active_testing.losses import ZeroOneLoss
 from active_testing_benchmark.active_testing.runner import prepare_evaluation_pool
+from active_testing_benchmark.modeling.registry import log_metrics
 
 
-def build_method_configs(auxiliary, num_classes: int, batch_size: int = 10):
+def build_method_configs(auxiliary, num_classes: int, batch_size: int = 25):
     """Construct the benchmark's six existing method configurations."""
     method_configs = [
         (UniformSampleMean, {"batch_size": batch_size}),
@@ -116,6 +118,10 @@ def run_repetition(
                     if isinstance(method, StratifiedSampleMean):
                         name += method.allocation.capitalize()
                     method_progress.set_postfix_str(name)
+                    if mlflow.active_run() is not None:
+                        mlflow.set_tags(
+                            {"stage": "AT", "AT.method": name, "AT.repetition": repetition + 1}
+                        )
                     history = run_active_evaluation(
                         method=method,
                         model=model,
@@ -145,6 +151,12 @@ def run_repetition(
                             }
                         )
                     frames.append(pd.DataFrame(records))
+                    if records:
+                        log_metrics(
+                            {"risk": records[-1]["risk"], "n_labels": records[-1]["n_labels"]},
+                            prefix=f"AT/{name}/{objective}",
+                            step=repetition + 1,
+                        )
     return frames
 
 

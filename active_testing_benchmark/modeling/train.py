@@ -18,6 +18,7 @@ from active_testing_benchmark.active_testing.surrogate import RandomForestModule
 from active_testing_benchmark.config import RAW_DATA_DIR
 from active_testing_benchmark.modeling.data import FairVisionData, prepare_data
 from active_testing_benchmark.modeling.models import create_model
+from active_testing_benchmark.modeling.registry import log_metrics
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,33 @@ def split_dataset(
         )
 
 
+def _epoch_metrics(labels, probabilities, loss: float) -> dict[str, float | None]:
+    """Compute classification metrics once over all predictions from an epoch."""
+    y_true = np.concatenate(labels)
+    y_score = np.concatenate(probabilities)
+    y_pred = y_score.argmax(axis=1)
+    num_classes = y_score.shape[1]
+    auc = None
+    if np.array_equal(np.unique(y_true), np.arange(num_classes)):
+        auc = (
+            roc_auc_score(y_true, y_score[:, 1])
+            if num_classes == 2
+            else roc_auc_score(y_true, y_score, multi_class="ovr", average="macro")
+        )
+    return {
+        "loss": loss,
+        "accuracy": accuracy_score(y_true, y_pred),
+        "f1": f1_score(
+            y_true,
+            y_pred,
+            average="binary" if num_classes == 2 else "macro",
+            labels=np.arange(num_classes),
+            zero_division=0.0,
+        ),
+        "roc_auc": auc,
+    }
+
+
 def train_model(
     training_setup: TrainingSetup,
     training_config: TrainingConfig,
@@ -130,6 +158,7 @@ def train_model(
         model.train()
         epoch_loss = 0
         denominator_total = 0
+        train_labels, train_probabilities = [], []
 
         tl_pbar = tqdm(train_loader, desc="Batches", leave=False, position=1)
         for batch in tl_pbar:
@@ -146,6 +175,8 @@ def train_model(
                 batch_loss *= denominator
             epoch_loss += batch_loss
             denominator_total += denominator
+            train_labels.append(targets.cpu().numpy())
+            train_probabilities.append(logits.detach().softmax(dim=1).cpu().numpy())
 
             tl_pbar.set_postfix(Loss=epoch_loss / denominator_total)
 
@@ -166,35 +197,30 @@ def train_model(
                 labels.append(targets.cpu().numpy())
                 probabilities.append(logits.softmax(dim=1).cpu().numpy())
 
-        y_true = np.concatenate(labels)
-        y_score = np.concatenate(probabilities)
-        y_pred = y_score.argmax(axis=1)
-        num_classes = y_score.shape[1]
-        auc = None
-        if np.array_equal(np.unique(y_true), np.arange(num_classes)):
-            auc = (
-                roc_auc_score(y_true, y_score[:, 1])
-                if num_classes == 2
-                else roc_auc_score(y_true, y_score, multi_class="ovr", average="macro")
-            )
-        validation_loss /= validation_count
+        train_metrics = _epoch_metrics(
+            train_labels, train_probabilities, epoch_loss / denominator_total
+        )
+        validation_metrics = _epoch_metrics(
+            labels, probabilities, validation_loss / validation_count
+        )
+        auc = validation_metrics["roc_auc"]
+        # Keep the validation history keys used by existing checkpoint readers.
         history.append(
             {
                 "epoch": epoch,
-                "training_loss": epoch_loss / denominator_total,
-                "validation_loss": validation_loss,
-                "accuracy": accuracy_score(y_true, y_pred),
-                "f1": f1_score(
-                    y_true,
-                    y_pred,
-                    average="binary" if num_classes == 2 else "macro",
-                    labels=np.arange(num_classes),
-                    zero_division=0.0,
-                ),
+                "training_loss": train_metrics["loss"],
+                "training_accuracy": train_metrics["accuracy"],
+                "training_f1": train_metrics["f1"],
+                "training_roc_auc": train_metrics["roc_auc"],
+                "validation_loss": validation_metrics["loss"],
+                "accuracy": validation_metrics["accuracy"],
+                "f1": validation_metrics["f1"],
                 "roc_auc": auc,
             }
         )
         logger.info(f"Epoch {epoch}: {history[-1]}")
+        log_metrics(train_metrics, prefix="training/train", step=epoch)
+        log_metrics(validation_metrics, prefix="training/validation", step=epoch)
         if scheduler is not None:
             scheduler.step()
         if auc is not None and auc > best_auc:
