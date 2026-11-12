@@ -43,10 +43,12 @@ clinical decisions or patient care.
 
 ## Image-classification experiments
 
-Experiments run through `active_testing_benchmark.experiment`. The dataset reads
-FairVision's metadata and SLO images from `data/raw/fairvision/<disease>/`,
-preserving its `training`, `validation`, and `test` splits. Raw images are never
-copied or changed.
+Experiments live in `active_testing_benchmark.experiments`, with separate
+modules for `feature_experiment`, `model_selection`, and `at_benchmarking`.
+Shared evaluation and checkpoint helpers live in `experiments.utils`. The
+dataset reads FairVision's metadata and SLO images from
+`data/raw/fairvision/<disease>/`, preserving its `training`, `validation`, and
+`test` splits. Raw images are never copied or changed.
 
 Run the development benchmark (the recipe first syncs dependencies):
 
@@ -69,7 +71,7 @@ can be run:
 just model-selection --seed 42
 
 # Equivalent to:
-just experiment --experiment model_selection --seed 42
+uv run python -m active_testing_benchmark.experiments.model_selection --seed 42
 ```
 
 Both models use the same 80/20 training split. Their best checkpoints are
@@ -170,8 +172,10 @@ is zero. Prediction-based methods may still estimate it. At the full-pool
 budget, every requested subgroup has labels and an estimate. Overall risk is
 stored once per sampling trajectory.
 
-Python callers use `run_dev_experiment()`, `run_final_experiment()`, or
-`run_model_selection_experiment()` from `experiment`. The AT functions return
+Python callers import `run_dev_experiment()` and `run_final_experiment()` from
+`active_testing_benchmark.experiments.at_benchmarking`, and
+`run_model_selection_experiment()` from
+`active_testing_benchmark.experiments.model_selection`. The AT functions return
 reference metrics. Model selection returns a comparison DataFrame. They accept
 `training_config`, `data_root`, `output_dir`, `checkpoint_dir`, and
 `reuse_trained_model`. AT functions also accept `repetitions`. `modeling.data`
@@ -275,7 +279,7 @@ repository. Thank you to its makers for sharing their approach.
 │
 ├── uv.lock            <- Locked dependencies, installed with `just requirements`
 │
-└── active_testing_benchmark   <- Source code for use in this project.
+└── active_testing_benchmark    <- Source code for use in this project.
     │
     ├── __init__.py             <- Makes active_testing_benchmark a Python module
     │
@@ -283,14 +287,19 @@ repository. Thank you to its makers for sharing their approach.
     │
     ├── dataset.py              <- Scripts to download or generate data
     │
-    ├── experiment.py       <- Current model-selection and AT experiment entry point
+    ├── experiments             <- Feature, model-selection, and AT experiment entry points
+    │   ├── __init__.py
+    │   ├── at_benchmarking.py
+    │   ├── train.py
+    │   └── models.py
+    │
     ├── benchmark.py            <- AT methods, objectives, and repetitions
-    ├── active_testing         <- Sampling methods, estimators, runner, and surrogates
+    ├── active_testing          <- Sampling methods, estimators, runner, and surrogates
     │
     └── modeling
         ├── __init__.py
-        ├── data.py              <- Current FairVision dataset and data preparation
-        ├── train.py        <- Current classifier and auxiliary-model training
+        ├── data.py             <- Current FairVision dataset and data preparation
+        ├── train.py            <- Current classifier and auxiliary-model training
         └── models.py           <- Model factories and image transforms
 ```
 

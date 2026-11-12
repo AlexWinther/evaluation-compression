@@ -17,7 +17,7 @@ from active_testing_benchmark.active_testing.surrogate import (
     SpatialTextureFeatures,
 )
 from active_testing_benchmark.config import RAW_DATA_DIR
-from active_testing_benchmark.experiment import evaluate_model
+from active_testing_benchmark.experiments.utils import evaluate_model
 from active_testing_benchmark.modeling.data import FairVisionData
 from active_testing_benchmark.modeling.models import create_image_transform
 from active_testing_benchmark.modeling.provenance import log_dataset_provenance
