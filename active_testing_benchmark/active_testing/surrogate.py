@@ -2,7 +2,63 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 import torch
 from torch import nn
+from torch.nn import functional as F
 from tqdm.auto import tqdm
+
+
+class SpatialTextureFeatures(nn.Module):
+    """Summarize intensity, contrast, and edges at two spatial resolutions.
+
+    Inputs are floating point BCHW images, including the normalized images used
+    by the target model. No labels, fitted statistics, or pretrained weights are
+    needed. First pool to 64x64 to bound convolution cost independently of input
+    size. At each of the 4x4 and 8x8 grids, concatenate per-channel local mean,
+    population standard deviation, and mean absolute x/y Sobel responses.
+    RGB inputs produce 960 features. Channel order and normalization are kept
+    intact, so training, prediction, and online updates use the same transform.
+
+    These handcrafted descriptors add coarse texture information but are not
+    learned semantic features. Their benefit must be measured on held-out data.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]) / 8
+        self.register_buffer("sobel", torch.stack((sobel_x, sobel_x.T)).unsqueeze(1))
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 4 or not images.is_floating_point():
+            raise ValueError("Expected floating point images with shape (batch, channels, H, W)")
+        if images.device.type == "mps" and any(size % 64 for size in images.shape[-2:]):
+            # MPS cannot pool non-divisible sizes (e.g. 224 -> 64). Preserve
+            # identical pooling semantics on CPU, then resume extraction on MPS.
+            # https://github.com/pytorch/pytorch/issues/96056
+            images = F.adaptive_avg_pool2d(images.cpu(), (64, 64)).to(images.device)
+        else:
+            images = F.adaptive_avg_pool2d(images, (64, 64))
+        batch, channels, height, width = images.shape
+        # Replicate padding avoids introducing artificial edges around constant images.
+        padded = F.pad(
+            images.reshape(batch * channels, 1, height, width), (1, 1, 1, 1), mode="replicate"
+        )
+        edges = F.conv2d(padded, self.sobel.to(images)).abs()
+        edges = edges.reshape(batch, channels, 2, height, width)
+        features = []
+        for grid in (4, 8):
+            mean = F.adaptive_avg_pool2d(images, grid)
+            # Center before squaring to avoid cancellation for nearly constant images.
+            centered = images - F.interpolate(mean, size=(height, width), mode="nearest")
+            std = F.adaptive_avg_pool2d(centered.square(), grid).sqrt()
+            features.extend(
+                statistic.flatten(1)
+                for statistic in (
+                    mean,
+                    std,
+                    F.adaptive_avg_pool2d(edges[:, :, 0], grid),
+                    F.adaptive_avg_pool2d(edges[:, :, 1], grid),
+                )
+            )
+        return torch.cat(features, dim=1)
 
 
 class MeanProbabilityEnsemble(nn.Module):
@@ -32,10 +88,7 @@ class RandomForestModule(nn.Module):
         super().__init__()
 
         if feature_extractor is None:
-            feature_extractor = nn.Sequential(
-                nn.AdaptiveAvgPool2d((16, 16)),
-                nn.Flatten(),
-            )
+            feature_extractor = SpatialTextureFeatures()
 
         self.num_classes = num_classes
         self.feature_extractor = feature_extractor

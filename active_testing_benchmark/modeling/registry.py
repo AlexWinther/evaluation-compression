@@ -16,6 +16,7 @@ EXPERIMENT_NAMES = {
     "model_selection": "FairVision/model_selection",
     "AT_dev": "FairVision/AT_dev",
     "AT_final": "FairVision/AT_final",
+    "feature_extractors": "FairVision/feature_extractors",
 }
 
 

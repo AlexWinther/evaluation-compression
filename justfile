@@ -42,3 +42,7 @@ experiment *args: requirements
 # Compare ResNet-18 and EfficientNet-B0 using the new training pipeline
 model-selection *args: requirements
     uv run python -m active_testing_benchmark.experiment --experiment model_selection "$@"
+
+# Compare random forest image features on held-out training data
+feature-experiment *args: requirements
+    uv run python -m active_testing_benchmark.feature_experiment "$@"

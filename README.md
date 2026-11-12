@@ -86,6 +86,13 @@ Kossen and PPAT use the same average predictive probabilities from both
 surrogate forests. ASE starts with that ensemble and uses its individual
 members for XWED.
 
+Both surrogate forests and the proxy use fixed spatial texture features by
+default. Images are pooled to 64×64, then summarized on 4×4 and 8×8 grids using
+per-channel mean, standard deviation, and absolute horizontal/vertical Sobel
+responses. This yields 960 RGB features compared with the previous 768 pooled
+pixels, with no additional training, dependencies, or weight downloads. It
+accepts the same normalized images as the target model.
+
 ASE refits its surrogate forests on the original development data plus all
 acquired labels every 50 labels. Set `--ase-update-every N` to change that
 frequency (positive integers only). Acquisition batches stop at update
@@ -181,8 +188,23 @@ model-selection` commands then send results to that server.
 | Experiment | MLflow experiment name | Runs |
 |---|---|---|
 | Model selection | `FairVision/model_selection` | One run per model |
+| Random forest features | `FairVision/feature_extractors` | One run per extractor |
 | Development AT | `FairVision/AT_dev` | One run per invocation |
 | Final AT | `FairVision/AT_final` | One run per confirmed invocation |
+
+Compare the original 16×16 pooled pixels with the spatial texture features using:
+
+```bash
+just feature-experiment --seed 42
+```
+
+Both forests use the same seed, settings, and stratified 80/20 split of the
+FairVision training partition. The holdout is used to compare extractors, so
+report final performance on a separate partition. MLflow records classification
+loss, accuracy, F1, AUC when available, feature counts, fit and evaluation time,
+and split provenance. Use `--disease`, `--n-estimators`, `--batch-size`,
+`--image-size`, or `--device` to change the defaults, and `--no-mlflow` to run
+without tracking. The command prints a comparison table when complete.
 
 Each epoch logs loss, accuracy, F1, and ROC AUC under separate MLflow paths:
 `training/train/{metric}` and `training/validation/{metric}`, where the metric
