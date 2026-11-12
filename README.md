@@ -79,16 +79,37 @@ test data.
 AT benchmarking runs uniform, balanced/proportional stratified, Kossen,
 active-surrogate, and prediction-powered methods. It estimates unweighted
 cross-entropy risk overall and by subgroup, including `age_group`. Each method
-runs for `--repetitions` (default 25), with a max label budget equal to the full
-evaluation pool in 10 label increments.
+runs for `--repetitions` (default 25), with a max label budget equal to the
+full evaluation pool.
+
+Kossen and PPAT use the same average predictive probabilities from both
+surrogate forests. ASE starts with that ensemble and uses its individual
+members for XWED.
+
+ASE refits its surrogate forests on the original development data plus all
+acquired labels every 50 labels. Set `--ase-update-every N` to change that
+frequency (positive integers only). Acquisition batches stop at update
+thresholds so refitting happens at the requested label counts. Each objective
+and repetition starts with fresh copies of the development-trained ASE
+surrogates.
 
 The recipes forward CLI flags, for example:
 
 ```bash
 just experiment --repetitions 5 --seed 42 --epochs 20
+just experiment --ase-update-every 100 --seed 42
+just experiment --protected-attribute gender --seed 42
 just model-selection --epochs 10 --batch-size 16 --device cpu
 just experiment --help
 ```
+
+By default, AT benchmarking reports all marginal subgroup attributes except raw
+`age`. Uniform sampling, Kossen, ASE, and PPAT each share one sampling run per
+repetition and objective across all attributes. The two stratified baselines run
+separately for each sampling attribute, and each run also reports every requested
+marginal attribute. Use `--protected-attribute` to restrict stratification to
+`gender`, `race`, `ethnicity`, `language`, `maritalstatus`, or `age_group`.
+All available marginal attributes are still reported.
 
 Use `--disease dr|amd|glaucoma` to select the disease (they must be downloaded
 before running the experiment). All available CLI flags and arguments can be
@@ -128,7 +149,19 @@ records configuration, checkpoint details, training history, auxiliary seeds,
 dataset sizes, and full-pool reference metrics. Model selection writes
 `comparison.csv` and `history.json` under
 `reports/active-testing/model-comparison/`. These are replaced on subsequent
-runs.
+runs. Curves include a `protected_attribute` column: `shared` identifies a
+non-stratified run reporting multiple attributes, while an attribute name
+identifies its stratification attribute. Shared runs report all attributes even
+when the CLI override selects one stratification attribute. Subgroup estimates
+and label counts remain wide columns (for example, `risk gender=female` and
+`n_labels_gender=female`). For a stratified run, the column names the sampling
+attribute. Every run contains estimates and counts for all requested marginal
+attributes. A reported subgroup may cross the sampling strata, so its estimate
+uses the stratum weights from that run. At smaller budgets, methods that
+require observed labels may leave a subgroup's risk blank when its label count
+is zero. Prediction-based methods may still estimate it. At the full-pool
+budget, every requested subgroup has labels and an estimate. Overall risk is
+stored once per sampling trajectory.
 
 Python callers use `run_dev_experiment()`, `run_final_experiment()`, or
 `run_model_selection_experiment()` from `experiment`. The AT functions return
@@ -142,8 +175,8 @@ owns the dataset, `modeling.train` owns training and auxiliary fitting, and
 
 Tracking is enabled by default. Set `MLFLOW_TRACKING_URI`,
 `MLFLOW_TRACKING_USERNAME`, and `MLFLOW_TRACKING_PASSWORD` in `.env`, using
-`.env.example` as a template. The existing `just experiment` and
-`just model-selection` commands then send results to that server.
+`.env.example` as a template. The existing `just experiment` and `just
+model-selection` commands then send results to that server.
 
 | Experiment | MLflow experiment name | Runs |
 |---|---|---|

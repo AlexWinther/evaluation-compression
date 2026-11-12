@@ -5,6 +5,22 @@ from torch import nn
 from tqdm.auto import tqdm
 
 
+class MeanProbabilityEnsemble(nn.Module):
+    """Average member class probabilities and return their logarithms as logits."""
+
+    def __init__(self, members: list[nn.Module] | tuple[nn.Module, ...]) -> None:
+        super().__init__()
+        if not members:
+            raise ValueError("An ensemble requires at least one member")
+        self.members = nn.ModuleList(members)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        probabilities = torch.stack(
+            [member(inputs).softmax(dim=-1) for member in self.members]
+        ).mean(dim=0)
+        return probabilities.clamp_min(torch.finfo(probabilities.dtype).tiny).log()
+
+
 class RandomForestModule(nn.Module):
     def __init__(
         self,
@@ -34,6 +50,8 @@ class RandomForestModule(nn.Module):
             n_jobs=-1,
             class_weight="balanced_subsample",
         )
+        self._development_features: np.ndarray | None = None
+        self._development_labels: np.ndarray | None = None
 
     @torch.no_grad()
     def _extract_features(self, images):
@@ -57,6 +75,8 @@ class RandomForestModule(nn.Module):
         X = np.concatenate(X)
         y = np.concatenate(y)
 
+        self._development_features = X
+        self._development_labels = y
         self.forest.fit(X, y)
         return self
 
@@ -74,3 +94,36 @@ class RandomForestModule(nn.Module):
 
         # Return log-probabilities as logits
         return torch.from_numpy(full_probs).to(images.device).clamp_min(1e-8).log()
+
+
+def update_random_forest_surrogates(
+    surrogates: tuple[RandomForestModule, ...] | list[RandomForestModule],
+    X_observed: torch.Tensor,
+    y_observed: torch.Tensor,
+) -> None:
+    """Refit each forest on development data plus the full observed history."""
+    labels = y_observed.detach().cpu().numpy()
+
+    for surrogate in surrogates:
+        if surrogate._development_features is None or surrogate._development_labels is None:
+            raise ValueError("RandomForestModule must be fitted before it can be updated")
+
+        try:
+            feature_device = next(surrogate.feature_extractor.parameters()).device
+        except StopIteration:
+            try:
+                feature_device = next(surrogate.feature_extractor.buffers()).device
+            except StopIteration:
+                feature_device = X_observed.device
+
+        observed_feature_batches = []
+        for start in range(0, len(X_observed), 256):
+            images = X_observed[start : start + 256].to(feature_device)
+            observed_feature_batches.append(surrogate._extract_features(images))
+
+        observed_features = np.concatenate(observed_feature_batches)
+        combined_features = np.concatenate(
+            (surrogate._development_features, observed_features), axis=0
+        )
+        combined_labels = np.concatenate((surrogate._development_labels, labels), axis=0)
+        surrogate.forest.fit(combined_features, combined_labels)

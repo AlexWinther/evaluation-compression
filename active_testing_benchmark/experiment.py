@@ -318,7 +318,11 @@ def _run_experiment(
     experiment: str = "AT_dev",
     repetitions: int = 25,
     track: bool = True,
+    ase_update_every: int = 50,
+    protected_attribute: str | None = None,
 ):
+    if ase_update_every <= 1:
+        raise ValueError("ase_update_every must be positive")
     device = device or (
         "cuda"
         if torch.cuda.is_available()
@@ -338,6 +342,7 @@ def _run_experiment(
             mlflow.log_params(
                 {
                     "repetitions": repetitions,
+                    "ase_update_every": ase_update_every,
                     "budget": len(test),
                     "train_size": len(train),
                     "validation_size": len(validation),
@@ -353,8 +358,21 @@ def _run_experiment(
             mlflow.set_tag("stage", "evaluation")
         reference_metrics = evaluate_model(model, test, config.batch_size, device)
         _log_evaluation(reference_metrics)
+        available_protected_columns = tuple(
+            column for column in reference_metrics["subgroup_metrics"] if column != "age"
+        )
+        if (
+            protected_attribute is not None
+            and protected_attribute not in available_protected_columns
+        ):
+            raise ValueError(
+                f"Protected attribute {protected_attribute!r} is not available in the evaluation data"
+            )
+        protected_columns = available_protected_columns
         if run is not None:
             mlflow.set_tag("stage", "auxiliary_fit")
+            mlflow.log_param("protected_columns", json.dumps(protected_columns))
+            mlflow.log_param("stratification_attribute", protected_attribute or "all")
 
         auxiliary = fit_auxiliary_models(train, test.classes, config, device)
 
@@ -365,8 +383,10 @@ def _run_experiment(
             num_classes=len(test.classes),
             device=device,
             seed=config.random_state,
-            protected_columns=tuple(reference_metrics["subgroup_metrics"]),
+            protected_columns=protected_columns,
+            stratification_attribute=protected_attribute,
             repetitions=repetitions,
+            ase_update_every=ase_update_every,
             budget=len(test),
         )
 
@@ -381,8 +401,10 @@ def _run_experiment(
                 "output_dir": str(output_dir),
                 "resolved_device": str(device),
                 "reuse_trained_model": reuse_trained_model,
-                "protected_columns": list(reference_metrics["subgroup_metrics"]),
+                "protected_columns": list(protected_columns),
+                "stratification_attribute": protected_attribute,
                 "repetitions": repetitions,
+                "ase_update_every": ase_update_every,
                 "budget": len(test),
             },
             "training": {
@@ -424,6 +446,8 @@ def run_dev_experiment(
     checkpoint_dir: Path = MODELS_DIR / "experiment",
     repetitions: int = 25,
     track: bool = True,
+    ase_update_every: int = 50,
+    protected_attribute: str | None = None,
 ):
     # Set defaults if no training config is given
     config = training_config or TrainingConfig(random_state=secrets.randbits(32))
@@ -466,6 +490,8 @@ def run_dev_experiment(
         experiment="AT_dev",
         repetitions=repetitions,
         track=track,
+        ase_update_every=ase_update_every,
+        protected_attribute=protected_attribute,
     )
 
 
@@ -479,6 +505,8 @@ def run_final_experiment(
     checkpoint_dir: Path = MODELS_DIR / "experiment",
     repetitions: int = 25,
     track: bool = True,
+    ase_update_every: int = 50,
+    protected_attribute: str | None = None,
 ):
     try:
         confirmation = input(
@@ -531,6 +559,8 @@ def run_final_experiment(
         experiment="AT_final",
         repetitions=repetitions,
         track=track,
+        ase_update_every=ase_update_every,
+        protected_attribute=protected_attribute,
     )
 
 
@@ -548,6 +578,18 @@ def main():
     parser.add_argument(
         "--repetitions", type=int, default=25, help="Number of AT benchmark repetitions"
     )
+    parser.add_argument(
+        "--ase-update-every",
+        type=int,
+        default=100,
+        help="Refit ASE surrogates after every N acquired labels (default: 50)",
+    )
+    parser.add_argument(
+        "--protected-attribute",
+        choices=("gender", "race", "ethnicity", "language", "maritalstatus", "age_group"),
+        default=None,
+        help="Stratify by one attribute (default: run each available attribute)",
+    )
     parser.add_argument("--seed", type=int, help="Random seed (generated when omitted)")
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"))
     parser.add_argument(
@@ -562,6 +604,8 @@ def main():
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("--repetitions must be positive")
+    if args.ase_update_every < 1:
+        parser.error("--ase-update-every must be positive")
     if args.FINAL and args.experiment == "model_selection":
         parser.error("--FINAL is only available for AT_benchmarking")
     seed = args.seed if args.seed is not None else secrets.randbits(32)
@@ -580,7 +624,15 @@ def main():
         reuse_trained_model=args.reuse_trained_model,
         checkpoint_dir=args.checkpoint_dir,
         track=not args.no_mlflow,
-        **({"repetitions": args.repetitions} if args.experiment == "AT_benchmarking" else {}),
+        **(
+            {
+                "repetitions": args.repetitions,
+                "ase_update_every": args.ase_update_every,
+                "protected_attribute": args.protected_attribute,
+            }
+            if args.experiment == "AT_benchmarking"
+            else {}
+        ),
     )
     if not isinstance(results, pd.DataFrame):
         pprint(results)

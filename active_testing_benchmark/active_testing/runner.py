@@ -1,10 +1,11 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from loguru import logger
 import torch
 from torch import nn
 from tqdm.auto import tqdm
 
+from active_testing_benchmark.active_testing.baseline import StratifiedSampleMean
 from active_testing_benchmark.active_testing.interface import (
     ActiveEvaluationMethod,
     Problem,
@@ -18,13 +19,14 @@ class EvaluationPool:
 
     Methods must treat the shared input tensors as read-only. Labels are never
     included in the Problem passed to methods.
+    Attribute views share tensors. Reporting memberships may span multiple partitions.
     """
 
     X_pool: torch.Tensor
     y_pool: torch.Tensor
-    protected_attributes: list[str]
+    stratification_groups: list[str] | None
     protected_columns: tuple[str, ...]
-    subgroup_memberships: dict[str, dict[str, int]] = field(default_factory=dict)
+    attribute_values: dict[str, list[str]] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.X_pool)
@@ -39,10 +41,20 @@ def prepare_evaluation_pool(
     protected_column = (
         [protected_column] if isinstance(protected_column, str) else list(protected_column)
     )
+    if not protected_column or len(set(protected_column)) != len(protected_column):
+        raise ValueError("Provide nonempty, unique protected columns")
+    if "age" in protected_column:
+        raise ValueError("Use age_group instead of raw age")
     if isinstance(dataset, EvaluationPool):
-        if tuple(protected_column) != dataset.protected_columns:
+        if tuple(protected_column) == dataset.protected_columns:
+            return dataset
+        if any(column not in dataset.attribute_values for column in protected_column):
             raise ValueError("Prepared pool uses different protected columns")
-        return dataset
+        return replace(
+            dataset,
+            protected_columns=tuple(protected_column),
+            stratification_groups=None,
+        )
     if len(dataset) == 0:
         raise ValueError("Evaluation pool must be nonempty")
 
@@ -50,10 +62,9 @@ def prepare_evaluation_pool(
 
     X_pool = []
     y_pool = []
-    protected_attributes = []
-    subgroup_memberships = {}
+    attribute_values = {column: [] for column in protected_column}
 
-    logger.debug(f"Using protected column(s): {protected_column}")
+    logger.debug(f"Reporting attributes: {protected_column}")
 
     for index in range(len(dataset)):
         sample = dataset[index]
@@ -62,15 +73,12 @@ def prepare_evaluation_pool(
         y_pool.append(sample["label"] if "label" in sample else sample["target"])
 
         subgroups = sample.get("subgroups", sample.get("protected", {}))
-        protected_attribute = ", ".join(str(subgroups[col]) for col in protected_column)
-        if len(protected_column) > 1:
-            for col in protected_column:
-                members = subgroup_memberships.setdefault(f"{col}={subgroups[col]}", {})
-                members[protected_attribute] = members.get(protected_attribute, 0) + 1
+        for column in protected_column:
+            attribute_values[column].append(f"{column}={subgroups[column]}")
 
-        protected_attributes.append(protected_attribute)
-
-    logger.debug(f"protected_attributes: {protected_attributes[:10]} (showing first 10)")
+    stratification_groups = None
+    for column, values in attribute_values.items():
+        logger.debug(f"Reporting groups for {column}: {sorted(set(values))}")
 
     logger.debug(f"image shapes: {X_pool[0].shape}, dtype: {X_pool[0].dtype}")
     logger.debug(f"y_pool type: {type(y_pool[0])}")
@@ -86,8 +94,20 @@ def prepare_evaluation_pool(
     )
 
     return EvaluationPool(
-        X_pool, y_pool, protected_attributes, tuple(protected_column), subgroup_memberships
+        X_pool, y_pool, stratification_groups, tuple(protected_column), attribute_values
     )
+
+
+def _reporting_memberships(pool: EvaluationPool) -> dict[str, tuple[int, ...]]:
+    """Build marginal reporting groups for the requested attributes only."""
+    groups: dict[str, list[int]] = {}
+    for column in pool.protected_columns:
+        values = pool.attribute_values.get(column, pool.stratification_groups)
+        if values is None:
+            raise ValueError(f"Missing reporting memberships for {column}")
+        for index, group in enumerate(values):
+            groups.setdefault(group, []).append(index)
+    return {group: tuple(indices) for group, indices in groups.items()}
 
 
 def run_active_evaluation(
@@ -99,8 +119,18 @@ def run_active_evaluation(
     protected_column: list[str] | str,
     budget: int | None = None,
     progress_position: int = 0,
+    stratification_attribute: str | None = None,
 ) -> list[dict]:
     """Run finite-pool active evaluation, returning risk estimates after each batch."""
+    columns = [protected_column] if isinstance(protected_column, str) else protected_column
+    if isinstance(method, StratifiedSampleMean) and stratification_attribute is None:
+        if len(columns) != 1:
+            raise ValueError("Select one protected attribute for stratification")
+        stratification_attribute = columns[0]
+    if not isinstance(method, StratifiedSampleMean) and stratification_attribute is not None:
+        raise ValueError("Only stratified methods use a stratification attribute")
+    if stratification_attribute is not None and stratification_attribute not in columns:
+        raise ValueError("The stratification attribute must be included in reporting columns")
     if loss_fn is None:
         loss_fn = nn.CrossEntropyLoss(reduction="sum")
 
@@ -110,8 +140,15 @@ def run_active_evaluation(
     pool = prepare_evaluation_pool(dataset, device, protected_column)
     X_pool = pool.X_pool
     y_pool = pool.y_pool
-    # Each run gets its own group list; image tensors are shared read-only.
-    protected_attributes = list(pool.protected_attributes)
+    # Reporting metadata covers all selected attributes. Only stratified methods
+    # receive a sampling partition
+    stratification_groups = None
+    if stratification_attribute is not None:
+        values = pool.attribute_values.get(stratification_attribute, pool.stratification_groups)
+        if values is None:
+            raise ValueError("Missing stratification memberships")
+        stratification_groups = list(values)
+    logger.debug(f"Stratification attribute: {stratification_attribute}")
 
     label_budget = len(X_pool) if budget is None else int(budget)
     if not 0 <= label_budget <= len(X_pool):
@@ -122,9 +159,10 @@ def run_active_evaluation(
         N=len(X_pool),
         budget=label_budget,
         X_pool=X_pool,
-        protected_attribute=protected_attributes,
+        stratification_groups=stratification_groups,
         model=model,
         loss_fn=loss_fn,
+        subgroup_indices=_reporting_memberships(pool),
     )
 
     # Create the inital state
@@ -177,20 +215,6 @@ def run_active_evaluation(
         state = method.observe(state, selection, labels, losses)
 
         estimate = method.estimate(state, history)
-        # Marginal subgroup risks are population-weighted means of the joint group estimates.
-        # Preserve missing estimates rather than treating unobserved groups as zero risk.
-        for group, members in pool.subgroup_memberships.items():
-            risks = [estimate.subgroup_risks[joint] for joint in members]
-            estimate.subgroup_risks[group] = (
-                sum(size * risk for size, risk in zip(members.values(), risks))
-                / sum(members.values())
-                if all(risk is not None for risk in risks)
-                else None
-            )
-            estimate.subgroup_n_labels[group] = sum(
-                estimate.subgroup_n_labels[joint] for joint in members
-            )
-
         # Add the current information about the current selection batch
         # including the current risk estimates to history
         history.append(
@@ -199,7 +223,7 @@ def run_active_evaluation(
                 "total selections": len(state["selections"]),
                 "selection": selection,
                 "labels": labels.to("cpu").tolist(),
-                "protected_attribute_group": [state["group_by_index"][i] for i in indices],
+                "stratification_groups": selection.stratification_groups,
                 "losses": losses,
                 "estimate": estimate,
             }

@@ -1,9 +1,9 @@
 """Active finite-pool risk estimation runner for FairVision image-classification."""
 
-from collections import Counter
 from collections.abc import Callable, Iterable
 import statistics
 
+from loguru import logger
 import numpy as np
 from scipy.special import softmax
 import torch
@@ -14,6 +14,7 @@ from active_testing_benchmark.active_testing.interface import (
     Estimate,
     Problem,
     SelectionPlan,
+    get_subgroup_indices,
 )
 
 # ---------------------------------------------------------------------------
@@ -175,10 +176,11 @@ def _initialize_common_state(
         mut_logits, problem.loss_fn, loss_type
     )
 
-    groups = problem.protected_attribute
-    if groups and len(groups) != N:
-        raise ValueError("Protected attributes must match pool length")
-    sizes = dict(Counter(groups))
+    groups = problem.stratification_groups
+    if groups is not None and len(groups) != N:
+        raise ValueError("Stratification groups must match pool length")
+    subgroup_indices = get_subgroup_indices(problem)
+    sizes = {group: len(indices) for group, indices in subgroup_indices.items()}
 
     return {
         "N": N,
@@ -192,7 +194,8 @@ def _initialize_common_state(
         "selected_order": [],
         "observed_labels": [],
         "observed_losses": [],
-        "group_by_index": groups,
+        "stratification_group_by_index": groups,
+        "subgroup_indices": subgroup_indices,
         "subgroup_sizes": sizes,
         "subgroup_counts": {g: 0 for g in sizes},
         "surrogate_members": None,
@@ -250,9 +253,9 @@ def _record_observation(
 
     # Record how many labels have been acquired within each known protected subgroup.
     for index in indices:
-        group = state["group_by_index"][index]
-        if group in state["subgroup_counts"]:
-            state["subgroup_counts"][group] += 1
+        for group, subgroup_indices in state["subgroup_indices"].items():
+            if index in subgroup_indices:
+                state["subgroup_counts"][group] += 1
 
     return state
 
@@ -280,6 +283,7 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
 
     Surrogate models must be fitted without evaluation-pool labels in advance.
     With surrogate_update, newly acquired labels may be used after observation.
+
     num_classes is the number of classes expected from the target and surrogates.
     """
 
@@ -353,6 +357,7 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         )
 
         state = self._refresh_predictions(state)
+        state["next_surrogate_update"] = self.update_every
 
         return state
 
@@ -383,6 +388,9 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
             state["remaining_budget"],
             len(state["remaining"]),
         )
+        if self.surrogate_update is not None:
+            # Ensure that the surrogate is updated every self.update_every labels
+            count = min(count, state["next_surrogate_update"] - len(state["selections"]))
         if count <= 0:
             raise ValueError("No remaining budget or unlabeled items")
 
@@ -399,7 +407,11 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
             indices=[int(i) for i in indices],
             selection_probabilities=None,
             inclusion_probabilities=None,
-            protected_attribute_group=[state["group_by_index"][i] for i in indices],
+            stratification_groups=(
+                [state["stratification_group_by_index"][i] for i in indices]
+                if state["stratification_group_by_index"] is not None
+                else None
+            ),
             metadata={"design": "ase_surrogate_interpolation", "acquisition": self.acquisition},
         )
 
@@ -408,20 +420,27 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         indices, y, l = _validate_observation(state, selection, new_labels, new_losses)
 
         # Update state
-        previous_count = len(state["selections"])
         state = _record_observation(state, indices, y, l)
+        current_count = len(state["selections"])
+        threshold = state["next_surrogate_update"]
 
-        # Update the surrogate if enabled
-        if (
-            self.surrogate_update is not None
-            and len(state["selections"]) // self.update_every > previous_count // self.update_every
-        ):
+        # Anchor refits to absolute label thresholds. If a supplied batch crosses
+        # several thresholds, refit once with all observations and schedule the
+        # next multiple, rather than waiting update_every labels from this refit.
+        if self.surrogate_update is not None and current_count >= threshold:
             X_seen = state["X_pool"][state["selected_order"]]
             y_seen = torch.as_tensor(
                 state["observed_labels"], device=X_seen.device, dtype=torch.long
             )
             self.surrogate_update(self.surrogate, X_seen, y_seen)
             state = self._refresh_predictions(state)
+            state["next_surrogate_update"] = (
+                current_count // self.update_every + 1
+            ) * self.update_every
+            logger.trace(
+                f"ASE surrogate refit at {current_count} acquired labels "
+                f"(scheduled threshold: {threshold}; next: {state['next_surrogate_update']})"
+            )
         return state
 
     def estimate(self, state: dict, history: list[dict]) -> Estimate:
@@ -432,12 +451,9 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
             state["surrogate_members"].mean(axis=0) * state["hypothetical_losses"]
         ).sum(axis=1)
         group_risks = {}
-        groups = state["group_by_index"]
-
         # Subgroup risk estimation
-        for g in state["subgroup_sizes"]:
-            mask = np.array([member == g for member in groups], dtype=bool)
-            group_risks[g] = float(expected_losses[mask].mean())
+        for group, indices in state["subgroup_indices"].items():
+            group_risks[group] = float(expected_losses[list(indices)].mean())
 
         return Estimate(
             risk=float(expected_losses.mean()),
@@ -613,10 +629,8 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
 
         # Save loss mean for subgroups for subgroup estimations
         group_means = {}
-        groups = state["group_by_index"]
-        for g in state["subgroup_sizes"]:
-            mask = np.array([member == g for member in groups], dtype=bool)
-            group_means[g] = float(losses[mask].mean())
+        for group, indices in state["subgroup_indices"].items():
+            group_means[group] = float(losses[list(indices)].mean())
         state["proxy_group_means"] = group_means
 
         state["centered_proxy_losses"] = losses - state["proxy_mean"]
@@ -686,7 +700,11 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
             indices=indices,
             selection_probabilities=q_selected,
             inclusion_probabilities=None,
-            protected_attribute_group=[state["group_by_index"][i] for i in indices],
+            stratification_groups=(
+                [state["stratification_group_by_index"][i] for i in indices]
+                if state["stratification_group_by_index"] is not None
+                else None
+            ),
             metadata={
                 "design": "ppat_rms_residual_without_replacement",
                 "lambda_at_acquisition": float(state["lambda"]),
@@ -773,18 +791,18 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
 
         # Compute subgroup risk
         subgroup_risks = {}
-        groups = state["group_by_index"]
         # TODO: Currently if no point from subgroup g has been acquired, this indicator-weighted
         # LURE subgroup estimate evaluates to 0. This is not an observed zero loss.
-        for g, size in state["subgroup_sizes"].items():
-            group_mask = np.array([groups[i] == g for i in selected], dtype=bool)
+        for group, indices in state["subgroup_indices"].items():
+            size = state["subgroup_sizes"][group]
+            group_mask = np.array([i in indices for i in selected], dtype=bool)
             # Subgroup controls must be centered at their own
             # subgroup means for the indicator-weighted LURE sum to be unbiased.
             centered_losses_g = observed_losses[group_mask] - lambda_ * (
-                state["proxy_losses"][selected[group_mask]] - state["proxy_group_means"][g]
+                state["proxy_losses"][selected[group_mask]] - state["proxy_group_means"][group]
             )
             # subgroup LURE means
-            subgroup_risks[g] = float(
+            subgroup_risks[group] = float(
                 N * np.dot(lure_weights[group_mask], centered_losses_g) / (n * size)
             )
 
@@ -798,7 +816,7 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
             # Theorem 4.1, Eq. 15/16: asymptotic variance and normal CI from the PPAT paper.
             # Requires sufficient budget and paper's overlap/moment assumptions.
             m = np.arange(1, n + 1, dtype=np.float64)
-            gamma = n * (N - n) / ((N - m) * (N - m + 1))
+            gamma = N * (N - n) / ((N - m) * (N - m + 1))
             q = np.asarray(state["selection_probs"], dtype=np.float64)
 
             A = (

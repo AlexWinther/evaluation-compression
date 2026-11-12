@@ -1,4 +1,3 @@
-from collections import Counter
 from collections.abc import Callable
 
 import numpy as np
@@ -11,6 +10,7 @@ from active_testing_benchmark.active_testing.interface import (
     Estimate,
     Problem,
     SelectionPlan,
+    get_subgroup_indices,
 )
 
 
@@ -168,10 +168,10 @@ class KossenActiveTesting(ActiveEvaluationMethod):
             label_smoothing = 0.0
             loss_denominators = np.ones(self.num_classes, dtype=np.float64)
 
-        groups = problem.protected_attribute
-        # TODO: add the posibility of no protected attributes being given for all AT methods
+        groups = problem.stratification_groups
 
-        sizes = dict(Counter(groups))
+        subgroup_indices = get_subgroup_indices(problem)
+        sizes = {group: len(indices) for group, indices in subgroup_indices.items()}
 
         return {
             "N": N,
@@ -190,7 +190,8 @@ class KossenActiveTesting(ActiveEvaluationMethod):
             "selection_probs": [],
             "observed_losses": [],
             "observed_labels": [],
-            "group_by_index": groups,
+            "stratification_group_by_index": groups,
+            "subgroup_indices": subgroup_indices,
             "subgroup_sizes": sizes,
             "subgroup_counts": {g: 0 for g in sizes},
         }
@@ -284,7 +285,11 @@ class KossenActiveTesting(ActiveEvaluationMethod):
             indices=selected,
             selection_probabilities=selection_probs,
             inclusion_probabilities=None,
-            protected_attribute_group=[state["group_by_index"][i] for i in selected],
+            stratification_groups=(
+                [state["stratification_group_by_index"][i] for i in selected]
+                if state["stratification_group_by_index"] is not None
+                else None
+            ),
             metadata={
                 "design": "kossen_active_testing_lure_without_replacement",
                 "acquisition": self.acquisition,
@@ -332,11 +337,11 @@ class KossenActiveTesting(ActiveEvaluationMethod):
         state["selection_probs"].extend(q_array.tolist())
         state["observed_losses"].extend(loss_array.tolist())
 
-        # Keep track of subgroup counts
+        # Count each selected item in every reporting group containing it.
         for index in indices:
-            group = state["group_by_index"][index]
-            if group in state["subgroup_counts"]:
-                state["subgroup_counts"][group] += 1
+            for group, subgroup in state["subgroup_indices"].items():
+                if index in subgroup:
+                    state["subgroup_counts"][group] += 1
 
         if self.surrogate_update is not None and self.surrogate:
             state["observed_labels"].extend(
@@ -387,7 +392,6 @@ class KossenActiveTesting(ActiveEvaluationMethod):
         # Apply the same LURE estimator to indicator-weighted losses for
         # each group, then rescale by N/N_g. Leave groups without acquired labels
         # undefined in the returned estimate.
-        groups = state["group_by_index"]
         selected = state["selected_order"]
 
         subgroup_risks = {}
@@ -397,7 +401,9 @@ class KossenActiveTesting(ActiveEvaluationMethod):
                 continue
 
             group_total = sum(
-                weighted_losses[j] for j, index in enumerate(selected) if groups[index] == group
+                weighted_losses[j]
+                for j, index in enumerate(selected)
+                if index in state["subgroup_indices"][group]
             )
             subgroup_risks[group] = float(N * group_total / (n * size))
 

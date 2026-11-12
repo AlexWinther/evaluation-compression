@@ -16,7 +16,7 @@ class SelectionPlan:
     indices: list[int]
     selection_probabilities: list[float] | None = None
     inclusion_probabilities: list[float] | None = None
-    protected_attribute_group: list[Hashable] | None = None
+    stratification_groups: list[Hashable] | None = None
     metadata: dict | None = None
 
 
@@ -48,9 +48,31 @@ class Problem:
     N: int
     budget: int
     X_pool: torch.Tensor
-    protected_attribute: list[Hashable]
+    stratification_groups: list[str] | None
     model: nn.Module
     loss_fn: nn.Module
+
+    # Reporting groups may overlap. Stratification_groups defines the sampling partition.
+    subgroup_indices: dict[str, tuple[int, ...]] | None = None
+
+
+def get_subgroup_indices(problem: Problem) -> dict[Hashable, set[int]]:
+    """Return reporting memberships, defaulting to the sampling partition.
+
+    Marginal groups overlap across attributes but each group contains a pool index
+    at most once. Memberships use known metadata, never evaluation labels.
+    """
+    if problem.subgroup_indices is None:
+        groups: dict[Hashable, set[int]] = {}
+        for index, group in enumerate(problem.stratification_groups or []):
+            groups.setdefault(group, set()).add(index)
+        return groups
+    groups = {group: set(indices) for group, indices in problem.subgroup_indices.items()}
+    if any(
+        not indices or any(i < 0 or i >= problem.N for i in indices) for indices in groups.values()
+    ):
+        raise ValueError("Reporting subgroups must contain valid, nonempty pool indices")
+    return groups
 
 
 class ActiveEvaluationMethod:
