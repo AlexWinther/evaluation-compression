@@ -136,6 +136,7 @@ class FairVisionData(Dataset):
                 labels.append(float(self.class_to_idx[label]))
                 subgroups = {name: _text(record[name]) for name in SUBGROUP_COLUMNS}
                 subgroups["age_group"] = _age_group(subgroups["age"])
+                del subgroups["age"]
                 self.subgroups.append(subgroups)
 
         if len(set(ids)) != len(ids):

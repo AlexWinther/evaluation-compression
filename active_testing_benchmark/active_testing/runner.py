@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from loguru import logger
 import torch
@@ -24,6 +24,7 @@ class EvaluationPool:
     y_pool: torch.Tensor
     protected_attributes: list[str]
     protected_columns: tuple[str, ...]
+    subgroup_memberships: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.X_pool)
@@ -50,6 +51,7 @@ def prepare_evaluation_pool(
     X_pool = []
     y_pool = []
     protected_attributes = []
+    subgroup_memberships = {}
 
     logger.debug(f"Using protected column(s): {protected_column}")
 
@@ -57,11 +59,14 @@ def prepare_evaluation_pool(
         sample = dataset[index]
 
         X_pool.append(sample["image"])
-        y_pool.append(sample["target"])
+        y_pool.append(sample["label"] if "label" in sample else sample["target"])
 
-        protected_attribute = ", ".join(
-            str(sample["protected"].get(col)) for col in protected_column or []
-        )
+        subgroups = sample.get("subgroups", sample.get("protected", {}))
+        protected_attribute = ", ".join(str(subgroups[col]) for col in protected_column)
+        if len(protected_column) > 1:
+            for col in protected_column:
+                members = subgroup_memberships.setdefault(f"{col}={subgroups[col]}", {})
+                members[protected_attribute] = members.get(protected_attribute, 0) + 1
 
         protected_attributes.append(protected_attribute)
 
@@ -80,7 +85,9 @@ def prepare_evaluation_pool(
         f"Loaded {len(X_pool):,} samples for active evaluation with {len(y_pool.unique()):,} unique classes"
     )
 
-    return EvaluationPool(X_pool, y_pool, protected_attributes, tuple(protected_column))
+    return EvaluationPool(
+        X_pool, y_pool, protected_attributes, tuple(protected_column), subgroup_memberships
+    )
 
 
 def run_active_evaluation(
@@ -169,6 +176,21 @@ def run_active_evaluation(
         # The state is updated, optionally including a learned surrogate model
         state = method.observe(state, selection, labels, losses)
 
+        estimate = method.estimate(state, history)
+        # Marginal subgroup risks are population-weighted means of the joint group estimates.
+        # Preserve missing estimates rather than treating unobserved groups as zero risk.
+        for group, members in pool.subgroup_memberships.items():
+            risks = [estimate.subgroup_risks[joint] for joint in members]
+            estimate.subgroup_risks[group] = (
+                sum(size * risk for size, risk in zip(members.values(), risks))
+                / sum(members.values())
+                if all(risk is not None for risk in risks)
+                else None
+            )
+            estimate.subgroup_n_labels[group] = sum(
+                estimate.subgroup_n_labels[joint] for joint in members
+            )
+
         # Add the current information about the current selection batch
         # including the current risk estimates to history
         history.append(
@@ -179,7 +201,7 @@ def run_active_evaluation(
                 "labels": labels.to("cpu").tolist(),
                 "protected_attribute_group": [state["group_by_index"][i] for i in indices],
                 "losses": losses,
-                "estimate": method.estimate(state, history),
+                "estimate": estimate,
             }
         )
         pbar.update(len(indices))

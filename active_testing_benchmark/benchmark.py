@@ -16,18 +16,18 @@ from active_testing_benchmark.active_testing.losses import ZeroOneLoss
 from active_testing_benchmark.active_testing.runner import prepare_evaluation_pool
 
 
-def build_method_configs(auxiliary, num_classes: int):
+def build_method_configs(auxiliary, num_classes: int, batch_size: int = 10):
     """Construct the benchmark's six existing method configurations."""
     method_configs = [
-        (UniformSampleMean, {"batch_size": 10}),
-        (StratifiedSampleMean, {"allocation": "balanced", "batch_size": 10}),
-        (StratifiedSampleMean, {"allocation": "proportional", "batch_size": 10}),
+        (UniformSampleMean, {"batch_size": batch_size}),
+        (StratifiedSampleMean, {"allocation": "balanced", "batch_size": batch_size}),
+        (StratifiedSampleMean, {"allocation": "proportional", "batch_size": batch_size}),
         (
             KossenActiveTesting,
             {
                 "surrogate": auxiliary.surrogates[0],
                 "num_classes": num_classes,
-                "batch_size": 10,
+                "batch_size": batch_size,
             },
         ),
         (
@@ -38,7 +38,7 @@ def build_method_configs(auxiliary, num_classes: int):
                 "acquisition": "xwed",
                 "loss_type": "cross_entropy",
                 "surrogate_output": "logits",
-                "batch_size": 10,
+                "batch_size": batch_size,
             },
         ),
         (
@@ -50,7 +50,7 @@ def build_method_configs(auxiliary, num_classes: int):
                 "lambda_value": 0.5,
                 "exploration": 0.05,
                 "loss_type": "cross_entropy",
-                "batch_size": 10,
+                "batch_size": batch_size,
             },
         ),
     ]

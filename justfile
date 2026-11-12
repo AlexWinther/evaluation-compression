@@ -35,10 +35,10 @@ data disease="dr" *args: requirements
 fairvision-metadata disease="dr" *args: requirements
     dataset_disease="$1"; shift; uv run python -m active_testing_benchmark.dataset --disease "$dataset_disease" --metadata-only "$@"
 
-# Run the development experiment with full classifier training; accepts experiment CLI flags
+# Run the new AT development benchmark; accepts experiment CLI flags
 experiment *args: requirements
-    uv run python -m active_testing_benchmark.experiment "$@"
+    uv run python -m active_testing_benchmark.new_experiment "$@"
 
-# Run the development experiment with classifier training capped at ten batches per phase
-experiment-fast *args: requirements
-    uv run python -m active_testing_benchmark.experiment --training-mode fast "$@"
+# Compare ResNet-18 and EfficientNet-B0 using the new training pipeline
+model-selection *args: requirements
+    uv run python -m active_testing_benchmark.new_experiment --experiment model_selection "$@"

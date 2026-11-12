@@ -10,10 +10,11 @@ import torch
 from torch import nn
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from tqdm.auto import tqdm
 
+from active_testing_benchmark.active_testing.surrogate import RandomForestModule
 from active_testing_benchmark.config import RAW_DATA_DIR
 from active_testing_benchmark.modeling.models import create_model
 from active_testing_benchmark.modeling.new import FairVisionData, prepare_data
@@ -30,6 +31,8 @@ class TrainingConfig:
 
     validation_fraction: float = 0.2
     random_state: int = 42
+    seed: int = 42
+    num_workers: int = 0
 
 
 @dataclass(init=False)
@@ -57,14 +60,14 @@ class TrainingSetup:
 
 
 def split_dataset(
-    dataset: Dataset,
+    dataset: FairVisionData,
     labels: np.ndarray,
     *,
     strategy: str = "holdout",
     validation_fraction: float = 0.2,
     n_splits: int = 5,
     random_state: int = 42,
-) -> Iterator[tuple[Subset[Dataset], Subset[Dataset]]]:
+) -> Iterator[tuple[Subset[FairVisionData], Subset[FairVisionData]]]:
     if strategy == "holdout":
         splitter = StratifiedShuffleSplit(
             n_splits=1,
@@ -90,31 +93,16 @@ def split_dataset(
 def train_model(
     training_setup: TrainingSetup,
     training_config: TrainingConfig,
-    training_data: FairVisionData,
+    training_dataset: FairVisionData | Subset[FairVisionData],
+    val_dataset: FairVisionData | Subset[FairVisionData],
     device: torch.device | str = "mps",
-    *,
-    validation_data: Dataset | None = None,
 ):
-    """Return the best model and history, splitting training data only if validation is omitted."""
+    """Return the best model and history, based on best validation checkpoint."""
     model = training_setup.model.to(device)
 
     logger.info(
         f"Starting training of {model.__module__} with {training_config.max_epochs} max epochs"
     )
-
-    if validation_data is None:
-        labels = training_data.labels.copy()
-        logger.info(f"Loaded {len(labels)} labels from training data")
-        splits = split_dataset(
-            training_data,
-            labels,
-            strategy="holdout",
-            validation_fraction=training_config.validation_fraction,
-            random_state=training_config.random_state,
-        )
-        training_dataset, val_dataset = next(splits)
-    else:
-        training_dataset, val_dataset = training_data, validation_data
 
     train_loader = DataLoader(
         training_dataset, batch_size=training_config.batch_size, shuffle=True
@@ -220,6 +208,36 @@ def train_model(
     return model, history
 
 
+@dataclass
+class AuxiliaryModels:
+    surrogates: tuple[RandomForestModule, RandomForestModule]
+    proxy: RandomForestModule
+    seeds: tuple[int, int, int]
+
+
+def fit_auxiliary_models(
+    dataset: FairVisionData | Subset[FairVisionData],
+    classes: list[str],
+    config: TrainingConfig,
+    device: torch.device | str,
+):
+    """Fit the two active-testing surrogates and proxy on all development images."""
+    children = np.random.SeedSequence(config.random_state).spawn(3)
+    seeds = tuple(int(child.generate_state(1)[0]) for child in children)
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=device.type == "cuda" if isinstance(device, torch.device) else device == "cuda",
+    )
+    forests = tuple(
+        RandomForestModule(num_classes=len(classes), random_state=seed).fit(loader, device=device)
+        for seed in seeds
+    )
+    return AuxiliaryModels((forests[0], forests[1]), forests[2], seeds)
+
+
 def main():
     training_config = TrainingConfig(
         max_epochs=10,
@@ -263,7 +281,7 @@ def main():
         scheduler=scheduler,
     )
 
-    train_model(training_setup, training_config, data.train, validation_data=data.test)
+    train_model(training_setup, training_config, data.train, val_dataset=data.test)
 
 
 if __name__ == "__main__":

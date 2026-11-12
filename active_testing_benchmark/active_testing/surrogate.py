@@ -41,14 +41,14 @@ class RandomForestModule(nn.Module):
         features = self.feature_extractor(images)
         return features.flatten(1).cpu().numpy()
 
-    def fit(self, dataloader, device="cpu"):
+    def fit(self, dataloader, device: torch.device | str = "cpu"):
         self.feature_extractor.to(device).eval()
 
         X, y = [], []
 
         for batch in tqdm(dataloader, desc="Extracting features for Random Forest training"):
             images = batch["image"]
-            labels = batch["target"]
+            labels = batch["label"]
 
             features = self._extract_features(images.to(device))
             X.append(features)

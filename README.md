@@ -14,7 +14,7 @@ Install [uv](https://docs.astral.sh/uv/) and [just](https://just.systems/), then
 ```bash
 just requirements              # Sync dependencies from uv.lock
 just test                      # Run the test suite
-just test tests/test_experiment.py -q
+just test tests/test_runner_subgroups.py -q
 just lint                      # Check formatting and lint rules
 just format                    # Apply formatting and lint fixes
 ```
@@ -22,7 +22,7 @@ just format                    # Apply formatting and lint fixes
 ## FairVision raw data
 
 The FairVision downloader retains the standalone, original-resolution SLO fundus
-JPEGs and the disease metadata CSVs only; it does not download or retain the 3D
+JPEGs and the disease metadata CSVs only. It does not download or retain the 3D
 OCT-containing NPZ files. For example:
 
 ```bash
@@ -30,7 +30,7 @@ just fairvision-metadata glaucoma
 just data glaucoma
 ```
 
-The disease defaults to `dr`; pass `amd`, `glaucoma`, or `all` as the first
+The disease defaults to `dr`. Pass `amd`, `glaucoma`, or `all` as the first
 argument. Additional downloader flags follow it, for example
 `just data glaucoma --output-dir /path/to/fairvision`.
 
@@ -38,16 +38,15 @@ Files are written below `data/raw/fairvision/` by default. The image command use
 HTTP byte ranges to retrieve selected JPEG members from the upstream ZIP rather
 than transferring the complete 40--63 GB disease archive. See the
 [upstream FairVision dataset](https://huggingface.co/datasets/harvardairobotics/FairVision)
-for its CC BY-NC-ND 4.0 license; it is for non-commercial research and not for
+for its CC BY-NC-ND 4.0 license. It is for non-commercial research and not for
 clinical decisions or patient care.
 
 ## Image-classification experiments
 
-The downloaded DR SLO images already use FairVision's `training`, `validation`,
-and `test` splits. The default command reads
-`data/raw/fairvision/dr/metadata.csv`, maps its `filename` entries such as
-`data_09382.npz` to `test/slo_fundus_09382.jpg`, and uses `dr` as the binary
-target. Raw images are never copied or changed.
+Experiments run through `active_testing_benchmark.new_experiment`. The new
+dataset reads FairVision's metadata and SLO images from
+`data/raw/fairvision/<disease>/`, preserving its `training`, `validation`, and
+`test` splits. Raw images are never copied or changed.
 
 Run the development benchmark (the recipe first syncs dependencies):
 
@@ -55,68 +54,92 @@ Run the development benchmark (the recipe first syncs dependencies):
 just experiment --seed 42
 ```
 
-The experiment uses `train` for development and `val` for active evaluation.
-A seeded, stratified 20% of development data selects the pilot duration; a fresh
-ResNet-18 is then refitted on all development data. Training defaults to ten pilot
-epochs, inverse-frequency weighted loss, and earliest-minimum class-balanced
-validation cross-entropy. The evaluation pool never determines model selection.
-Final experiments involving the test split remain blocked.
+Development AT experiment trains ResNet-18 on a stratified 80% of FairVision's training
+split. The remaining 20% selects the checkpoint with the highest ROC AUC. Ties
+keep the earliest checkpoint. The restored model is evaluated and benchmarked
+on FairVision validation. Training defaults to 10 epochs, batch size 32,
+pretrained ImageNet weights, unweighted cross-entropy, AdamW, and cosine learning
+rate scheduling. A random seed is generated and logged unless `--seed` is given.
 
-For pipeline development, replace classifier training with a bounded real loop:
+A seperate model selection experiment comparing ResNet-18 and EfficientNet-B0 can be run:
 
 ```bash
-just experiment-fast --seed 42
+just model-selection --seed 42
+
+# Equivalent to:
+just experiment --experiment model_selection --seed 42
 ```
 
-Fast mode runs one pilot epoch and one fresh refit epoch, each capped at ten
-batches. Counts and weights still use the complete relevant training partition.
-Ten batches do not guarantee observing every class. Validation, surrogate/proxy
-forest fitting, reference inference, and active testing still run in full.
-This mode checks the pipeline; its results should not be used as trained-model
-benchmark evidence.
+Both models use the same 80/20 training split. Their best checkpoints are compared
+on FairVision validation. This command does not run AT methods or use test data.
 
-Use `--epochs`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--image-size`,
-and `--num-workers` to configure training. `--no-weighted-loss` and
-`--selection-objective unweighted_cross_entropy` independently control fitting
-and epoch selection. `--weighted-sampling` enables inverse-frequency sampling.
-ResNet-18 uses pretrained ImageNet weights by default; `--no-pretrained` avoids
-the weight download. `--device cpu` bypasses accelerator selection.
+AT benchmarking runs uniform, balanced/proportional stratified, Kossen,
+active-surrogate, and prediction-powered methods. It estimates unweighted
+cross-entropy risk overall and by subgroup, including `age_group`. Each method
+runs for `--repetitions` (default 25), with a max label budget equal to the full
+evaluation pool in 10 label increments.
 
-The benchmark retains uniform, balanced/proportional stratified, Kossen,
-active-surrogate, and prediction-powered methods. Each runs for `--repetitions`
-(default 1) with `--budget` labels (default 1000, no greater than the evaluation
-pool size). `--no-class-balanced-at` disables the additional balanced-risk
-objective without changing training or selection.
-
-Both experiment recipes forward CLI flags, for example:
+The recipes forward CLI flags, for example:
 
 ```bash
 just experiment --repetitions 5 --seed 42 --epochs 20
-just experiment-fast --seed 42 --device cpu --budget 100 --no-pretrained
+just model-selection --epochs 10 --batch-size 16 --device cpu
 just experiment --help
 ```
 
-Each run writes a uniquely named CSV and JSON sidecar beneath
-`results/active-testing/`, configurable with `--output-dir`. CSV rows contain
-method, objective, repetition, seed, label counts, and risk estimates. JSON stores
-resolved configuration and seeds, training history and mode, class counts and
-weights, and full-pool reference metrics. No MLflow credentials are required.
-`--data-root` selects an alternative FairVision root and `--disease` selects
-`dr`, `glaucoma`, or `amd`.
+Use `--disease dr|amd|glaucoma` to select the disease (they must be downloaded
+before running the experiment). All available CLI flags and arguments can be
+found with `--help`. Additional training
+settings, such as image size and learning rate, are configured through
+`modeling.new_train.TrainingConfig`.
 
-Python callers use `run_experiment(ExperimentConfig(...))`, which returns an
-`ExperimentResult` with curves, reference metrics, training metadata, resolved
-configuration, and artifact paths. `modeling.preparation` prepares partitions;
-`modeling.train` owns classifier and auxiliary fitting; `modeling.evaluation`
-computes reference metrics; `benchmark` constructs methods and runs repetitions.
-The full and fast classifier trainers accept the same prepared data,
-`TrainingConfig`, and device and return the same `TrainingResult` type.
+Best checkpoints are saved under `models/new-experiment/`, separated by
+`model_selection`, `AT_dev`, or `AT_final`, then disease and model name. A fresh
+training run replaces the checkpoint at its corresponding path. To load an
+existing checkpoint and skip classifier training:
+
+```bash
+just experiment --reuse-trained-model --seed 42
+just model-selection --reuse-trained-model
+```
+
+`--checkpoint-dir` selects another checkpoint root. Reuse requires a matching
+checkpoint. AT still fits its auxiliary forests and runs evaluation and
+benchmarking. Checkpoints retain their original training configuration, seed,
+and history.
+
+Final AT trains on FairVision training, selects the best checkpoint on FairVision
+validation, and evaluates on test:
+
+```bash
+just experiment --FINAL --seed 42
+```
+
+This requires typing `FINAL` at the interactive prompt before any final-experiment
+data is loaded. The prompt also applies when reusing a final checkpoint.
+`--FINAL` is unavailable for model selection.
+
+AT runs save uniquely named curves CSVs and matching metadata JSON files under
+`reports/active-testing/AT_benchmarking/`. Curves contain methods, objectives,
+repetitions, seeds, label counts, and overall/subgroup risk estimates. Metadata
+records configuration, checkpoint details, training history, auxiliary seeds,
+dataset sizes, and full-pool reference metrics. Model selection writes
+`comparison.csv` and `history.json` under
+`reports/active-testing/model-comparison/`. These are replaced on subsequent runs.
+
+Python callers use `run_dev_experiment()`, `run_final_experiment()`, or
+`run_model_selection_experiment()` from `new_experiment`. The AT functions return
+reference metrics. Model selection returns a comparison DataFrame. They accept
+`training_config`, `data_root`, `output_dir`, `checkpoint_dir`, and
+`reuse_trained_model`. AT functions also accept `repetitions`.
+`modeling.new` owns the dataset, `modeling.new_train` owns training and auxiliary
+fitting, and `benchmark` owns repeated active evaluation.
 
 ## Acknowledgment
 
 The weekly meeting notes are inspired by the
 [WhitakerLabProjectManagement](https://github.com/WhitakerLab/WhitakerLabProjectManagement)
-repository. We thank its makers for sharing their approach.
+repository. Thank you to its makers for sharing their approach.
 
 ## Project Organization
 
@@ -130,7 +153,7 @@ repository. We thank its makers for sharing their approach.
 │   ├── processed      <- The final, canonical data sets for modeling.
 │   └── raw            <- The original, immutable data dump.
 │
-├── docs               <- A default mkdocs project; see www.mkdocs.org for details
+├── docs               <- A default mkdocs project. See www.mkdocs.org for details
 │
 ├── models             <- Trained and serialized models, model predictions, or model summaries
 │
@@ -138,8 +161,7 @@ repository. We thank its makers for sharing their approach.
 │                         the creator's initials, and a short `-` delimited description, e.g.
 │                         `1.0-jqp-initial-data-exploration`.
 │
-├── pyproject.toml     <- Project configuration file with package metadata for 
-│                         active_testing_benchmark and configuration for tools like black
+├── pyproject.toml     <- Package dependencies and Ruff configuration
 │
 ├── references         <- Data dictionaries, manuals, and all other explanatory materials.
 │
@@ -156,14 +178,19 @@ repository. We thank its makers for sharing their approach.
     │
     ├── dataset.py              <- Scripts to download or generate data
     │
-    ├── features.py             <- Code to create features for modeling
+    ├── new_experiment.py       <- Current model-selection and AT experiment entry point
+    ├── benchmark.py            <- AT methods, objectives, and repetitions
+    ├── active_testing         <- Sampling methods, estimators, runner, and surrogates
     │
-    ├── modeling                
-    │   ├── __init__.py 
-    │   ├── predict.py          <- Code to run model inference with trained models          
-    │   └── train.py            <- Code to train models
+    ├── modeling
+    │   ├── __init__.py
+    │   ├── new.py              <- Current FairVision dataset and data preparation
+    │   ├── new_train.py        <- Current classifier and auxiliary-model training
+    │   ├── models.py           <- Model factories and image transforms
+    │   └── ...                 <- Older pipeline and optional MLflow tooling
     │
-    └── plots.py                <- Code to create visualizations
+    ├── experiment.py           <- Older experiment entry point, retained during migration
+    └── plots.py                <- Plotting utility for an older results format
 ```
 
 --------
