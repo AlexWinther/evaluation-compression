@@ -24,9 +24,9 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from active_testing_benchmark.benchmark import run_benchmark
 from active_testing_benchmark.config import CLASS_TO_IDX, MODELS_DIR, PROJ_ROOT, RAW_DATA_DIR
+from active_testing_benchmark.modeling.data import FairVisionData, prepare_data
 from active_testing_benchmark.modeling.models import create_image_transform, create_model
-from active_testing_benchmark.modeling.new import FairVisionData, prepare_data
-from active_testing_benchmark.modeling.new_train import (
+from active_testing_benchmark.modeling.train import (
     TrainingConfig,
     TrainingSetup,
     fit_auxiliary_models,
@@ -149,7 +149,7 @@ def run_model_selection_experiment(
     data_root: Path = RAW_DATA_DIR / "fairvision",
     output_dir: Path = PROJ_ROOT / "reports" / "active-testing" / "model-comparison",
     reuse_trained_model: bool = False,
-    checkpoint_dir: Path = MODELS_DIR / "new-experiment",
+    checkpoint_dir: Path = MODELS_DIR / "experiment",
 ) -> pd.DataFrame:
     """Select checkpoints on 20% of train, then compare models on FairVision validation."""
     config = replace(
@@ -334,7 +334,7 @@ def run_dev_experiment(
     data_root: Path = RAW_DATA_DIR / "fairvision",
     output_dir: Path = PROJ_ROOT / "reports" / "active-testing" / "AT_benchmarking",
     reuse_trained_model: bool = False,
-    checkpoint_dir: Path = MODELS_DIR / "new-experiment",
+    checkpoint_dir: Path = MODELS_DIR / "experiment",
     repetitions: int = 25,
 ):
     # Set defaults if no training config is given
@@ -387,7 +387,7 @@ def run_final_experiment(
     data_root: Path = RAW_DATA_DIR / "fairvision",
     output_dir: Path = PROJ_ROOT / "reports" / "active-testing" / "AT_benchmarking",
     reuse_trained_model: bool = False,
-    checkpoint_dir: Path = MODELS_DIR / "new-experiment",
+    checkpoint_dir: Path = MODELS_DIR / "experiment",
     repetitions: int = 25,
 ):
     try:
@@ -464,7 +464,7 @@ def main():
         action="store_true",
         help="Load the saved best checkpoint instead of training",
     )
-    parser.add_argument("--checkpoint-dir", type=Path, default=MODELS_DIR / "new-experiment")
+    parser.add_argument("--checkpoint-dir", type=Path, default=MODELS_DIR / "experiment")
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("--repetitions must be positive")

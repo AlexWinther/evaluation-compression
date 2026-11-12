@@ -3,13 +3,13 @@ from dataclasses import dataclass, field
 from loguru import logger
 import torch
 from torch import nn
-from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
 from active_testing_benchmark.active_testing.interface import (
     ActiveEvaluationMethod,
     Problem,
 )
+from active_testing_benchmark.modeling.data import FairVisionData
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class EvaluationPool:
 
 
 def prepare_evaluation_pool(
-    dataset: Dataset | EvaluationPool,
+    dataset: FairVisionData | EvaluationPool,
     device: torch.device,
     protected_column: list[str] | str,
 ) -> EvaluationPool:
@@ -92,7 +92,7 @@ def prepare_evaluation_pool(
 
 def run_active_evaluation(
     method: ActiveEvaluationMethod,
-    dataset: Dataset | EvaluationPool,
+    dataset: FairVisionData | EvaluationPool,
     model: nn.Module,
     device: torch.device,
     loss_fn: nn.Module,

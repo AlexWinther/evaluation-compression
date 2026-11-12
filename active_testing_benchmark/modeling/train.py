@@ -16,8 +16,8 @@ from tqdm.auto import tqdm
 
 from active_testing_benchmark.active_testing.surrogate import RandomForestModule
 from active_testing_benchmark.config import RAW_DATA_DIR
+from active_testing_benchmark.modeling.data import FairVisionData, prepare_data
 from active_testing_benchmark.modeling.models import create_model
-from active_testing_benchmark.modeling.new import FairVisionData, prepare_data
 
 
 @dataclass(frozen=True)
@@ -189,7 +189,7 @@ def train_model(
                     y_pred,
                     average="binary" if num_classes == 2 else "macro",
                     labels=np.arange(num_classes),
-                    zero_division=0,
+                    zero_division=0.0,
                 ),
                 "roc_auc": auc,
             }
@@ -224,6 +224,9 @@ def fit_auxiliary_models(
     """Fit the two active-testing surrogates and proxy on all development images."""
     children = np.random.SeedSequence(config.random_state).spawn(3)
     seeds = tuple(int(child.generate_state(1)[0]) for child in children)
+    if len(seeds) != 3:
+        raise ValueError("Expected only 3 generated seeds")
+
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,

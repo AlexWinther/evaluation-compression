@@ -37,8 +37,8 @@ fairvision-metadata disease="dr" *args: requirements
 
 # Run the new AT development benchmark; accepts experiment CLI flags
 experiment *args: requirements
-    uv run python -m active_testing_benchmark.new_experiment "$@"
+    uv run python -m active_testing_benchmark.experiment "$@"
 
 # Compare ResNet-18 and EfficientNet-B0 using the new training pipeline
 model-selection *args: requirements
-    uv run python -m active_testing_benchmark.new_experiment --experiment model_selection "$@"
+    uv run python -m active_testing_benchmark.experiment --experiment model_selection "$@"

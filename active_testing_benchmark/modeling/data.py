@@ -64,9 +64,9 @@ class FairVisionData(Dataset):
 
         self.disease = disease
         self.root_dir = (fairvision_data_root / disease.lower()).resolve()
-        self.splits = set(
-            map(lambda s: {"train": "training", "val": "validation"}.get(s, s), splits)
-        )
+        self.splits = {
+            {"train": "training", "val": "validation"}.get(split, split) for split in splits
+        }
 
         self.transform = transform
         self.class_to_idx = class_to_idx or CLASS_TO_IDX[disease.lower()]

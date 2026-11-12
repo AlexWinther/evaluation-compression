@@ -8,8 +8,8 @@ Benchmarking of active-testing approaches on medical imaging
 
 ## Project commands
 
-Install [uv](https://docs.astral.sh/uv/) and [just](https://just.systems/), then use
-`just` to list the available commands. Commands run Python tools through uv.
+Install [uv](https://docs.astral.sh/uv/) and [just](https://just.systems/), then
+use `just` to list the available commands. Commands run Python tools through uv.
 
 ```bash
 just requirements              # Sync dependencies from uv.lock
@@ -34,19 +34,19 @@ The disease defaults to `dr`. Pass `amd`, `glaucoma`, or `all` as the first
 argument. Additional downloader flags follow it, for example
 `just data glaucoma --output-dir /path/to/fairvision`.
 
-Files are written below `data/raw/fairvision/` by default. The image command uses
-HTTP byte ranges to retrieve selected JPEG members from the upstream ZIP rather
-than transferring the complete 40--63 GB disease archive. See the
+Files are written below `data/raw/fairvision/` by default. The image command
+uses HTTP byte ranges to retrieve selected JPEG members from the upstream ZIP
+rather than transferring the complete 40--63 GB disease archive. See the
 [upstream FairVision dataset](https://huggingface.co/datasets/harvardairobotics/FairVision)
 for its CC BY-NC-ND 4.0 license. It is for non-commercial research and not for
 clinical decisions or patient care.
 
 ## Image-classification experiments
 
-Experiments run through `active_testing_benchmark.new_experiment`. The new
-dataset reads FairVision's metadata and SLO images from
-`data/raw/fairvision/<disease>/`, preserving its `training`, `validation`, and
-`test` splits. Raw images are never copied or changed.
+Experiments run through `active_testing_benchmark.experiment`. The dataset reads
+FairVision's metadata and SLO images from `data/raw/fairvision/<disease>/`,
+preserving its `training`, `validation`, and `test` splits. Raw images are never
+copied or changed.
 
 Run the development benchmark (the recipe first syncs dependencies):
 
@@ -54,14 +54,16 @@ Run the development benchmark (the recipe first syncs dependencies):
 just experiment --seed 42
 ```
 
-Development AT experiment trains ResNet-18 on a stratified 80% of FairVision's training
-split. The remaining 20% selects the checkpoint with the highest ROC AUC. Ties
-keep the earliest checkpoint. The restored model is evaluated and benchmarked
-on FairVision validation. Training defaults to 10 epochs, batch size 32,
-pretrained ImageNet weights, unweighted cross-entropy, AdamW, and cosine learning
-rate scheduling. A random seed is generated and logged unless `--seed` is given.
+Development AT experiment trains ResNet-18 on a stratified 80% of FairVision's
+training split. The remaining 20% selects the checkpoint with the highest ROC
+AUC. Ties keep the earliest checkpoint. The restored model is evaluated and
+benchmarked on FairVision validation. Training defaults to 10 epochs, batch size
+32, pretrained ImageNet weights, unweighted cross-entropy, AdamW, and cosine
+learning rate scheduling. A random seed is generated and logged unless `--seed`
+is given.
 
-A seperate model selection experiment comparing ResNet-18 and EfficientNet-B0 can be run:
+A seperate model selection experiment comparing ResNet-18 and EfficientNet-B0
+can be run:
 
 ```bash
 just model-selection --seed 42
@@ -70,8 +72,9 @@ just model-selection --seed 42
 just experiment --experiment model_selection --seed 42
 ```
 
-Both models use the same 80/20 training split. Their best checkpoints are compared
-on FairVision validation. This command does not run AT methods or use test data.
+Both models use the same 80/20 training split. Their best checkpoints are
+compared on FairVision validation. This command does not run AT methods or use
+test data.
 
 AT benchmarking runs uniform, balanced/proportional stratified, Kossen,
 active-surrogate, and prediction-powered methods. It estimates unweighted
@@ -89,9 +92,8 @@ just experiment --help
 
 Use `--disease dr|amd|glaucoma` to select the disease (they must be downloaded
 before running the experiment). All available CLI flags and arguments can be
-found with `--help`. Additional training
-settings, such as image size and learning rate, are configured through
-`modeling.new_train.TrainingConfig`.
+found with `--help`. Additional training settings, such as image size and
+learning rate, are configured through `modeling.train.TrainingConfig`.
 
 Best checkpoints are saved under `models/new-experiment/`, separated by
 `model_selection`, `AT_dev`, or `AT_final`, then disease and model name. A fresh
@@ -108,16 +110,16 @@ checkpoint. AT still fits its auxiliary forests and runs evaluation and
 benchmarking. Checkpoints retain their original training configuration, seed,
 and history.
 
-Final AT trains on FairVision training, selects the best checkpoint on FairVision
-validation, and evaluates on test:
+Final AT trains on FairVision training, selects the best checkpoint on
+FairVision validation, and evaluates on test:
 
 ```bash
 just experiment --FINAL --seed 42
 ```
 
-This requires typing `FINAL` at the interactive prompt before any final-experiment
-data is loaded. The prompt also applies when reusing a final checkpoint.
-`--FINAL` is unavailable for model selection.
+This requires typing `FINAL` at the interactive prompt before any
+final-experiment data is loaded. The prompt also applies when reusing a final
+checkpoint. `--FINAL` is unavailable for model selection.
 
 AT runs save uniquely named curves CSVs and matching metadata JSON files under
 `reports/active-testing/AT_benchmarking/`. Curves contain methods, objectives,
@@ -125,15 +127,16 @@ repetitions, seeds, label counts, and overall/subgroup risk estimates. Metadata
 records configuration, checkpoint details, training history, auxiliary seeds,
 dataset sizes, and full-pool reference metrics. Model selection writes
 `comparison.csv` and `history.json` under
-`reports/active-testing/model-comparison/`. These are replaced on subsequent runs.
+`reports/active-testing/model-comparison/`. These are replaced on subsequent
+runs.
 
 Python callers use `run_dev_experiment()`, `run_final_experiment()`, or
-`run_model_selection_experiment()` from `new_experiment`. The AT functions return
+`run_model_selection_experiment()` from `experiment`. The AT functions return
 reference metrics. Model selection returns a comparison DataFrame. They accept
 `training_config`, `data_root`, `output_dir`, `checkpoint_dir`, and
-`reuse_trained_model`. AT functions also accept `repetitions`.
-`modeling.new` owns the dataset, `modeling.new_train` owns training and auxiliary
-fitting, and `benchmark` owns repeated active evaluation.
+`reuse_trained_model`. AT functions also accept `repetitions`. `modeling.data`
+owns the dataset, `modeling.train` owns training and auxiliary fitting, and
+`benchmark` owns repeated active evaluation.
 
 ## Acknowledgment
 
@@ -178,19 +181,15 @@ repository. Thank you to its makers for sharing their approach.
     │
     ├── dataset.py              <- Scripts to download or generate data
     │
-    ├── new_experiment.py       <- Current model-selection and AT experiment entry point
+    ├── experiment.py       <- Current model-selection and AT experiment entry point
     ├── benchmark.py            <- AT methods, objectives, and repetitions
     ├── active_testing         <- Sampling methods, estimators, runner, and surrogates
     │
-    ├── modeling
-    │   ├── __init__.py
-    │   ├── new.py              <- Current FairVision dataset and data preparation
-    │   ├── new_train.py        <- Current classifier and auxiliary-model training
-    │   ├── models.py           <- Model factories and image transforms
-    │   └── ...                 <- Older pipeline and optional MLflow tooling
-    │
-    ├── experiment.py           <- Older experiment entry point, retained during migration
-    └── plots.py                <- Plotting utility for an older results format
+    └── modeling
+        ├── __init__.py
+        ├── data.py              <- Current FairVision dataset and data preparation
+        ├── train.py        <- Current classifier and auxiliary-model training
+        └── models.py           <- Model factories and image transforms
 ```
 
 --------
