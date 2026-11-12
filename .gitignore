@@ -241,3 +241,4 @@ deploy/mlflow/*.tar.gz
 deploy/mlflow/backups/
 /results/active-testing
 /docs/docs
+/notebooks/eda.ipynb

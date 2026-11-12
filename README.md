@@ -14,7 +14,7 @@ use `just` to list the available commands. Commands run Python tools through uv.
 ```bash
 just requirements              # Sync dependencies from uv.lock
 just test                      # Run the test suite
-just test tests/test_runner_subgroups.py -q
+just test tests/active_testing -q # Run tests for one area
 just lint                      # Check formatting and lint rules
 just format                    # Apply formatting and lint fixes
 ```
