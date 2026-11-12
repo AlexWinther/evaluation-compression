@@ -60,7 +60,7 @@ def _run_experiment(
     *,
     output_dir: Path = PROJ_ROOT / "reports" / "active-testing" / "AT_benchmarking",
     experiment: str = "AT_dev",
-    repetitions: int = 25,
+    repetitions: int = 50,
     track: bool = True,
     ase_update_every: int = 50,
     protected_attribute: str | None = None,
@@ -188,7 +188,7 @@ def run_dev_experiment(
     output_dir: Path = PROJ_ROOT / "reports" / "active-testing" / "AT_benchmarking",
     reuse_trained_model: bool = False,
     checkpoint_dir: Path = MODELS_DIR / "experiment",
-    repetitions: int = 25,
+    repetitions: int = 50,
     track: bool = True,
     ase_update_every: int = 50,
     protected_attribute: str | None = None,
@@ -317,7 +317,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
-        "--repetitions", type=int, default=25, help="Number of AT benchmark repetitions"
+        "--repetitions", type=int, default=50, help="Number of AT benchmark repetitions"
     )
     parser.add_argument(
         "--ase-update-every",

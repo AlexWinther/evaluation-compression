@@ -34,14 +34,14 @@ The disease defaults to `dr`. Pass `amd`, `glaucoma`, or `all` as the first
 argument. Additional downloader flags follow it, for example
 `just data glaucoma --output-dir /path/to/fairvision`.
 
-Files are written below `data/raw/fairvision/` by default. The image command
+Files are written in `data/raw/fairvision/` by default. The image command
 uses HTTP byte ranges to retrieve selected JPEG members from the upstream ZIP
 rather than transferring the complete 40--63 GB disease archive. See the
 [upstream FairVision dataset](https://huggingface.co/datasets/harvardairobotics/FairVision)
 for its CC BY-NC-ND 4.0 license. It is for non-commercial research and not for
 clinical decisions or patient care.
 
-## Image-classification experiments
+## Experiments
 
 Experiments live in `active_testing_benchmark.experiments`, with separate
 modules for `feature_experiment`, `model_selection`, and `at_benchmarking`.
@@ -50,80 +50,186 @@ dataset reads FairVision's metadata and SLO images from
 `data/raw/fairvision/<disease>/`, preserving its `training`, `validation`, and
 `test` splits. Raw images are never copied or changed.
 
+Use `--disease dr|amd|glaucoma` to select a disease. Download its data before
+running an experiment. Omit `--seed` to generate and log a fresh random seed,
+or pass `--seed N` to reproduce a run. The recipes forward CLI flags, and
+`--help` lists the options for each experiment.
+
+### Comparison of feature extraction used in surrogates
+
+This experiment compares image representations for random forest classifiers.
+Compare the original 16×16 pooled pixels, spatial texture features, and a frozen
+ImageNet ResNet-18 backbone using:
+
+```bash
+just feature-experiment
+
+# See CLI options with:
+just feature-experiment --help
+```
+
+The ImageNet backbone returns 512 features before the classification layer. Its
+weights and batch-normalization statistics stay frozen. It uses the same image
+resize and ImageNet normalization as the other extractors, retaining the full
+image instead of adding a center crop. The first use downloads approximately 45
+MB of `ResNet18_Weights.IMAGENET1K_V1` weights to torchvision's cache. MLflow
+records the weight version and initialization time separately from fit time. To
+select only certain extractors, pass, for example, `--extractors pooled_pixels
+imagenet_resnet18`.
+
+All forests within an invocation use the same seed, settings, and stratified
+80/20 split of the FairVision training partition. The holdout is used to compare
+extractors, so report final performance on a separate partition. The official
+validation and test partitions are not used for feature selection. MLflow
+records classification loss, accuracy, F1, AUC when available, feature counts,
+fit and evaluation time, and split provenance. Use `--disease`,
+`--n-estimators`, `--batch-size`, `--image-size`, or `--device` to change the
+defaults, and `--no-mlflow` to run without tracking. The command prints a
+comparison table when complete.
+
+### Model selection
+
+Compare ResNet-18 and EfficientNet-B0 using:
+
+```bash
+just model-selection
+
+# See CLI options with:
+just model-selection --help
+```
+
+Both models use the same stratified 80/20 split of FairVision's training
+partition, with the 20% holdout used to select checkpoints. Their best
+checkpoints are compared on FairVision validation. This command does not run AT
+methods or use test data.
+
+Model selection writes `comparison.csv` and `history.json` under
+`reports/active-testing/model-comparison/`. These are replaced on subsequent
+runs.
+
+### Active-testing (AT) benchmarking
+
+This experiment evaluates risk estimation methods using a trained image
+classifier. Development and final runs use different FairVision partitions.
+
+#### Development run
+
 Run the development benchmark (the recipe first syncs dependencies):
 
 ```bash
-just experiment --seed 42
+just experiment
+
+# See CLI options with:
+just experiment --help
 ```
 
-Development AT experiment trains ResNet-18 on a stratified 80% of FairVision's
-training split. The remaining 20% selects the checkpoint with the highest ROC
-AUC. Ties keep the earliest checkpoint. The restored model is evaluated and
-benchmarked on FairVision validation. Training defaults to 10 epochs, batch size
-32, pretrained ImageNet weights, unweighted cross-entropy, AdamW, and cosine
-learning rate scheduling. A random seed is generated and logged unless `--seed`
-is given.
+The development AT experiment trains ResNet-18 on a label-stratified 80% of
+FairVision's training split. The remaining 20% selects the checkpoint with the
+highest ROC AUC. Ties keep the earliest checkpoint. The restored model is
+evaluated and benchmarked on FairVision validation. Training defaults to 10
+epochs, batch size 32, pretrained ImageNet weights, unweighted cross-entropy,
+AdamW, and cosine learning rate scheduling.
 
-A seperate model selection experiment comparing ResNet-18 and EfficientNet-B0
-can be run:
+#### Final run
+
+The final AT experiment's model trains on FairVision training, selects the
+checkpoint performing the best on FairVision validation, and evaluates on test:
 
 ```bash
-just model-selection --seed 42
-
-# Equivalent to:
-uv run python -m active_testing_benchmark.experiments.model_selection --seed 42
+just experiment --FINAL
 ```
 
-Both models use the same 80/20 training split. Their best checkpoints are
-compared on FairVision validation. This command does not run AT methods or use
-test data.
+This requires typing `FINAL` at the interactive prompt before any
+final-experiment data is loaded. The prompt also applies when reusing a final
+checkpoint. `--FINAL` flag is only available for the AT benchmarking experiment.
+
+#### Methods and subgroup reporting
 
 AT benchmarking runs uniform, balanced/proportional stratified, Kossen,
 active-surrogate, and prediction-powered methods. It estimates unweighted
 cross-entropy risk overall and by subgroup, including `age_group`. Each method
-runs for `--repetitions` (default 25), with a max label budget equal to the
+runs for `--repetitions` (default 50), with a max label budget equal to the
 full evaluation pool.
 
 Kossen and PPAT use the same average predictive probabilities from both
 surrogate forests. ASE starts with that ensemble and uses its individual
 members for XWED.
 
-Both surrogate forests and the proxy use fixed spatial texture features by
-default. Images are pooled to 64×64, then summarized on 4×4 and 8×8 grids using
-per-channel mean, standard deviation, and absolute horizontal/vertical Sobel
-responses. This yields 960 RGB features compared with the previous 768 pooled
-pixels, with no additional training, dependencies, or weight downloads. It
-accepts the same normalized images as the target model.
+Both surrogates and the proxy use frozen ImageNet ResNet-18 features for their
+random forests by default. The classification layer is removed, producing 512
+features per image.  Backbone weights and batch-normalization statistics remain
+frozen during fitting, prediction, and ASE updates. It accepts the same resized,
+ImageNet-normalized images as the target model. The first use downloads
+approximately 45 MB of `ResNet18_Weights.IMAGENET1K_V1` weights to torchvision's
+cache.  Custom extractors remain supported through
+`RandomForestModule(feature_extractor=...)`, including
+`SpatialTextureFeatures()` for the previous texture baseline.
 
 ASE refits its surrogate forests on the original development data plus all
-acquired labels every 50 labels. Set `--ase-update-every N` to change that
+acquired labels every 100 labels. Set `--ase-update-every N` to change that
 frequency (positive integers only). Acquisition batches stop at update
 thresholds so refitting happens at the requested label counts. Each objective
 and repetition starts with fresh copies of the development-trained ASE
 surrogates.
 
-The recipes forward CLI flags, for example:
+By default, AT benchmarking reports all marginal subgroup attributes except raw
+`age`. Uniform sampling, Kossen, ASE, and PPAT each share one sampling run per
+repetition and estimates risk across all attributes. The two stratified
+baselines run separately for each protected attribute, and each run also reports
+every requested marginal attribute. Use `--protected-attribute` to restrict
+stratification to `gender`, `race`, `ethnicity`, `language`, `maritalstatus`, or
+`age_group`.  All available marginal attributes are still reported.
+
+For example:
 
 ```bash
 just experiment --repetitions 5 --seed 42 --epochs 20
 just experiment --ase-update-every 100 --seed 42
 just experiment --protected-attribute gender --seed 42
-just model-selection --epochs 10 --batch-size 16 --device cpu
-just experiment --help
 ```
 
-By default, AT benchmarking reports all marginal subgroup attributes except raw
-`age`. Uniform sampling, Kossen, ASE, and PPAT each share one sampling run per
-repetition and objective across all attributes. The two stratified baselines run
-separately for each sampling attribute, and each run also reports every requested
-marginal attribute. Use `--protected-attribute` to restrict stratification to
-`gender`, `race`, `ethnicity`, `language`, `maritalstatus`, or `age_group`.
-All available marginal attributes are still reported.
+#### Outputs and tracking
 
-Use `--disease dr|amd|glaucoma` to select the disease (they must be downloaded
-before running the experiment). All available CLI flags and arguments can be
-found with `--help`. Additional training settings, such as image size and
-learning rate, are configured through `modeling.train.TrainingConfig`.
+AT runs save uniquely named curves CSVs and matching metadata JSON files under
+`reports/active-testing/AT_benchmarking/`. Curves contain methods, objectives,
+repetitions, seeds, label counts, and overall/subgroup risk estimates. Metadata
+records configuration, checkpoint details, training history, auxiliary seeds,
+dataset sizes, and full-pool reference metrics.
+
+Curves include a `protected_attribute` column: `shared` identifies a
+non-stratified run reporting multiple attributes, while an attribute name
+identifies its stratification attribute. Shared runs report all attributes even
+when the CLI override selects one stratification attribute. Subgroup estimates
+and label counts remain wide columns (for example, `risk gender=female` and
+`n_labels_gender=female`). For a stratified run, the column names the sampling
+attribute. Every run contains estimates and counts for all requested marginal
+attributes. A reported subgroup may cross the sampling strata, so its estimate
+uses the stratum weights from that run. At smaller budgets, methods that
+require observed labels may leave a subgroup's risk blank when its label count
+is zero. Prediction-based methods may still estimate it. At the full-pool
+budget, every requested subgroup has labels and an estimate. Overall risk is
+stored once per sampling trajectory.
+
+During AT, the MLflow tags `stage`, `AT.method`, and `AT.repetition` show
+progress. Risk and label-count metrics are logged after each method/repetition. Overall and subgroup reference metrics
+are logged after evaluation. Full AT curves remain available in the CSV artifact.
+
+### Classifier training and checkpointing
+
+Model selection and AT use the classifier training pipeline. Additional
+training settings, such as image size and learning rate, are configured
+through `modeling.train.TrainingConfig`. For example:
+
+```bash
+just model-selection --epochs 10 --batch-size 16 --device cpu
+```
+
+Each epoch logs loss, accuracy, F1, and ROC AUC under separate MLflow paths:
+`training/train/{metric}` and `training/validation/{metric}`, where the metric
+names are `loss`, `accuracy`, `f1`, and `roc_auc`. Training metrics aggregate
+predictions from the optimization pass, while validation uses the updated model
+in evaluation mode after the epoch. No extra training-set inference pass is
+needed. Checkpoint selection continues to maximize validation AUC.
 
 Best checkpoints are saved under `models/experiment/`, separated by
 `model_selection`, `AT_dev`, or `AT_final`, then disease and model name. A fresh
@@ -140,37 +246,11 @@ checkpoint. AT still fits its auxiliary forests and runs evaluation and
 benchmarking. Checkpoints retain their original training configuration, seed,
 and history.
 
-Final AT trains on FairVision training, selects the best checkpoint on
-FairVision validation, and evaluates on test:
+### Python entry points
 
-```bash
-just experiment --FINAL --seed 42
-```
-
-This requires typing `FINAL` at the interactive prompt before any
-final-experiment data is loaded. The prompt also applies when reusing a final
-checkpoint. `--FINAL` is unavailable for model selection.
-
-AT runs save uniquely named curves CSVs and matching metadata JSON files under
-`reports/active-testing/AT_benchmarking/`. Curves contain methods, objectives,
-repetitions, seeds, label counts, and overall/subgroup risk estimates. Metadata
-records configuration, checkpoint details, training history, auxiliary seeds,
-dataset sizes, and full-pool reference metrics. Model selection writes
-`comparison.csv` and `history.json` under
-`reports/active-testing/model-comparison/`. These are replaced on subsequent
-runs. Curves include a `protected_attribute` column: `shared` identifies a
-non-stratified run reporting multiple attributes, while an attribute name
-identifies its stratification attribute. Shared runs report all attributes even
-when the CLI override selects one stratification attribute. Subgroup estimates
-and label counts remain wide columns (for example, `risk gender=female` and
-`n_labels_gender=female`). For a stratified run, the column names the sampling
-attribute. Every run contains estimates and counts for all requested marginal
-attributes. A reported subgroup may cross the sampling strata, so its estimate
-uses the stratum weights from that run. At smaller budgets, methods that
-require observed labels may leave a subgroup's risk blank when its label count
-is zero. Prediction-based methods may still estimate it. At the full-pool
-budget, every requested subgroup has labels and an estimate. Overall risk is
-stored once per sampling trajectory.
+Python callers import `run_feature_experiment()` from
+`active_testing_benchmark.experiments.feature_experiment` to return a
+comparison DataFrame.
 
 Python callers import `run_dev_experiment()` and `run_final_experiment()` from
 `active_testing_benchmark.experiments.at_benchmarking`, and
@@ -186,44 +266,26 @@ owns the dataset, `modeling.train` owns training and auxiliary fitting, and
 
 Tracking is enabled by default. Set `MLFLOW_TRACKING_URI`,
 `MLFLOW_TRACKING_USERNAME`, and `MLFLOW_TRACKING_PASSWORD` in `.env`, using
-`.env.example` as a template. The existing `just experiment` and `just
-model-selection` commands then send results to that server.
+`.env.example` as a template. The `just feature-experiment`,
+`just model-selection`, and `just experiment` commands then send results to that
+server.
 
 | Experiment | MLflow experiment name | Runs |
 |---|---|---|
-| Model selection | `FairVision/model_selection` | One run per model |
-| Random forest features | `FairVision/feature_extractors` | One run per extractor |
+| Model selection | `FairVision/model_selection` | One parent per invocation, one child per model |
+| Random forest features | `FairVision/feature_extractors` | One parent per invocation, one child per extractor |
 | Development AT | `FairVision/AT_dev` | One run per invocation |
 | Final AT | `FairVision/AT_final` | One run per confirmed invocation |
 
-Compare the original 16×16 pooled pixels with the spatial texture features using:
+Parents record the shared configuration, seed, selected methods, dataset
+provenance, and a `comparison.csv` artifact. Child runs retain method-specific
+parameters, metrics, and artifacts. Returned comparison tables include both
+`mlflow_run_id` and `mlflow_parent_run_id`. A method failure marks both that child
+and its parent failed. Tracking can still be disabled with `--no-mlflow`.
 
-```bash
-just feature-experiment --seed 42
-```
-
-Both forests use the same seed, settings, and stratified 80/20 split of the
-FairVision training partition. The holdout is used to compare extractors, so
-report final performance on a separate partition. MLflow records classification
-loss, accuracy, F1, AUC when available, feature counts, fit and evaluation time,
-and split provenance. Use `--disease`, `--n-estimators`, `--batch-size`,
-`--image-size`, or `--device` to change the defaults, and `--no-mlflow` to run
-without tracking. The command prints a comparison table when complete.
-
-Each epoch logs loss, accuracy, F1, and ROC AUC under separate MLflow paths:
-`training/train/{metric}` and `training/validation/{metric}`, where the metric
-names are `loss`, `accuracy`, `f1`, and `roc_auc`. Training metrics aggregate
-predictions from the optimization pass, while validation uses the updated model
-in evaluation mode after the epoch. No extra training-set inference pass is
-needed. Checkpoint selection continues to maximize validation AUC.
-
-During AT, the `stage`,
-`AT.method`, and `AT.repetition` tags show progress. Risk and label-count metrics
-are logged after each method/repetition. Overall and subgroup reference metrics
-are logged after evaluation. Full AT curves remain available in the CSV artifact.
-
-Each run records its configuration and seeds, best checkpoint and training
-history, reference metrics, and AT CSV/JSON outputs. Reused checkpoints retain
+Classifier and AT runs record their configuration and seeds, best checkpoint
+and training history. AT runs also record reference metrics and CSV/JSON outputs.
+Reused checkpoints retain
 their original training configuration and, when trained with tracking, source
 run ID. Older checkpoints remain reusable. Local outputs are still
 saved, and the metadata/comparison CSV includes the corresponding MLflow run ID.
