@@ -1,7 +1,7 @@
 """Run development or final active-testing benchmarking."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 import json
 from pathlib import Path
@@ -15,6 +15,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Subset
 
+from active_testing_benchmark.active_testing.diagnostics import surrogate_diagnostics
 from active_testing_benchmark.benchmark import run_benchmark
 from active_testing_benchmark.config import CLASS_TO_IDX, MODELS_DIR, PROJ_ROOT, RAW_DATA_DIR
 from active_testing_benchmark.experiments.utils import (
@@ -25,7 +26,7 @@ from active_testing_benchmark.experiments.utils import (
 from active_testing_benchmark.modeling.data import FairVisionData
 from active_testing_benchmark.modeling.models import create_image_transform
 from active_testing_benchmark.modeling.provenance import log_dataset_provenance
-from active_testing_benchmark.modeling.registry import experiment_run
+from active_testing_benchmark.modeling.registry import experiment_run, log_metrics
 from active_testing_benchmark.modeling.train import (
     TrainingConfig,
     fit_auxiliary_models,
@@ -47,6 +48,44 @@ def save_results(curves, metadata, output_dir):
     curves.to_csv(curves_path, index=False, mode="x")
     logger.info(f"Saved experiment curves to {curves_path}")
     return curves_path, metadata_path
+
+
+def _checkpoint_path(checkpoint_dir: Path, experiment: str, disease: str, model_type: str) -> Path:
+    """Return where an AT experiment saves, and reuses, its best checkpoint."""
+    return Path(checkpoint_dir) / experiment / disease.lower() / f"{model_type}.pt"
+
+
+def _reused_checkpoint_seed(checkpoint_path: Path, requested_seed: int | None) -> int:
+    """Return the seed that trained a reused checkpoint, rejecting a conflicting seed.
+
+    The seed also fixes the 80/20 development split, the auxiliary-model seeds and the
+    benchmark repetitions. A reused model must therefore run with its training seed,
+    or the holdout can contain images the model was trained on.
+    """
+    if not Path(checkpoint_path).exists():
+        raise FileNotFoundError(f"No checkpoint to reuse at {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    training_seed = int(checkpoint["config"]["random_state"])
+    if requested_seed is not None and requested_seed != training_seed:
+        raise ValueError(
+            f"--seed {requested_seed} does not match the seed {training_seed} that trained "
+            f"the reused checkpoint {checkpoint_path}. Omit --seed or pass --seed {training_seed}."
+        )
+    return training_seed
+
+
+def _resolve_config(
+    training_config: TrainingConfig | None,
+    checkpoint_path: Path,
+    reuse_trained_model: bool,
+) -> TrainingConfig:
+    """Use a fresh random seed for training, or the checkpoint's seed when reusing it."""
+    if not reuse_trained_model:
+        return training_config or TrainingConfig(random_state=secrets.randbits(32))
+    config = training_config or TrainingConfig()
+    requested_seed = training_config.random_state if training_config is not None else None
+    seed = _reused_checkpoint_seed(checkpoint_path, requested_seed)
+    return replace(config, random_state=seed)
 
 
 def _run_experiment(
@@ -120,6 +159,16 @@ def _run_experiment(
 
         auxiliary = fit_auxiliary_models(train, test.classes, config, device)
 
+        # Measure surrogate and proxy quality on the checkpoint-selection holdout,
+        # never on the evaluation pool, so that no evaluation labels are used.
+        if run is not None:
+            mlflow.set_tag("stage", "diagnostics")
+        diagnostics = surrogate_diagnostics(
+            model, auxiliary.surrogates, auxiliary.proxy, validation, device, config.batch_size
+        )
+        logger.info(f"Surrogate diagnostics on the holdout: {diagnostics}")
+        log_metrics(diagnostics, prefix="diagnostics")
+
         curves = run_benchmark(
             model=model,
             dataset=test,
@@ -168,6 +217,7 @@ def _run_experiment(
             "validation_size": len(validation),
             "evaluation_size": len(test),
             "reference_metrics": reference_metrics,
+            "surrogate_diagnostics": diagnostics,
         }
         curves_path, metadata_path = save_results(curves, metadata, output_dir)
         if run is not None:
@@ -193,8 +243,9 @@ def run_dev_experiment(
     ase_update_every: int = 50,
     protected_attribute: str | None = None,
 ):
-    # Set defaults if no training config is given
-    config = training_config or TrainingConfig(random_state=secrets.randbits(32))
+    model_type = (training_config or TrainingConfig()).model_type
+    checkpoint_path = _checkpoint_path(checkpoint_dir, "AT_dev", disease, model_type)
+    config = _resolve_config(training_config, checkpoint_path, reuse_trained_model)
 
     train = FairVisionData(
         disease=disease,
@@ -228,7 +279,7 @@ def run_dev_experiment(
         validation,
         config,
         device,
-        Path(checkpoint_dir) / "AT_dev" / disease.lower() / f"{config.model_type}.pt",
+        checkpoint_path,
         reuse_trained_model,
         output_dir=output_dir,
         experiment="AT_dev",
@@ -264,8 +315,9 @@ def run_final_experiment(
         logger.info("Final experiment cancelled")
         return {"CANCELED": "Final experiment cancelled"}
 
-    # Set defaults if no training config is given
-    config = training_config or TrainingConfig(random_state=secrets.randbits(32))
+    model_type = (training_config or TrainingConfig()).model_type
+    checkpoint_path = _checkpoint_path(checkpoint_dir, "AT_final", disease, model_type)
+    config = _resolve_config(training_config, checkpoint_path, reuse_trained_model)
 
     train = FairVisionData(
         disease=disease,
@@ -297,7 +349,7 @@ def run_final_experiment(
         test,
         config,
         device,
-        Path(checkpoint_dir) / "AT_final" / disease.lower() / f"{config.model_type}.pt",
+        checkpoint_path,
         reuse_trained_model,
         output_dir=output_dir,
         experiment="AT_final",
@@ -336,7 +388,7 @@ def main():
     parser.add_argument(
         "--reuse-trained-model",
         action="store_true",
-        help="Load the saved best checkpoint instead of training",
+        help="Load the saved best checkpoint instead of training. Uses its training seed",
     )
     parser.add_argument("--checkpoint-dir", type=Path, default=MODELS_DIR / "experiment")
     parser.add_argument(
@@ -347,8 +399,20 @@ def main():
         parser.error("--repetitions must be positive")
     if args.ase_update_every < 1:
         parser.error("--ase-update-every must be positive")
-    seed = args.seed if args.seed is not None else secrets.randbits(32)
-    logger.info(f"Experiment seed: {seed}")
+    if args.reuse_trained_model:
+        # Fail before any prompt or data loading when the seed conflicts with the checkpoint.
+        experiment_name = "AT_final" if args.FINAL else "AT_dev"
+        checkpoint_path = _checkpoint_path(
+            args.checkpoint_dir, experiment_name, args.disease, TrainingConfig().model_type
+        )
+        try:
+            seed = _reused_checkpoint_seed(checkpoint_path, args.seed)
+        except (FileNotFoundError, ValueError) as error:
+            parser.error(str(error))
+        logger.info(f"Experiment seed: {seed} (from the reused checkpoint)")
+    else:
+        seed = args.seed if args.seed is not None else secrets.randbits(32)
+        logger.info(f"Experiment seed: {seed}")
 
     runner = run_final_experiment if args.FINAL else run_dev_experiment
     results = runner(

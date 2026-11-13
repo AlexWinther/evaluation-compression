@@ -7,6 +7,10 @@ from torch.utils.data import DataLoader
 from active_testing_benchmark.active_testing import (
     surrogate,
 )
+from active_testing_benchmark.active_testing.diagnostics import (
+    surrogate_diagnostics,
+    variance_gain,
+)
 from active_testing_benchmark.active_testing.surrogate import (
     RandomForestModule,
     SpatialTextureFeatures,
@@ -134,3 +138,39 @@ def test_forest_callback_retains_development_data_without_repeating_old_observat
         assert [len(y) for _, y in calls] == [3, 5]
         np.testing.assert_array_equal(calls[-1][0], [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4]])
         np.testing.assert_array_equal(calls[-1][1], [0, 0, 1, 1, 1])
+
+
+def test_variance_gain_is_one_for_uniform_scores_and_large_for_the_true_loss():
+    losses = np.array([0.01, 0.02, 0.05, 3.0, 0.1, 4.0])
+    assert variance_gain(np.ones_like(losses), losses) == pytest.approx(1.0)
+    assert variance_gain(losses, losses) > 10
+    assert variance_gain(1 / losses, losses) < 1
+
+
+class Scaled(nn.Module):
+    """Return confident logits that put almost all mass on the input's one-hot class."""
+
+    def forward(self, images):
+        return 20 * images
+
+
+def test_surrogate_diagnostics_separate_informative_and_uninformative_surrogates():
+    labels = [0, 1, 0, 1, 1, 0, 0, 1]
+    images = torch.eye(2)[labels]
+    dataset = [{"image": image, "label": label} for image, label in zip(images, labels)]
+    torch.manual_seed(0)
+    model = nn.Linear(2, 2)
+    # The constant surrogate ignores its input. The scaled identity knows the label.
+    constant = nn.Linear(2, 2)
+    nn.init.zeros_(constant.weight)
+
+    informative = surrogate_diagnostics(model, (Scaled(),), Scaled(), dataset, "cpu", 3)
+    uninformative = surrogate_diagnostics(model, (constant,), constant, dataset, "cpu", 3)
+
+    assert informative["kossen_variance_gain"] > uninformative["kossen_variance_gain"]
+    assert informative["kossen_variance_gain"] == pytest.approx(
+        informative["oracle_variance_gain"], rel=1e-3
+    )
+    assert informative["ase_relative_bias"] == pytest.approx(0.0, abs=1e-6)
+    # A proxy that predicts the true label has proxy losses equal to the true losses.
+    assert informative["ppat_proxy_correlation"] == pytest.approx(1.0)

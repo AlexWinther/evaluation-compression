@@ -1,0 +1,47 @@
+---
+config:
+  theme: neutral
+  markdownAutoWrap: false
+  flowchart:
+    curve: basis
+    wrappingWidth: 400
+    nodeSpacing: 20
+    rankSpacing: 40
+---
+
+flowchart LR
+  subgraph IN["Inputs"]
+    direction TB
+    P[("Unlabeled pool<br/>N fundus images<br/>+ demographics")]
+    F["Fixed classifier <i>f</i><br/>ResNet-18"]
+    S["Surrogate and proxy<br/>random forests"]
+    M["<b>Evaluation method</b><br/>passive: uniform, stratified<br/>active: LURE, ASE, PPAT"]
+  end
+
+  subgraph LOOP["Repeat until M labels"]
+    direction TB
+    A["<b>Acquire</b><br/>select a batch of<br/>unlabeled items"]
+    O["<b>Observe</b><br/>reveal labels and losses<br/>of the selected items"]
+    U["<b>Update</b><br/>refresh method state"]
+    A --> O --> U --> A
+  end
+
+  E["<b>Estimate</b><br/>overall risk<br/>subgroup risks"]
+  R[("Full-pool reference<br/>overall and<br/>subgroup risks")]
+  C["<b>Compare</b><br/>estimation error<br/>across budgets and runs"]
+
+  P --> A
+  F --> A
+  S -. "active methods only" .-> A
+  M --> A
+  U -- "after each batch" --> E --> C
+  R --> C
+
+  classDef data fill:#e8f0fb,stroke:#4a6fa5,color:#1b2a41
+  classDef step fill:#ffffff,stroke:#555555,color:#111111
+  classDef result fill:#eaf5ea,stroke:#4a8a4a,color:#1b331b
+  classDef note fill:#fafafa,stroke:#999999,stroke-dasharray:4 3,color:#333333
+    class P,R data
+  class F,S,A,O,U step
+  class E,C result
+  class M note

@@ -153,6 +153,8 @@ def test_complete_experiments_log_live_metrics_checkpoints_and_provenance(
             assert run.data.params["repetitions"] == "2"
             metadata = json.loads(next(arguments["output_dir"].glob("*.json")).read_text())
             assert metadata["mlflow_run_id"] == run.info.run_id
+            assert "diagnostics/kossen_variance_gain" in run.data.metrics
+            assert "kossen_variance_gain" in metadata["surrogate_diagnostics"]
     assert mlflow.active_run() is None
 
 
@@ -188,6 +190,74 @@ def test_reuse_keeps_original_training_lineage_and_skips_training(
         assert run.data.tags["training.source_run_id"] in original_ids
         assert "training/train/loss" not in run.data.metrics
         assert "evaluation/auc" in run.data.metrics
+
+
+def test_at_reuse_adopts_the_checkpoint_seed_and_rejects_a_different_one(
+    local_mlflow, tiny_pipeline, monkeypatch
+):
+    arguments, _ = tiny_pipeline
+    experiment.run_dev_experiment(**arguments, repetitions=1, track=False)
+    monkeypatch.setattr(
+        utils, "train_model", lambda *args, **kwargs: pytest.fail("Retrained reused model")
+    )
+
+    with pytest.raises(ValueError, match="does not match the seed 42"):
+        experiment.run_dev_experiment(
+            **{**arguments, "training_config": TrainingConfig(random_state=7)},
+            repetitions=1,
+            reuse_trained_model=True,
+            track=False,
+        )
+
+    experiment.run_dev_experiment(
+        **{**arguments, "training_config": None},
+        repetitions=1,
+        reuse_trained_model=True,
+        track=False,
+    )
+    metadata = [json.loads(path.read_text()) for path in arguments["output_dir"].glob("*.json")]
+    assert [item["configuration"]["seed"] for item in metadata] == [42, 42]
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_cli_reuse_takes_the_seed_from_the_checkpoint(monkeypatch, tmp_path, final):
+    experiment_name = "AT_final" if final else "AT_dev"
+    checkpoint_path = tmp_path / experiment_name / "dr" / "resnet.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    torch.save({"config": {"random_state": 5}}, checkpoint_path)
+    arguments = ["experiment", "--reuse-trained-model", "--checkpoint-dir", str(tmp_path)]
+    monkeypatch.setattr("sys.argv", arguments + (["--FINAL"] if final else []))
+    calls = []
+    runner_name = "run_final_experiment" if final else "run_dev_experiment"
+    monkeypatch.setattr(experiment, runner_name, lambda **kwargs: calls.append(kwargs) or {})
+
+    experiment.main()
+
+    assert calls[0]["training_config"].random_state == 5
+
+
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize("save_checkpoint,message", [(True, "does not match"), (False, "No checkpoint")])
+def test_cli_reuse_rejects_a_conflicting_seed_or_missing_checkpoint(
+    monkeypatch, tmp_path, capsys, final, save_checkpoint, message
+):
+    experiment_name = "AT_final" if final else "AT_dev"
+    checkpoint_path = tmp_path / experiment_name / "dr" / "resnet.pt"
+    if save_checkpoint:
+        checkpoint_path.parent.mkdir(parents=True)
+        torch.save({"config": {"random_state": 5}}, checkpoint_path)
+    arguments = ["experiment", "--reuse-trained-model", "--checkpoint-dir", str(tmp_path)]
+    arguments += ["--seed", "6"] + (["--FINAL"] if final else [])
+    monkeypatch.setattr("sys.argv", arguments)
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("Prompted before failing"))
+    runner_name = "run_final_experiment" if final else "run_dev_experiment"
+    monkeypatch.setattr(experiment, runner_name, lambda **kwargs: pytest.fail("Ran experiment"))
+
+    with pytest.raises(SystemExit) as error:
+        experiment.main()
+
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
 
 
 def test_local_only_pipeline_creates_outputs_without_mlflow_runs(local_mlflow, tiny_pipeline):
@@ -344,10 +414,11 @@ def test_run_experiment_selects_columns_for_benchmark_and_metadata(
     monkeypatch.setattr(experiment, "experiment_run", lambda *args, **kwargs: nullcontext(None))
     monkeypatch.setattr(experiment, "_train_or_load", lambda *args: (object(), checkpoint))
     monkeypatch.setattr(experiment, "evaluate_model", lambda *args: metrics)
+    monkeypatch.setattr(experiment, "surrogate_diagnostics", lambda *args: {})
     monkeypatch.setattr(
         experiment,
         "fit_auxiliary_models",
-        lambda *args: SimpleNamespace(seeds=(1, 2, 3)),
+        lambda *args: SimpleNamespace(surrogates=(), proxy=None, seeds=(1, 2, 3)),
     )
 
     def run_benchmark(**kwargs):

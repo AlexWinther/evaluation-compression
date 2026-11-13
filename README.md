@@ -188,6 +188,25 @@ just experiment --ase-update-every 100 --seed 42
 just experiment --protected-attribute gender --seed 42
 ```
 
+#### Surrogate diagnostics
+
+Before benchmarking, AT runs measure how well the surrogates and proxy track
+the classifier's cross-entropy losses. These measurements use the
+checkpoint-selection holdout, never the evaluation pool. Active testing can
+only beat uniform sampling when its acquisition scores follow the true losses.
+The diagnostics are:
+
+| Name | Meaning |
+|---|---|
+| `kossen_score_spearman` | Rank correlation of the Kossen acquisition score with the true loss |
+| `kossen_variance_gain` | Uniform variance divided by Kossen proposal variance (above 1 is better than uniform) |
+| `oracle_variance_gain` | The same ratio for a proposal proportional to the true loss (the upper limit) |
+| `ase_relative_bias` | Relative error of the ASE estimate before acquiring labels |
+| `ppat_proxy_correlation` | Correlation of the PPAT proxy loss with the true loss (λ = 0.5 helps above 0.25) |
+
+They are logged to MLflow under `diagnostics/` and saved in the metadata JSON
+as `surrogate_diagnostics`.
+
 #### Outputs and tracking
 
 AT runs save uniquely named curves CSVs and matching metadata JSON files under
@@ -237,14 +256,18 @@ training run replaces the checkpoint at its corresponding path. To load an
 existing checkpoint and skip classifier training:
 
 ```bash
-just experiment --reuse-trained-model --seed 42
+just experiment --reuse-trained-model
 just model-selection --reuse-trained-model
 ```
 
 `--checkpoint-dir` selects another checkpoint root. Reuse requires a matching
-checkpoint. AT still fits its auxiliary forests and runs evaluation and
-benchmarking. Checkpoints retain their original training configuration, seed,
-and history.
+checkpoint. AT reuse runs with the checkpoint's training seed, so the
+development holdout, auxiliary models and repetitions match the original run.
+Omit `--seed` to adopt it. A mismatching `--seed` stops the run before any
+prompt or data loading. Python callers get a `ValueError` if
+`training_config.random_state` differs from the checkpoint's seed. AT still
+fits its auxiliary forests and runs evaluation and benchmarking. Checkpoints
+retain their original training configuration, seed, and history.
 
 ### Python entry points
 
