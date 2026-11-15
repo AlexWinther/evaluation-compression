@@ -1,4 +1,9 @@
-"""Compare random forest image features on a held-out part of FairVision training data."""
+"""Compare random forest image features on a held-out part of FairVision training data.
+
+With a target checkpoint, the experiment also runs the surrogate diagnostics for each
+extractor. These show whether a better feature extractor only raises the forest's AUC
+or also makes its predictions track the losses of the model under test.
+"""
 
 import argparse
 from dataclasses import dataclass
@@ -14,12 +19,18 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
+from active_testing_benchmark.active_testing.diagnostics import surrogate_diagnostics
 from active_testing_benchmark.active_testing.surrogate import (
     RandomForestModule,
     SpatialTextureFeatures,
 )
 from active_testing_benchmark.config import RAW_DATA_DIR
-from active_testing_benchmark.experiments.utils import evaluate_model
+from active_testing_benchmark.experiments.utils import (
+    evaluate_model,
+    load_checkpoint,
+    model_from_checkpoint,
+    reused_checkpoint_seed,
+)
 from active_testing_benchmark.modeling.data import FairVisionData
 from active_testing_benchmark.modeling.models import FrozenImageNetFeatures, create_image_transform
 from active_testing_benchmark.modeling.provenance import log_dataset_provenance
@@ -60,10 +71,17 @@ def run_feature_experiment(
     data_root: Path = RAW_DATA_DIR / "fairvision",
     track: bool = True,
     extractors: tuple[str, ...] = EXTRACTOR_NAMES,
+    target_checkpoint: Path | None = None,
 ) -> pd.DataFrame:
     """Compare descriptors using the same forest and stratified training holdout.
 
     The official validation and test partitions are not used for feature selection.
+
+    `target_checkpoint` is an `AT_dev` classifier checkpoint. When given, the
+    experiment runs with the checkpoint's training seed. This reproduces the
+    checkpoint's 80/20 split, so the holdout contains no images the classifier was
+    trained on. Each forest then acts as both surrogate and proxy in
+    `surrogate_diagnostics`.
     """
     if n_estimators <= 0 or batch_size <= 0 or image_size <= 0:
         raise ValueError("n_estimators, batch_size, and image_size must be positive")
@@ -71,6 +89,8 @@ def run_feature_experiment(
         raise ValueError("Choose at least one extractor without duplicates")
     if set(extractors).difference(EXTRACTOR_NAMES):
         raise ValueError(f"Unknown extractor, choose from {EXTRACTOR_NAMES}")
+    if target_checkpoint is not None:
+        seed = reused_checkpoint_seed(target_checkpoint, seed)
     seed = seed if seed is not None else secrets.randbits(32)
     logger.info(f"Experiment seed: {seed}")
     device = device or (
@@ -89,6 +109,14 @@ def run_feature_experiment(
     fit, holdout = next(
         split_dataset(dataset, dataset.labels, validation_fraction=0.2, random_state=seed)
     )
+    target_model = None
+    if target_checkpoint is not None:
+        checkpoint = load_checkpoint(target_checkpoint)
+        if checkpoint["classes"] != dataset.classes or (
+            checkpoint["config"]["image_size"] != image_size
+        ):
+            raise ValueError(f"Checkpoint classes or image size do not match: {target_checkpoint}")
+        target_model = model_from_checkpoint(checkpoint, device)
     loader = DataLoader(fit, batch_size=batch_size, shuffle=False)
     rows = []
     factories = {
@@ -152,6 +180,12 @@ def run_feature_experiment(
                 log_metrics(overall, prefix="evaluation")
                 log_metrics({"fit_seconds": fit_seconds, "evaluation_seconds": evaluation_seconds})
                 log_metrics({"initialization_seconds": initialization_seconds})
+                diagnostics = {}
+                if target_model is not None:
+                    diagnostics = surrogate_diagnostics(
+                        target_model, (model,), model, holdout, device, batch_size
+                    )
+                    log_metrics(diagnostics, prefix="diagnostics")
                 if run is not None:
                     mlflow.log_param("feature_count", model.forest.n_features_in_)
                 rows.append(
@@ -161,6 +195,7 @@ def run_feature_experiment(
                         "validation_size": len(holdout),
                         "feature_count": model.forest.n_features_in_,
                         **overall,
+                        **diagnostics,
                         "fit_seconds": fit_seconds,
                         "initialization_seconds": initialization_seconds,
                         "evaluation_seconds": evaluation_seconds,
@@ -191,7 +226,18 @@ def main() -> None:
         default=EXTRACTOR_NAMES,
         help="Extractors to compare (default: all, including frozen ImageNet ResNet-18)",
     )
+    parser.add_argument(
+        "--target-checkpoint",
+        type=Path,
+        help="AT_dev classifier checkpoint. Adds surrogate diagnostics and uses its seed",
+    )
     args = parser.parse_args()
+    if args.target_checkpoint is not None:
+        # Fail before loading any data when the seed conflicts with the checkpoint.
+        try:
+            reused_checkpoint_seed(args.target_checkpoint, args.seed)
+        except (FileNotFoundError, ValueError) as error:
+            parser.error(str(error))
     results = run_feature_experiment(
         disease=args.disease,
         seed=args.seed,
@@ -202,6 +248,7 @@ def main() -> None:
         data_root=args.data_root,
         track=not args.no_mlflow,
         extractors=tuple(args.extractors),
+        target_checkpoint=args.target_checkpoint,
     )
     print(results.to_string(index=False))
 

@@ -87,6 +87,20 @@ fit and evaluation time, and split provenance. Use `--disease`,
 defaults, and `--no-mlflow` to run without tracking. The command prints a
 comparison table when complete.
 
+A higher AUC does not by itself make a better active-testing surrogate. To also
+check how well each forest tracks the losses of the model under test, pass an
+`AT_dev` checkpoint:
+
+```bash
+just feature-experiment --target-checkpoint models/experiment/AT_dev/dr/resnet.pt
+```
+
+Each extractor then also reports the
+[surrogate diagnostics](#surrogate-diagnostics), with the forest acting as both
+surrogate and proxy. The run uses the checkpoint's training seed, so the holdout
+is the checkpoint's own selection holdout and contains no images the classifier
+was trained on. Omit `--seed` to adopt it. A different `--seed` stops the run.
+
 ### Model selection
 
 Compare ResNet-18 and EfficientNet-B0 using:

@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import Dataset
 
 from active_testing_benchmark.experiments import feature_experiment
+from active_testing_benchmark.modeling.models import create_model
 
 
 class SyntheticData(Dataset):
@@ -90,3 +91,67 @@ def test_handcrafted_selection_does_not_initialize_backbone(monkeypatch):
         n_estimators=3, device="cpu", track=False, extractors=("spatial_texture",)
     )
     assert results["extractor"].tolist() == ["spatial_texture"]
+
+
+@pytest.fixture
+def target_checkpoint(tmp_path):
+    """A small saved classifier checkpoint trained, nominally, with seed 5."""
+    model = create_model("resnet", out_dim=2, use_pretrained=False)
+    path = tmp_path / "resnet.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": {"model_type": "resnet", "image_size": 224, "random_state": 5},
+            "classes": ["zero", "one"],
+        },
+        path,
+    )
+    return path
+
+
+def test_target_checkpoint_adds_diagnostics_and_uses_its_seed(monkeypatch, target_checkpoint):
+    monkeypatch.setattr(feature_experiment, "FairVisionData", SyntheticData)
+    splits = []
+    split_dataset = feature_experiment.split_dataset
+
+    def record_split(*args, **kwargs):
+        splits.append(kwargs["random_state"])
+        return split_dataset(*args, **kwargs)
+
+    monkeypatch.setattr(feature_experiment, "split_dataset", record_split)
+    results = feature_experiment.run_feature_experiment(
+        n_estimators=3,
+        batch_size=4,
+        device="cpu",
+        track=False,
+        extractors=("pooled_pixels", "spatial_texture"),
+        target_checkpoint=target_checkpoint,
+    )
+    assert splits == [5]
+    assert results["kossen_variance_gain"].gt(0).all()
+    assert results["oracle_variance_gain"].ge(results["kossen_variance_gain"]).all()
+    assert {
+        "kossen_score_spearman",
+        "kossen_error_auc",
+        "ase_relative_bias",
+        "ppat_proxy_correlation",
+    } <= set(
+        results.columns
+    )
+
+
+def test_target_checkpoint_rejects_a_different_seed(monkeypatch, target_checkpoint, capsys):
+    monkeypatch.setattr(feature_experiment, "FairVisionData", SyntheticData)
+    with pytest.raises(ValueError, match="does not match the seed 5"):
+        feature_experiment.run_feature_experiment(
+            seed=6, device="cpu", track=False, target_checkpoint=target_checkpoint
+        )
+    arguments = ["feature", "--seed", "6", "--target-checkpoint", str(target_checkpoint)]
+    monkeypatch.setattr("sys.argv", arguments)
+    monkeypatch.setattr(
+        feature_experiment, "run_feature_experiment", lambda **kwargs: pytest.fail("Ran")
+    )
+    with pytest.raises(SystemExit) as error:
+        feature_experiment.main()
+    assert error.value.code == 2
+    assert "does not match" in capsys.readouterr().err
