@@ -22,6 +22,7 @@ from active_testing_benchmark.experiments.utils import (
     _log_evaluation,
     _train_or_load,
     evaluate_model,
+    reused_checkpoint_seed,
 )
 from active_testing_benchmark.modeling.data import FairVisionData
 from active_testing_benchmark.modeling.models import create_image_transform
@@ -55,25 +56,6 @@ def _checkpoint_path(checkpoint_dir: Path, experiment: str, disease: str, model_
     return Path(checkpoint_dir) / experiment / disease.lower() / f"{model_type}.pt"
 
 
-def _reused_checkpoint_seed(checkpoint_path: Path, requested_seed: int | None) -> int:
-    """Return the seed that trained a reused checkpoint, rejecting a conflicting seed.
-
-    The seed also fixes the 80/20 development split, the auxiliary-model seeds and the
-    benchmark repetitions. A reused model must therefore run with its training seed,
-    or the holdout can contain images the model was trained on.
-    """
-    if not Path(checkpoint_path).exists():
-        raise FileNotFoundError(f"No checkpoint to reuse at {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    training_seed = int(checkpoint["config"]["random_state"])
-    if requested_seed is not None and requested_seed != training_seed:
-        raise ValueError(
-            f"--seed {requested_seed} does not match the seed {training_seed} that trained "
-            f"the reused checkpoint {checkpoint_path}. Omit --seed or pass --seed {training_seed}."
-        )
-    return training_seed
-
-
 def _resolve_config(
     training_config: TrainingConfig | None,
     checkpoint_path: Path,
@@ -84,7 +66,7 @@ def _resolve_config(
         return training_config or TrainingConfig(random_state=secrets.randbits(32))
     config = training_config or TrainingConfig()
     requested_seed = training_config.random_state if training_config is not None else None
-    seed = _reused_checkpoint_seed(checkpoint_path, requested_seed)
+    seed = reused_checkpoint_seed(checkpoint_path, requested_seed)
     return replace(config, random_state=seed)
 
 
@@ -406,7 +388,7 @@ def main():
             args.checkpoint_dir, experiment_name, args.disease, TrainingConfig().model_type
         )
         try:
-            seed = _reused_checkpoint_seed(checkpoint_path, args.seed)
+            seed = reused_checkpoint_seed(checkpoint_path, args.seed)
         except (FileNotFoundError, ValueError) as error:
             parser.error(str(error))
         logger.info(f"Experiment seed: {seed} (from the reused checkpoint)")

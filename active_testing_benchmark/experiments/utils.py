@@ -3,6 +3,7 @@
 from collections import defaultdict
 from dataclasses import asdict
 import json
+from pathlib import Path
 import random
 from time import perf_counter
 
@@ -83,9 +84,43 @@ def evaluate_model(
     return result
 
 
+def load_checkpoint(checkpoint_path: Path) -> dict:
+    """Load a checkpoint saved by `_train_or_load` onto the CPU."""
+    return torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+
+def model_from_checkpoint(checkpoint: dict, device: torch.device | str) -> nn.Module:
+    """Rebuild the trained classifier stored in a checkpoint, in evaluation mode."""
+    model = create_model(
+        checkpoint["config"]["model_type"],
+        out_dim=len(checkpoint["classes"]),
+        use_pretrained=False,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model.to(device).eval()
+
+
+def reused_checkpoint_seed(checkpoint_path: Path, requested_seed: int | None) -> int:
+    """Return the seed that trained a reused checkpoint, rejecting a conflicting seed.
+
+    The seed also fixes the 80/20 development split, the auxiliary-model seeds and the
+    benchmark repetitions. A reused model must therefore run with its training seed,
+    or the holdout can contain images the model was trained on.
+    """
+    if not Path(checkpoint_path).exists():
+        raise FileNotFoundError(f"No checkpoint to reuse at {checkpoint_path}")
+    training_seed = int(load_checkpoint(checkpoint_path)["config"]["random_state"])
+    if requested_seed is not None and requested_seed != training_seed:
+        raise ValueError(
+            f"--seed {requested_seed} does not match the seed {training_seed} that trained "
+            f"the reused checkpoint {checkpoint_path}. Omit --seed or pass --seed {training_seed}."
+        )
+    return training_seed
+
+
 def _train_or_load(config, classes, train, validation, device, checkpoint_path, reuse):
     if reuse:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        checkpoint = load_checkpoint(checkpoint_path)
         if checkpoint["classes"] != classes or any(
             checkpoint["config"][name] != getattr(config, name)
             for name in ("model_type", "image_size")
@@ -93,10 +128,7 @@ def _train_or_load(config, classes, train, validation, device, checkpoint_path, 
             raise ValueError(
                 f"Checkpoint does not match the model, classes or image size: {checkpoint_path}"
             )
-        model = create_model(config.model_type, out_dim=len(classes), use_pretrained=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.to(device)
-        model.eval()
+        model = model_from_checkpoint(checkpoint, device)
         logger.info(
             f"Loaded {checkpoint_path} (training seed: {checkpoint['config']['random_state']})"
         )
