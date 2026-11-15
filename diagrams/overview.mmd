@@ -15,7 +15,7 @@ flowchart LR
     P[("Unlabeled pool<br/>N fundus images<br/>+ demographics")]
     F["Fixed classifier <i>f</i><br/>ResNet-18"]
     S["Surrogate and proxy<br/>random forests"]
-    M["<b>Evaluation method</b><br/>passive: uniform, stratified<br/>active: LURE, ASE, PPAT"]
+    M["<b>Evaluation method</b><br/>passive: uniform, stratified<br/>active: Kossen et al., ASE, PPAT"]
   end
 
   subgraph LOOP["Repeat until M labels"]
