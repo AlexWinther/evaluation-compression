@@ -8,10 +8,12 @@ from active_testing_benchmark.active_testing import (
     surrogate,
 )
 from active_testing_benchmark.active_testing.diagnostics import (
+    confidence_binned_losses,
     surrogate_diagnostics,
     variance_gain,
 )
 from active_testing_benchmark.active_testing.surrogate import (
+    ConstantClassSurrogate,
     RandomForestModule,
     SpatialTextureFeatures,
     update_random_forest_surrogates,
@@ -147,11 +149,56 @@ def test_variance_gain_is_one_for_uniform_scores_and_large_for_the_true_loss():
     assert variance_gain(1 / losses, losses) < 1
 
 
+def hypothetical_losses(positive_probabilities: list[float]) -> np.ndarray:
+    """Return binary cross-entropy for each item if its label were class 0 or class 1."""
+    p = np.array(positive_probabilities)
+    return -np.log(np.column_stack([1 - p, p]))
+
+
+def test_confidence_binning_cannot_separate_errors_at_the_same_confidence():
+    # Four items predicted class 1 with 0.9 confidence, one of them wrongly.
+    class_losses = hypothetical_losses([0.9, 0.9, 0.9, 0.9])
+    losses = class_losses[np.arange(4), [1, 1, 1, 0]]
+    binned = confidence_binned_losses(class_losses, losses, n_bins=1)
+    np.testing.assert_allclose(binned, np.full(4, losses.mean()))
+    # Equal scores give the uniform proposal, so the confident error stays hidden.
+    assert variance_gain(binned, losses) == pytest.approx(1.0)
+    assert variance_gain(losses, losses) > 1
+
+
+def test_rms_confidence_proposal_is_never_worse_than_uniform_but_mean_can_be():
+    # Eight confident predictions with one confident error, and eight moderate errors.
+    class_losses = hypothetical_losses([0.99] * 8 + [0.6] * 8)
+    labels = [1] * 7 + [0] + [0] * 8
+    losses = class_losses[np.arange(16), labels]
+    mean_proposal = confidence_binned_losses(class_losses, losses, n_bins=2)
+    rms_proposal = np.sqrt(confidence_binned_losses(class_losses, losses**2, n_bins=2))
+    # The mean undersamples the confident bin, which holds the largest single loss.
+    assert variance_gain(mean_proposal, losses) < 1
+    assert variance_gain(rms_proposal, losses) > 1
+
+
+def test_confidence_binning_keeps_losses_that_confidence_explains():
+    # Each confidence level, per predicted class, has its own bin and a single loss.
+    class_losses = hypothetical_losses([0.95, 0.7, 0.55, 0.4, 0.2, 0.05])
+    labels = [1, 1, 0, 0, 0, 1]
+    losses = class_losses[np.arange(6), labels]
+    binned = confidence_binned_losses(class_losses, losses, n_bins=3)
+    np.testing.assert_allclose(binned, losses)
+
+
 class Scaled(nn.Module):
     """Return confident logits that put almost all mass on the input's one-hot class."""
 
     def forward(self, images):
         return 20 * images
+
+
+class Inverted(nn.Module):
+    """Return confident logits for the class opposite to the input's one-hot class."""
+
+    def forward(self, images):
+        return 20 * (1 - images)
 
 
 def test_surrogate_diagnostics_separate_informative_and_uninformative_surrogates():
@@ -168,9 +215,35 @@ def test_surrogate_diagnostics_separate_informative_and_uninformative_surrogates
     uninformative = surrogate_diagnostics(model, (constant,), constant, dataset, "cpu", 3)
 
     assert informative["kossen_variance_gain"] > uninformative["kossen_variance_gain"]
+    # A surrogate that predicts the wrong label scores the model's correct images highest.
+    inverted = surrogate_diagnostics(model, (Inverted(),), Scaled(), dataset, "cpu", 3)
+    assert informative["kossen_error_auc"] == pytest.approx(1.0)
+    assert inverted["kossen_error_auc"] == pytest.approx(0.0)
     assert informative["kossen_variance_gain"] == pytest.approx(
         informative["oracle_variance_gain"], rel=1e-3
     )
     assert informative["ase_relative_bias"] == pytest.approx(0.0, abs=1e-6)
+    # The surrogate-free diagnostics depend only on the model, not on the surrogates.
+    for name in ("target_variance_gain", "confidence_oracle_variance_gain"):
+        assert informative[name] == pytest.approx(uninformative[name])
+        assert informative[name] > 0
     # A proxy that predicts the true label has proxy losses equal to the true losses.
     assert informative["ppat_proxy_correlation"] == pytest.approx(1.0)
+
+
+def test_constant_class_surrogate_scores_the_loss_of_its_class():
+    surrogate = ConstantClassSurrogate(num_classes=2, target_class=1)
+    images = torch.randn(4, 2)
+    probabilities = surrogate(images).softmax(dim=1)
+    torch.testing.assert_close(probabilities, torch.tensor([[0.0, 1.0]] * 4), atol=1e-6, rtol=0)
+
+    # The model is sure of class 0 for the first two items and of class 1 for the rest.
+    logits = torch.tensor([[5.0, -5.0], [5.0, -5.0], [-5.0, 5.0], [-5.0, 5.0]])
+    expected_losses = (probabilities * -logits.log_softmax(dim=1)).sum(dim=1)
+    torch.testing.assert_close(expected_losses, -logits.log_softmax(dim=1)[:, 1], atol=1e-5, rtol=0)
+    assert expected_losses[0] > expected_losses[2]
+
+
+def test_constant_class_surrogate_rejects_an_unknown_class():
+    with pytest.raises(ValueError, match="target_class"):
+        ConstantClassSurrogate(num_classes=2, target_class=2)

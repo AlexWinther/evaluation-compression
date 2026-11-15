@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 import torch
@@ -77,6 +79,31 @@ class MeanProbabilityEnsemble(nn.Module):
             [member(inputs).softmax(dim=-1) for member in self.members]
         ).mean(dim=0)
         return probabilities.clamp_min(torch.finfo(probabilities.dtype).tiny).log()
+
+
+class ConstantClassSurrogate(nn.Module):
+    """Predict one class with certainty for every input, ignoring the image.
+
+    This is a baseline that needs no training. Under it, the Kossen score of an
+    image is the model's cross-entropy if the label were `target_class`, so it ranks
+    images by how strongly the model rejects that class. With the positive class,
+    the score is highest for the images the model is most sure are negative, which
+    includes the confident misses that hold most of the loss on FairVision DR.
+    """
+
+    def __init__(self, num_classes: int, target_class: int) -> None:
+        super().__init__()
+        if not 0 <= target_class < num_classes:
+            raise ValueError(f"target_class must be in [0, {num_classes})")
+        self.num_classes = num_classes
+        self.target_class = target_class
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # Log-probabilities of a one-hot distribution. The tiny floor keeps the other
+        # classes finite, as in RandomForestModule.
+        logits = torch.full((len(images), self.num_classes), math.log(1e-8))
+        logits[:, self.target_class] = 0.0
+        return logits.to(images.device)
 
 
 class RandomForestModule(nn.Module):

@@ -199,8 +199,11 @@ The diagnostics are:
 | Name | Meaning |
 |---|---|
 | `kossen_score_spearman` | Rank correlation of the Kossen acquisition score with the true loss |
+| `kossen_error_auc` | AUC of the Kossen score for separating the images the classifier misclassifies from the rest (0.5 is chance) |
 | `kossen_variance_gain` | Uniform variance divided by Kossen proposal variance (above 1 is better than uniform) |
 | `oracle_variance_gain` | The same ratio for a proposal proportional to the true loss (the upper limit) |
+| `target_variance_gain` | The same ratio when the classifier is its own surrogate (Kossen without a surrogate, "Ori" in Lee et al., 2024) |
+| `confidence_oracle_variance_gain` | The same ratio for the best proposal using only the classifier's confidence, proportional to the RMS loss per confidence bin (an optimistic in-sample estimate, not a strict limit, of what any surrogate-free or recalibrated proposal can reach, never below about 1) |
 | `ase_relative_bias` | Relative error of the ASE estimate before acquiring labels |
 | `ppat_proxy_correlation` | Correlation of the PPAT proxy loss with the true loss (λ = 0.5 helps above 0.25) |
 
