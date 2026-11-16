@@ -9,8 +9,10 @@ from active_testing_benchmark.active_testing import (
 )
 from active_testing_benchmark.active_testing.diagnostics import (
     confidence_binned_losses,
+    proxy_diagnostics,
     surrogate_diagnostics,
     variance_gain,
+    xwed_scores,
 )
 from active_testing_benchmark.active_testing.surrogate import (
     ConstantClassSurrogate,
@@ -341,6 +343,51 @@ def test_frozen_feature_probe_returns_log_probabilities_for_every_class():
     assert (log_probabilities.argmax(dim=1) == labels).float().mean() > 0.9
 
 
+def test_proxy_diagnostics_reward_a_proxy_that_knows_the_labels():
+    labels = np.array([0, 0, 0, 1, 0, 1, 0, 0])
+    # A model that is confident in class 0 everywhere, so it misses both positives.
+    class_losses = np.tile(-np.log([0.9, 0.1]), (len(labels), 1))
+    class_losses[::2] = -np.log([0.7, 0.3])
+    oracle = np.eye(2)[labels]
+    perfect = proxy_diagnostics(class_losses, labels, oracle)
+    assert perfect["ppat_proxy_correlation"] == pytest.approx(1.0)
+    assert perfect["ppat_lambda_dagger"] == pytest.approx(1.0)
+    assert perfect["proxy_accuracy"] == 1.0
+    assert perfect["proxy_class_frequency_error"] == 0.0
+    # A proxy that never predicts the rare class misses its whole frequency.
+    negative = proxy_diagnostics(class_losses, labels, np.tile([0.8, 0.2], (len(labels), 1)))
+    assert negative["proxy_class_frequency_error"] == pytest.approx(labels.mean())
+    assert negative["proxy_auc"] == pytest.approx(0.5)
+    assert negative["ppat_soft_proxy_correlation"] is not None
+
+
+def test_xwed_is_zero_when_members_agree_and_grows_with_disagreement():
+    class_losses = np.array([[0.1, 2.0], [0.1, 2.0]])
+    agree = np.array([[[0.8, 0.2], [0.8, 0.2]], [[0.8, 0.2], [0.8, 0.2]]])
+    disagree = np.array([[[0.8, 0.2], [0.99, 0.01]], [[0.8, 0.2], [0.5, 0.5]]])
+    np.testing.assert_allclose(xwed_scores(agree, class_losses), 0.0, atol=1e-12)
+    scores = xwed_scores(disagree, class_losses)
+    assert scores[0] == pytest.approx(0.0)
+    assert scores[1] > 0
+
+
+def test_surrogate_diagnostics_report_calibration_and_member_diversity():
+    labels = [0, 1, 0, 1, 1, 0, 0, 1]
+    images = torch.eye(2)[labels]
+    dataset = [{"image": image, "label": label} for image, label in zip(images, labels)]
+    torch.manual_seed(0)
+    model = nn.Linear(2, 2)
+    single = surrogate_diagnostics(model, (Scaled(),), Scaled(), dataset, "cpu", 3)
+    assert single["member_disagreement"] is None
+    assert single["xwed_spearman"] is None
+    assert single["surrogate_class_frequency_error"] == pytest.approx(0.0, abs=1e-6)
+    pair = surrogate_diagnostics(model, (Scaled(), Inverted()), Scaled(), dataset, "cpu", 3)
+    assert pair["member_disagreement"] == pytest.approx(1.0)
+    assert pair["xwed_spearman"] is not None
+    assert pair["surrogate_nll"] > single["surrogate_nll"]
+    assert pair["ppat_lambda_dagger"] == pytest.approx(1.0)
+
+
 def test_exact_oracle_returns_the_true_labels_and_ignores_noise():
     labels = np.array([0, 1, 1, 0, 2])
     logits = np.zeros((5, 3))
@@ -395,3 +442,37 @@ def test_model_noisy_oracle_interpolates_between_the_labels_and_the_model():
 def test_label_oracle_rejects_invalid_settings(arguments, message):
     with pytest.raises(ValueError, match=message):
         LabelOracle(*arguments)
+
+
+def test_surrogate_diagnostics_reach_the_ceiling_with_an_oracle_and_fall_with_noise():
+    rng = np.random.default_rng(0)
+    labels = (rng.random(400) < 0.3).astype(int)
+    images = torch.from_numpy(rng.normal(size=(400, 2))).float()
+    dataset = [{"image": image, "label": int(label)} for image, label in zip(images, labels)]
+    model = nn.Identity()
+
+    def diagnostics(kind, noise):
+        return surrogate_diagnostics(
+            model,
+            (LabelOracle(2, kind, noise, seed=1),),
+            LabelOracle(2, kind, noise, seed=2, hard_labels=True),
+            dataset,
+            "cpu",
+            64,
+        )
+
+    exact = diagnostics("oracle", 0.0)
+    assert exact["kossen_variance_gain"] == pytest.approx(exact["oracle_variance_gain"], rel=1e-3)
+    assert exact["kossen_score_spearman"] == pytest.approx(1.0)
+    assert exact["ppat_proxy_correlation"] == pytest.approx(1.0)
+    assert exact["ase_relative_bias"] == pytest.approx(0.0, abs=1e-6)
+    for kind in ("noisy_oracle", "model_noisy_oracle"):
+        noisy = diagnostics(kind, 0.3)
+        assert noisy["kossen_score_spearman"] < 1.0
+        assert noisy["kossen_variance_gain"] < exact["kossen_variance_gain"]
+        assert noisy["ppat_proxy_correlation"] < 1.0
+    # At full noise the correlated oracle is the model used as its own surrogate.
+    model_only = diagnostics("model_noisy_oracle", 1.0)
+    assert model_only["kossen_variance_gain"] == pytest.approx(
+        model_only["target_variance_gain"], rel=1e-4
+    )
