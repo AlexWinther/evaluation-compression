@@ -591,3 +591,25 @@ def test_cli_rejects_nonpositive_ase_update_frequency(monkeypatch, capsys, frequ
         experiment.main()
     assert error.value.code == 2
     assert "--ase-update-every must be positive" in capsys.readouterr().err
+
+
+def test_loss_concentration_finds_the_share_of_loss_held_by_confident_errors():
+    from active_testing_benchmark.experiments.pool_diagnostics import loss_concentration
+
+    # Nineteen confident correct predictions and one confident error.
+    labels = [0] * 19 + [1]
+    images = torch.zeros(20, 2)
+    images[:, 0] = 1.0
+    dataset = [{"image": image, "label": label} for image, label in zip(images, labels)]
+
+    class Confident(nn.Module):
+        def forward(self, X):
+            return 10 * X
+
+    result = loss_concentration(Confident(), dataset, "cpu", batch_size=8, top_fraction=0.05)
+    assert result["misclassified"] == 1
+    assert result["top_misclassified"] == 1
+    assert result["top_loss_share"] == pytest.approx(result["misclassified_loss_share"])
+    assert result["top_loss_share"] > 0.9
+    assert result["top_median_confidence"] > 0.99
+    assert result["class_counts"] == [19, 1]
