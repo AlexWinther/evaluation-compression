@@ -98,7 +98,32 @@ def prepare_evaluation_pool(
     )
 
 
-def _reporting_memberships(pool: EvaluationPool) -> dict[str, tuple[int, ...]]:
+def subset_evaluation_pool(pool: EvaluationPool, positions) -> EvaluationPool:
+    """Return the pool restricted to `positions`, in the given order.
+
+    Inputs, labels and memberships are indexed together, so position i of the subset
+    is the item at `positions[i]` of the original pool. The stratification partition
+    is cleared, as in `prepare_evaluation_pool`, and set again by the runner.
+    """
+    positions = [int(position) for position in positions]
+    if not positions or len(set(positions)) != len(positions):
+        raise ValueError("A pool subset needs nonempty, unique positions")
+    if min(positions) < 0 or max(positions) >= len(pool):
+        raise ValueError("Pool subset positions must lie within the pool")
+    index = torch.as_tensor(positions, dtype=torch.long, device=pool.X_pool.device)
+    return EvaluationPool(
+        X_pool=pool.X_pool[index],
+        y_pool=pool.y_pool[index.to(pool.y_pool.device)],
+        stratification_groups=None,
+        protected_columns=pool.protected_columns,
+        attribute_values={
+            column: [values[position] for position in positions]
+            for column, values in pool.attribute_values.items()
+        },
+    )
+
+
+def reporting_memberships(pool: EvaluationPool) -> dict[str, tuple[int, ...]]:
     """Build marginal reporting groups for the requested attributes only."""
     groups: dict[str, list[int]] = {}
     for column in pool.protected_columns:
@@ -162,7 +187,7 @@ def run_active_evaluation(
         stratification_groups=stratification_groups,
         model=model,
         loss_fn=loss_fn,
-        subgroup_indices=_reporting_memberships(pool),
+        subgroup_indices=reporting_memberships(pool),
     )
 
     # Create the inital state

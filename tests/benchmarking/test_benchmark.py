@@ -23,9 +23,10 @@ from active_testing_benchmark.active_testing.runner import (
     run_active_evaluation,
 )
 from active_testing_benchmark.active_testing.sota import (
+    KOSSEN_RETRAINING_SCHEDULE,
     ActiveSurrogateEstimator,
 )
-from active_testing_benchmark.active_testing.surrogate import RandomForestModule
+from active_testing_benchmark.active_testing.surrogate import LabelOracle, RandomForestModule
 from active_testing_benchmark.benchmark import build_method_configs
 
 
@@ -376,3 +377,311 @@ def test_benchmark_kossen_and_ppat_share_the_same_predictive_mixture():
     np.testing.assert_allclose(kossen_probs, ppat_probs)
     expected_scores = (ppat_probs * ppat_state["hypothetical_losses"]).sum(axis=1)
     np.testing.assert_allclose(kossen._acquisition_scores(kossen_state), expected_scores)
+
+
+def method_kwargs(configs, method_class):
+    return next(kwargs for cls, kwargs in configs if cls is method_class)
+
+
+def test_methods_share_the_floor_lambda_and_forest_retraining_schedule():
+    auxiliary = SimpleNamespace(
+        surrogates=fitted_surrogates(), proxy=nn.Identity(), surrogate_kind="forest"
+    )
+    configs = build_method_configs(auxiliary, 2)
+    kossen = method_kwargs(configs, KossenActiveTesting)
+    ase = method_kwargs(configs, ActiveSurrogateEstimator)
+    ppat = method_kwargs(configs, PredictionPoweredActiveTesting)
+    assert kossen["exploration"] == ppat["exploration"] == 0.2
+    assert ppat["lambda_value"] == 0.5
+    assert ase["update_schedule"] == KOSSEN_RETRAINING_SCHEDULE
+    assert "update_every" not in ase
+    assert ase["surrogate_update"] is benchmark.update_random_forest_surrogates
+    # One shared surrogate: AT averages the members that ASE and PPAT use.
+    assert list(kossen["surrogate"].members) == ase["surrogate"] == ppat["surrogate"]
+
+
+def test_deep_ensemble_surrogate_is_never_refitted_or_copied(monkeypatch):
+    members = (FixedLogits([0.7, 0.3]), FixedLogits([0.6, 0.4]))
+    auxiliary = SimpleNamespace(
+        surrogates=members, proxy=nn.Identity(), surrogate_kind="resnet_ensemble"
+    )
+    configs = build_method_configs(auxiliary, 2, ase_update_every=10)
+    ase_config = next(item for item in configs if item[0] is ActiveSurrogateEstimator)
+    assert "surrogate_update" not in ase_config[1]
+    seen = []
+
+    def fake_run(*, method, **kwargs):
+        seen.append(method.surrogate)
+        return []
+
+    monkeypatch.setattr(benchmark, "run_active_evaluation", fake_run)
+    pool = EvaluationPool(torch.ones(3, 2), torch.ones(3).long(), ["A"] * 3, ("group",))
+    benchmark.run_repetition(
+        seed=0,
+        device="cpu",
+        dataset=pool,
+        model=nn.Identity(),
+        method_configs=[ase_config],
+        budget=3,
+        protected_columns=("group",),
+    )
+    assert all(member is original for member, original in zip(seen[0], members))
+
+
+@pytest.mark.parametrize("frequency,valid", [(1, True), (0, False), (-2, False)])
+def test_ase_update_frequency_accepts_every_positive_value(frequency, valid):
+    auxiliary = SimpleNamespace(surrogates=fitted_surrogates(), proxy=nn.Identity())
+    if not valid:
+        with pytest.raises(ValueError, match="positive"):
+            build_method_configs(auxiliary, 2, ase_update_every=frequency)
+        return
+    ase = method_kwargs(build_method_configs(auxiliary, 2, ase_update_every=frequency),
+                        ActiveSurrogateEstimator)
+    assert ase["update_every"] == 1
+
+
+class LabelledDataset:
+    """Twelve two-feature images, a quarter of them positive, with a gender per image."""
+
+    def __init__(self, size=12):
+        self.size = size
+        self.reads = 0
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, index):
+        self.reads += 1
+        return {
+            "image": torch.tensor([float(index % 3), float(index % 2)]),
+            "label": int(index % 4 == 0),
+            "subgroups": {"gender": "female" if index % 2 else "male"},
+        }
+
+
+def test_class_stratified_positions_keep_class_shares_and_depend_only_on_the_seed():
+    labels = np.array([0] * 70 + [1] * 20 + [2] * 10)
+    positions = benchmark.class_stratified_positions(labels, 30, benchmark.pool_rng(7, 0))
+    assert len(set(positions)) == 30
+    assert list(positions) == sorted(positions)
+    assert np.bincount(labels[positions]).tolist() == [21, 6, 3]
+    again = benchmark.class_stratified_positions(labels, 30, benchmark.pool_rng(7, 0))
+    other = benchmark.class_stratified_positions(labels, 30, benchmark.pool_rng(7, 1))
+    np.testing.assert_array_equal(positions, again)
+    assert not np.array_equal(positions, other)
+    # Largest remainders fill the places that rounding down leaves open.
+    shares = benchmark.class_stratified_positions(labels, 11, benchmark.pool_rng(7, 0))
+    assert np.bincount(labels[shares]).tolist() == [8, 2, 1]
+    with pytest.raises(ValueError, match="pool size"):
+        benchmark.class_stratified_positions(labels, 101, benchmark.pool_rng(7, 0))
+
+
+def test_subset_pool_indexes_inputs_labels_and_memberships_together():
+    from active_testing_benchmark.active_testing.runner import subset_evaluation_pool
+
+    pool = prepare_evaluation_pool(LabelledDataset(), "cpu", ["gender"])
+    subset = subset_evaluation_pool(pool, [8, 1, 4])
+    assert subset.X_pool.tolist() == pool.X_pool[[8, 1, 4]].tolist()
+    assert subset.y_pool.tolist() == [1, 0, 1]
+    assert subset.attribute_values["gender"] == ["gender=male", "gender=female", "gender=male"]
+    assert subset.protected_columns == ("gender",)
+    with pytest.raises(ValueError, match="unique"):
+        subset_evaluation_pool(pool, [1, 1])
+    with pytest.raises(ValueError, match="within the pool"):
+        subset_evaluation_pool(pool, [12])
+
+
+def test_cached_predictions_match_the_modules_and_refit_forests_in_isolation():
+    from active_testing_benchmark.active_testing.prediction_cache import cache_pool_predictions
+    from active_testing_benchmark.active_testing.surrogate import (
+        update_random_forest_surrogates,
+    )
+
+    torch.manual_seed(0)
+    pool = prepare_evaluation_pool(LabelledDataset(), "cpu", ["gender"])
+    model = nn.Linear(2, 2)
+    extractor = nn.Linear(2, 3)
+    development = [
+        {"image": torch.tensor([float(i % 3), float(i % 2)]), "label": i % 2} for i in range(8)
+    ]
+    forests = tuple(
+        RandomForestModule(2, extractor, n_estimators=5, random_state=seed).fit(
+            DataLoader(development, batch_size=4)
+        )
+        for seed in (1, 2)
+    )
+    auxiliary = SimpleNamespace(surrogates=(*forests, FixedLogits([0.3, 0.7])), proxy=model)
+
+    index_pool, cached_model, cached_auxiliary = cache_pool_predictions(pool, model, auxiliary)
+
+    assert index_pool.X_pool.tolist() == list(range(12))
+    assert index_pool.y_pool is pool.y_pool
+    indices = torch.tensor([5, 0, 11])
+    images = pool.X_pool[indices]
+    with torch.inference_mode():
+        torch.testing.assert_close(cached_model(indices), model(images))
+        torch.testing.assert_close(cached_auxiliary.proxy(indices), model(images))
+        for cached, original in zip(cached_auxiliary.surrogates, auxiliary.surrogates):
+            torch.testing.assert_close(cached(indices), original(images))
+    # The forests share one feature lookup and keep their fitted state.
+    cached_forests = cached_auxiliary.surrogates[:2]
+    assert cached_forests[0].feature_extractor is cached_forests[1].feature_extractor
+    assert all(forest.feature_extractor is extractor for forest in forests)
+
+    # Refitting through the cache equals refitting from images, and leaves the originals.
+    reference = deepcopy(forests)
+    labels = torch.tensor([1, 0, 1])
+    update_random_forest_surrogates(cached_forests, indices, labels)
+    update_random_forest_surrogates(reference, images, labels)
+    with torch.inference_mode():
+        for cached, refitted in zip(cached_forests, reference):
+            torch.testing.assert_close(cached(indices), refitted(images))
+    for forest in forests:
+        assert len(forest.forest.estimators_[0].tree_.value) > 0
+        assert forest._development_features.shape == (8, 3)
+
+
+def run_small_benchmark(dataset, **kwargs):
+    defaults = dict(
+        model=nn.Identity(),
+        dataset=dataset,
+        auxiliary=SimpleNamespace(
+            surrogates=(FixedLogits([0.7, 0.3]), FixedLogits([0.4, 0.6])),
+            proxy=FixedLogits([0.5, 0.5]),
+            surrogate_kind="resnet_ensemble",
+        ),
+        num_classes=2,
+        device="cpu",
+        seed=3,
+        repetitions=3,
+        budget=4,
+        protected_columns=("gender",),
+        stratification_attribute="gender",
+    )
+    return benchmark.run_benchmark(**{**defaults, **kwargs})
+
+
+def pool_losses(dataset):
+    pool = prepare_evaluation_pool(dataset, "cpu", ["gender"])
+    losses = nn.functional.cross_entropy(pool.X_pool, pool.y_pool, reduction="none")
+    # Per-item losses in double precision, as the runner sums `loss.item()` values.
+    return pool, losses.numpy().astype(np.float64)
+
+
+def test_frozen_pool_rows_store_the_full_pool_reference():
+    dataset = LabelledDataset()
+    curves = run_small_benchmark(dataset)
+    # The images are read once, although three repetitions evaluate them.
+    assert dataset.reads == 12
+    pool, losses = pool_losses(dataset)
+    assert set(curves["pool_size"]) == {12}
+    np.testing.assert_allclose(curves["reference_risk"], losses.mean())
+    female = np.array(pool.attribute_values["gender"]) == "gender=female"
+    np.testing.assert_allclose(curves["reference_risk gender=female"], losses[female].mean())
+    assert set(curves["pool_n_gender=female"]) == {6}
+    # At the full budget every label-based estimate recovers the reference. ASE with a
+    # fixed surrogate predicts from the surrogate alone, as in "ASE (const.)".
+    full = run_small_benchmark(LabelledDataset(), budget=12, repetitions=1)
+    final = full[(full.n_labels == 12) & (full.method != "ActiveSurrogateEstimator")]
+    assert len(final) == 5
+    np.testing.assert_allclose(final["risk"], final["reference_risk"])
+
+
+def test_a_pool_of_the_whole_dataset_reproduces_the_frozen_pool():
+    frozen = run_small_benchmark(LabelledDataset())
+    whole = run_small_benchmark(LabelledDataset(), pool_size=12)
+    pd_testing = pytest.importorskip("pandas.testing")
+    pd_testing.assert_frame_equal(frozen, whole)
+
+
+def test_resampled_pools_are_stratified_shared_by_methods_and_scored_against_themselves():
+    dataset = LabelledDataset()
+    curves = run_small_benchmark(dataset, pool_size=8, repetitions=4)
+    _, losses = pool_losses(dataset)
+    assert set(curves["pool_size"]) == {8}
+    references = curves.groupby("repetition")["reference_risk"].agg(["min", "max"])
+    # All methods and designs of one repetition share its pool.
+    np.testing.assert_allclose(references["min"], references["max"])
+    # Different repetitions draw different pools from the 12 images.
+    assert references["min"].nunique() > 1
+    labels = np.array([int(i % 4 == 0) for i in range(12)])
+    for repetition in range(4):
+        positions = benchmark.class_stratified_positions(
+            labels, 8, benchmark.pool_rng(3, repetition)
+        )
+        assert np.bincount(labels[positions]).tolist() == [6, 2]
+        rows = curves[curves.repetition == repetition + 1]
+        np.testing.assert_allclose(rows["reference_risk"], losses[positions].mean())
+    # The budget of 4 stops before the pool of 8 is exhausted.
+    assert curves["n_labels"].max() == 4
+
+
+@pytest.mark.parametrize(
+    "arguments,message",
+    [
+        ({"pool_size": 13}, "pool_size"),
+        ({"pool_size": 0}, "pool_size"),
+        ({"pool_size": 3, "budget": 4}, "budget"),
+        ({"budget": 13}, "budget"),
+    ],
+)
+def test_benchmark_rejects_pools_and_budgets_outside_the_dataset(arguments, message):
+    with pytest.raises(ValueError, match=message):
+        run_small_benchmark(LabelledDataset(), **arguments)
+
+
+def test_cached_oracles_are_built_from_the_pool_labels_and_model_outputs():
+    from active_testing_benchmark.active_testing.prediction_cache import cache_pool_predictions
+
+    torch.manual_seed(0)
+    pool = prepare_evaluation_pool(LabelledDataset(), "cpu", ["gender"])
+    model = nn.Linear(2, 2)
+    auxiliary = SimpleNamespace(
+        surrogates=(LabelOracle(2, "oracle"), LabelOracle(2, "model_noisy_oracle", 1.0)),
+        proxy=LabelOracle(2, "oracle", hard_labels=True),
+    )
+    index_pool, cached_model, cached = cache_pool_predictions(pool, model, auxiliary)
+    indices = index_pool.X_pool
+    exact, model_copy = cached.surrogates
+    assert exact(indices).argmax(dim=1).tolist() == pool.y_pool.tolist()
+    assert cached.proxy(indices).argmax(dim=1).tolist() == pool.y_pool.tolist()
+    torch.testing.assert_close(
+        model_copy(indices).softmax(dim=1), cached_model(indices).softmax(dim=1), rtol=1e-4, atol=0
+    )
+    # The originals stay oracles, so another pool gets its own labels.
+    assert isinstance(auxiliary.surrogates[0], LabelOracle)
+
+
+def test_oracle_auxiliaries_remove_the_estimation_error_of_ase_and_ppat():
+    dataset = LabelledDataset(24)
+    oracle = SimpleNamespace(
+        surrogates=(LabelOracle(2, "oracle"),),
+        proxy=LabelOracle(2, "oracle", hard_labels=True),
+        surrogate_kind="oracle",
+    )
+    curves = run_small_benchmark(dataset, auxiliary=oracle, budget=8, repetitions=5)
+    error = (curves["risk"] - curves["reference_risk"]).abs()
+    # ASE predicts every loss from the surrogate, so an exact oracle gives the exact
+    # risk before any label. It is never refitted.
+    ase = curves.method == "ActiveSurrogateEstimator"
+    np.testing.assert_allclose(error[ase], 0.0, atol=1e-5)
+    # The oracle proxy loss equals the true loss. With lambda = 1/2 the control variate
+    # removes half of every residual, so PPAT beats LURE with the same proposal floor.
+    final = curves[curves.n_labels == 8]
+    mse = ((final["risk"] - final["reference_risk"]) ** 2).groupby(final["method"]).mean()
+    assert mse["PredictionPoweredActiveTesting"] < mse["UniformSampleMean"]
+    assert mse["KossenActiveTesting"] < mse["UniformSampleMean"]
+
+
+def test_acquisition_batch_size_sets_every_methods_step_and_rejects_zero():
+    curves = run_small_benchmark(LabelledDataset(24), budget=12, acquisition_batch_size=3)
+    for _, method_curves in curves.groupby(["method", "repetition"]):
+        assert method_curves["n_labels"].tolist() == [3, 6, 9, 12]
+    default = run_small_benchmark(LabelledDataset(24), budget=12, repetitions=1)
+    # The default step of 25 labels exceeds this budget, so one step acquires it all.
+    assert set(default["n_labels"]) == {12}
+    auxiliary = SimpleNamespace(surrogates=(FixedLogits([0.5, 0.5]),), proxy=nn.Identity())
+    configs = build_method_configs(auxiliary, 2, 7)
+    assert {kwargs["batch_size"] for _, kwargs in configs} == {7}
+    with pytest.raises(ValueError, match="acquisition_batch_size"):
+        run_small_benchmark(LabelledDataset(24), acquisition_batch_size=0)
