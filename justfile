@@ -63,3 +63,7 @@ pool-diagnostics run *args: requirements
 report-results run *args: requirements
     uv run python -m active_testing_benchmark.reporting "$@"
 
+# Render the report's overview diagram. mermaid-cli uses the system Chrome, since
+# Puppeteer's own chrome-headless-shell is not installed.
+overview-diagram:
+    mmdc --quiet --puppeteerConfigFile diagrams/puppeteer-config.json --input diagrams/overview.mmd --output report/figures/overview.pdf

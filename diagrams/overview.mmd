@@ -14,7 +14,7 @@ flowchart LR
     direction TB
     P[("Unlabeled pool<br/>N fundus images<br/>+ demographics")]
     F["Fixed classifier <i>f</i><br/>ResNet-18"]
-    S["Surrogate and proxy<br/>random forests"]
+    S["Surrogates and proxy<br/>random forests or<br/>ResNet-18 ensemble"]
     M["<b>Evaluation method</b><br/>passive: uniform, stratified<br/>active: Kossen et al., ASE, PPAT"]
   end
 
@@ -32,9 +32,9 @@ flowchart LR
 
   P --> A
   F --> A
-  S -. "active methods only" .-> A
+  S --> A
   M --> A
-  U -- "after each batch" --> E --> C
+  U --> E --> C
   R --> C
 
   classDef data fill:#e8f0fb,stroke:#4a6fa5,color:#1b2a41
