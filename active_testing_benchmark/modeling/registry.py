@@ -17,6 +17,7 @@ EXPERIMENT_NAMES = {
     "AT_dev": "FairVision/AT_dev",
     "AT_final": "FairVision/AT_final",
     "feature_extractors": "FairVision/feature_extractors",
+    "proxy_candidates": "FairVision/proxy_candidates",
 }
 
 

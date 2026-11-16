@@ -242,3 +242,4 @@ deploy/mlflow/backups/
 /results/active-testing
 /docs/docs
 /notebooks/eda.ipynb
+/data/interim/proxy_features

@@ -46,3 +46,7 @@ model-selection *args: requirements
 # Compare random forest image features on held-out training data
 feature-experiment *args: requirements
     uv run python -m active_testing_benchmark.experiments.feature_experiment "$@"
+
+# Compare candidate PPAT proxies (frozen-feature probes, FLAIR zero-shot) on a checkpoint's holdout
+proxy-experiment *args: requirements
+    uv run python -m active_testing_benchmark.experiments.proxy_experiment "$@"

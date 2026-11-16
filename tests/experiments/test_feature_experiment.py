@@ -7,7 +7,11 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-from active_testing_benchmark.experiments import feature_experiment
+from active_testing_benchmark.experiments import (
+    feature_experiment,
+    proxy_experiment,
+)
+from active_testing_benchmark.modeling import foundation
 from active_testing_benchmark.modeling.models import create_model
 
 
@@ -167,3 +171,103 @@ def test_main_saves_the_comparison_when_given_an_output_path(monkeypatch, tmp_pa
     monkeypatch.setattr("sys.argv", ["feature", "--no-mlflow", "--output", str(output)])
     feature_experiment.main()
     pd.testing.assert_frame_equal(pd.read_csv(output), results)
+
+
+class ProxyData(SyntheticData):
+    """SyntheticData with the sample IDs that the proxy experiment caches features by."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.sample_ids = [f"id-{index}" for index in range(len(self.labels))]
+
+
+class FakeFlair(torch.nn.Module):
+    """A stand-in for FLAIRModel with its batch image, text and logit methods."""
+
+    def __init__(self):
+        super().__init__()
+        self.vision_model = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten()
+        )
+
+    def preprocess_text(self, prompts):
+        ids = torch.tensor([[index % 3] for index in range(len(prompts))])
+        return ids, torch.ones_like(ids)
+
+    def text_model(self, input_ids, attention_mask):
+        return torch.nn.functional.one_hot(input_ids[:, 0], 3).float()
+
+    def compute_logits(self, image_embeddings, text_embeddings):
+        return image_embeddings @ text_embeddings.t()
+
+
+def proxy_setup(monkeypatch):
+    monkeypatch.setattr(proxy_experiment, "FairVisionData", ProxyData)
+    monkeypatch.setattr(
+        proxy_experiment,
+        "FrozenImageNetFeatures",
+        lambda: torch.nn.Sequential(torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten()),
+    )
+    monkeypatch.setattr(foundation, "_load_flair", FakeFlair)
+
+
+def test_proxy_candidates_are_scored_on_the_checkpoint_holdout(
+    monkeypatch, tmp_path, target_checkpoint
+):
+    proxy_setup(monkeypatch)
+    splits = []
+    split_dataset = proxy_experiment.split_dataset
+
+    def record_split(*args, **kwargs):
+        splits.append(kwargs["random_state"])
+        return split_dataset(*args, **kwargs)
+
+    monkeypatch.setattr(proxy_experiment, "split_dataset", record_split)
+    candidates = ("imagenet_probe", "flair_probe", "flair_zero_shot")
+    results = proxy_experiment.run_proxy_experiment(
+        target_checkpoint,
+        batch_size=4,
+        device="cpu",
+        cache_dir=tmp_path / "features",
+        track=False,
+        candidates=candidates,
+    )
+    assert splits == [5]
+    assert results["candidate"].tolist() == list(candidates)
+    assert results["train_size"].eq(16).all() and results["holdout_size"].eq(4).all()
+    assert results["proxy_accuracy"].between(0, 1).all()
+    assert {"ppat_proxy_correlation", "ppat_lambda_dagger", "proxy_positive_rate"} <= set(
+        results.columns
+    )
+    assert sorted(path.name for path in (tmp_path / "features").iterdir()) == [
+        "flair.npz",
+        "imagenet_resnet18.npz",
+    ]
+
+    # A second run reuses the cached features instead of extracting them again.
+    monkeypatch.setattr(
+        proxy_experiment, "FrozenImageNetFeatures", lambda: pytest.fail("Re-extracted")
+    )
+    again = proxy_experiment.run_proxy_experiment(
+        target_checkpoint,
+        batch_size=4,
+        device="cpu",
+        cache_dir=tmp_path / "features",
+        track=False,
+        candidates=("imagenet_probe",),
+    )
+    assert again["proxy_accuracy"].iloc[0] == results["proxy_accuracy"].iloc[0]
+
+
+def test_proxy_experiment_rejects_unknown_candidates_and_a_different_seed(
+    monkeypatch, target_checkpoint
+):
+    proxy_setup(monkeypatch)
+    with pytest.raises(ValueError, match="Unknown candidate"):
+        proxy_experiment.run_proxy_experiment(
+            target_checkpoint, track=False, candidates=("tabpfn",)
+        )
+    with pytest.raises(ValueError, match="does not match the seed 5"):
+        proxy_experiment.run_proxy_experiment(
+            target_checkpoint, seed=6, track=False, candidates=("imagenet_probe",)
+        )
