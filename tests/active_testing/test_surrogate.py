@@ -14,6 +14,7 @@ from active_testing_benchmark.active_testing.diagnostics import (
 )
 from active_testing_benchmark.active_testing.surrogate import (
     ConstantClassSurrogate,
+    LabelOracle,
     RandomForestModule,
     SpatialTextureFeatures,
     update_random_forest_surrogates,
@@ -338,3 +339,59 @@ def test_frozen_feature_probe_returns_log_probabilities_for_every_class():
     assert (log_probabilities[:, 2] < -15).all()
     labels = torch.stack([item["label"] for item in development])
     assert (log_probabilities.argmax(dim=1) == labels).float().mean() > 0.9
+
+
+def test_exact_oracle_returns_the_true_labels_and_ignores_noise():
+    labels = np.array([0, 1, 1, 0, 2])
+    logits = np.zeros((5, 3))
+    oracle = LabelOracle(3, "oracle", noise=0.9, seed=1)
+    probabilities = np.exp(oracle.log_probabilities(labels, logits))
+    np.testing.assert_allclose(probabilities, np.eye(3)[labels], atol=1e-7)
+    with pytest.raises(RuntimeError, match="log_probabilities"):
+        oracle(torch.zeros(5, 3))
+
+
+def test_noisy_oracle_flips_labels_and_gives_surrogates_the_calibrated_posterior():
+    rng = np.random.default_rng(0)
+    labels = (rng.random(20_000) < 0.1).astype(int)
+    logits = np.zeros((len(labels), 2))
+    proxy = LabelOracle(2, "noisy_oracle", noise=0.2, seed=5, hard_labels=True)
+    noisy_labels = proxy.log_probabilities(labels, logits).argmax(axis=1)
+    assert (noisy_labels != labels).mean() == pytest.approx(0.2, abs=0.01)
+    # The same seed gives the same grader, and another seed errs on other items.
+    np.testing.assert_array_equal(
+        noisy_labels, proxy.log_probabilities(labels, logits).argmax(axis=1)
+    )
+    other = LabelOracle(2, "noisy_oracle", noise=0.2, seed=6, hard_labels=True)
+    assert (other.log_probabilities(labels, logits).argmax(axis=1) != noisy_labels).any()
+
+    surrogate_oracle = LabelOracle(2, "noisy_oracle", noise=0.2, seed=5)
+    positive = np.exp(surrogate_oracle.log_probabilities(labels, logits))[:, 1]
+    # Calibrated: among the items with one posterior value, that share is positive.
+    for value in np.unique(positive):
+        assert labels[positive == value].mean() == pytest.approx(value, abs=0.02)
+    # With a rare positive class, a positive call from this grader is right less than
+    # half of the time, so the posterior differs from the hard label.
+    assert positive.max() < 0.5
+
+
+def test_model_noisy_oracle_interpolates_between_the_labels_and_the_model():
+    labels = np.array([0, 1] * 500)
+    logits = np.tile([[2.0, -1.0]], (1000, 1))
+    model_probabilities = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+    exact = np.exp(LabelOracle(2, "model_noisy_oracle", 0.0).log_probabilities(labels, logits))
+    np.testing.assert_allclose(exact, np.eye(2)[labels], atol=1e-7)
+    model_only = LabelOracle(2, "model_noisy_oracle", 1.0).log_probabilities(labels, logits)
+    np.testing.assert_allclose(np.exp(model_only), model_probabilities, rtol=1e-5)
+    half = np.exp(LabelOracle(2, "model_noisy_oracle", 0.5).log_probabilities(labels, logits))
+    from_model = np.isclose(half, model_probabilities, rtol=1e-5).all(axis=1)
+    assert from_model.mean() == pytest.approx(0.5, abs=0.05)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [((2, "gp"), "kind"), ((2, "noisy_oracle", 1.5), "noise"), ((1, "oracle"), "two classes")],
+)
+def test_label_oracle_rejects_invalid_settings(arguments, message):
+    with pytest.raises(ValueError, match=message):
+        LabelOracle(*arguments)

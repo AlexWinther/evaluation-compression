@@ -112,6 +112,109 @@ class ConstantClassSurrogate(nn.Module):
         return logits.to(images.device)
 
 
+ORACLE_KINDS = ("oracle", "noisy_oracle", "model_noisy_oracle")
+
+
+class LabelOracle(nn.Module):
+    """An auxiliary model that is given the true labels, as a positive control.
+
+    The benchmark's real surrogates and proxies predict from the image. An oracle
+    instead reads the label, so it shows what the estimators gain when the auxiliary
+    model is as good as it can be, and a noisy oracle shows how quickly that gain is
+    lost. It is a control condition and never a usable method, since it needs the
+    labels that active testing is meant to save.
+
+    Kinds, with `noise` in [0, 1]:
+
+    - `oracle`: the true label with certainty. `noise` is ignored. As a surrogate, the
+      Kossen score equals the true loss, which is the optimal proposal. As a proxy, the
+      proxy loss equals the true loss.
+    - `noisy_oracle`: a simulated second grader whose errors are independent of the
+      model. Each label is replaced, with probability `noise`, by another class chosen
+      uniformly. For two classes this is a grader with sensitivity and specificity
+      `1 - noise`. With `hard_labels=False` (surrogates) the output is the calibrated
+      posterior P(y | noisy label), computed with Bayes' rule from the class
+      frequencies of the labelled data. With `hard_labels=True` (proxies) it is the
+      noisy label itself, because PPAT uses the proxy's hard label.
+    - `model_noisy_oracle`: errors that coincide with the model's own. With probability
+      `1 - noise` the output is the true label, otherwise it is the model's predicted
+      distribution. At `noise=1` this is the model used as its own surrogate, which
+      cannot see the model's confident mistakes. Real surrogates fail in this
+      correlated way more than in the independent way of `noisy_oracle`.
+
+    The noise is drawn once per item from `seed`, so an oracle is a fixed auxiliary
+    model like the others. Give the surrogate and the proxy different seeds, since
+    PPAT treats them as separate objects.
+
+    An oracle cannot predict from images. `cache_pool_predictions` and
+    `surrogate_diagnostics` call `log_probabilities` with the labels instead.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        kind: str = "oracle",
+        noise: float = 0.0,
+        seed: int = 0,
+        *,
+        hard_labels: bool = False,
+    ) -> None:
+        super().__init__()
+        if kind not in ORACLE_KINDS:
+            raise ValueError(f"kind must be one of {ORACLE_KINDS}")
+        if not 0.0 <= noise <= 1.0:
+            raise ValueError("noise must be in [0, 1]")
+        if num_classes < 2:
+            raise ValueError("An oracle needs at least two classes")
+        self.num_classes = num_classes
+        self.kind = kind
+        self.noise = 0.0 if kind == "oracle" else float(noise)
+        self.seed = int(seed)
+        self.hard_labels = hard_labels
+
+    def log_probabilities(self, labels: np.ndarray, model_logits: np.ndarray) -> np.ndarray:
+        """Return [n, classes] log-probabilities for items with these true labels.
+
+        `model_logits` are the outputs of the model under test for the same items. Only
+        `model_noisy_oracle` uses them. Zero probabilities are floored at 1e-8 so the
+        logarithms stay finite, as in `RandomForestModule`.
+        """
+        labels = np.asarray(labels, dtype=np.int64)
+        model_logits = np.asarray(model_logits, dtype=np.float64)
+        if model_logits.shape != (len(labels), self.num_classes):
+            raise ValueError("Expected [n, classes] model logits and n labels")
+        rng = np.random.default_rng(self.seed)
+        one_hot = np.eye(self.num_classes)
+        probabilities = one_hot[labels]
+        if self.kind == "noisy_oracle":
+            flipped = rng.random(len(labels)) < self.noise
+            # Adding 1..C-1 modulo C picks one of the other classes uniformly.
+            offsets = rng.integers(1, self.num_classes, size=len(labels))
+            noisy_labels = np.where(flipped, (labels + offsets) % self.num_classes, labels)
+            if self.hard_labels:
+                probabilities = one_hot[noisy_labels]
+            else:
+                # likelihood[noisy, true] = P(noisy label | true label).
+                likelihood = np.full(
+                    (self.num_classes, self.num_classes), self.noise / (self.num_classes - 1)
+                )
+                np.fill_diagonal(likelihood, 1.0 - self.noise)
+                prior = np.bincount(labels, minlength=self.num_classes) / len(labels)
+                joint = likelihood[noisy_labels] * prior
+                probabilities = joint / joint.sum(axis=1, keepdims=True)
+        elif self.kind == "model_noisy_oracle":
+            replaced = rng.random(len(labels)) < self.noise
+            model_probabilities = np.exp(log_softmax(model_logits, axis=1))
+            probabilities = np.where(replaced[:, None], model_probabilities, probabilities)
+        return np.log(np.maximum(probabilities, 1e-8)).astype(np.float32)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "A LabelOracle cannot predict from inputs. Use log_probabilities with the "
+            "labels, as cache_pool_predictions and surrogate_diagnostics do."
+        )
+
+
 def fit_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
     """Return the temperature T that minimises the NLL of softmax(logits / T).
 
