@@ -14,13 +14,14 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import torch
 from torch import nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
 from active_testing_benchmark.modeling.models import create_model
 from active_testing_benchmark.modeling.registry import log_metrics
 from active_testing_benchmark.modeling.train import (
     TrainingSetup,
+    best_history_row,
+    create_scheduler,
     train_model,
 )
 
@@ -143,9 +144,7 @@ def _train_or_load(config, classes, train, validation, device, checkpoint_path, 
     model = create_model(config.model_type, out_dim=len(classes), use_pretrained=True).to(device)
     optimizer = AdamW(model.parameters(), lr=config.initial_lr, weight_decay=config.weight_decay)
     setup = TrainingSetup(
-        model,
-        optimizer=optimizer,
-        scheduler=CosineAnnealingLR(optimizer, T_max=config.max_epochs),
+        model, optimizer=optimizer, scheduler=create_scheduler(optimizer, config)
     )
     torch.manual_seed(config.random_state)
     start = perf_counter()
@@ -168,6 +167,15 @@ def _train_or_load(config, classes, train, validation, device, checkpoint_path, 
     return model, checkpoint
 
 
+def selected_history_row(checkpoint: dict) -> dict:
+    """Return the history row of the epoch that the checkpoint saved.
+
+    Checkpoints saved before `checkpoint_metric` existed were selected by AUC.
+    """
+    metric = checkpoint["config"].get("checkpoint_metric", "roc_auc")
+    return best_history_row(checkpoint["history"], metric)
+
+
 def _log_training(checkpoint, checkpoint_path, *, reused):
     if mlflow.active_run() is None:
         return
@@ -180,11 +188,14 @@ def _log_training(checkpoint, checkpoint_path, *, reused):
         "training.json",
     )
     mlflow.log_artifact(str(checkpoint_path), "checkpoints")
-    best = max(
-        (row for row in checkpoint["history"] if row["roc_auc"] is not None),
-        key=lambda row: row["roc_auc"],
+    best = selected_history_row(checkpoint)
+    log_metrics(
+        {
+            "best_epoch": best["epoch"],
+            "best_validation_auc": best["roc_auc"],
+            "best_validation_loss": best["validation_loss"],
+        }
     )
-    log_metrics({"best_epoch": best["epoch"], "best_validation_auc": best["roc_auc"]})
 
 
 def _log_evaluation(metrics):

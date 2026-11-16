@@ -32,8 +32,84 @@ class TrainingConfig:
 
     validation_fraction: float = 0.2
     random_state: int = 42
+    # "roc_auc" keeps the epoch with the highest validation AUC (best ranking).
+    # "validation_loss" keeps the lowest validation cross-entropy, which also rewards
+    # calibration. Active testing estimates the cross-entropy, so an overconfident
+    # checkpoint changes the quantity being estimated, not only its ranking quality.
+    checkpoint_metric: str = "roc_auc"
+    # Stop after this many epochs without improvement of `checkpoint_metric`.
+    # None trains for all `max_epochs`.
+    early_stopping_patience: int | None = None
+    # "cosine" anneals the learning rate to zero over `max_epochs`. "constant" keeps
+    # `initial_lr` throughout, as FairVision trains its CNNs (Luo et al., 2024, Sec. 5,
+    # with a step schedule that only decays after epoch 30).
+    lr_schedule: str = "cosine"
     seed: int = 42
     num_workers: int = 0
+
+
+CHECKPOINT_METRICS = ("roc_auc", "validation_loss")
+LR_SCHEDULES = ("cosine", "constant")
+# Values of fields added to TrainingConfig after checkpoints were first saved. A stored
+# configuration without the field was trained with this value.
+HISTORICAL_TRAINING_DEFAULTS = {
+    "checkpoint_metric": "roc_auc",
+    "early_stopping_patience": None,
+    "lr_schedule": "cosine",
+}
+
+
+def stored_training_config(stored: dict) -> TrainingConfig:
+    """Rebuild the TrainingConfig a checkpoint was trained with.
+
+    Fields that did not exist when the checkpoint was saved take the value they
+    implicitly had then (`HISTORICAL_TRAINING_DEFAULTS`).
+    """
+    known = {name for name in TrainingConfig.__dataclass_fields__}
+    return TrainingConfig(
+        **{
+            **HISTORICAL_TRAINING_DEFAULTS,
+            **{name: value for name, value in stored.items() if name in known},
+        }
+    )
+
+
+def create_scheduler(optimizer: Optimizer, config: TrainingConfig) -> LRScheduler | None:
+    """Return the learning-rate schedule named by `config.lr_schedule`.
+
+    None means a constant learning rate, since `train_model` then never steps one.
+    """
+    if config.lr_schedule == "cosine":
+        return CosineAnnealingLR(optimizer, T_max=config.max_epochs)
+    if config.lr_schedule == "constant":
+        return None
+    raise ValueError(f"lr_schedule must be one of {LR_SCHEDULES}")
+
+
+def _is_better(metric: str, value: float | None, best: float | None) -> bool:
+    """Return whether `value` improves on `best`; AUC is maximised and loss minimised."""
+    if value is None:
+        return False
+    if best is None:
+        return True
+    return value > best if metric == "roc_auc" else value < best
+
+
+def best_history_row(history: list[dict], metric: str = "roc_auc") -> dict:
+    """Return the history row of the selected checkpoint for `metric`.
+
+    The first epoch wins ties, as in `train_model`, which only replaces the best
+    checkpoint on a strict improvement.
+    """
+    if metric not in CHECKPOINT_METRICS:
+        raise ValueError(f"checkpoint_metric must be one of {CHECKPOINT_METRICS}")
+    best = None
+    for row in history:
+        if _is_better(metric, row[metric], best[metric] if best else None):
+            best = row
+    if best is None:
+        raise ValueError(f"No epoch has a valid {metric}")
+    return best
 
 
 @dataclass(init=False)
@@ -124,8 +200,15 @@ def train_model(
     training_dataset: FairVisionData | Subset[FairVisionData],
     val_dataset: FairVisionData | Subset[FairVisionData],
     device: torch.device | str = "mps",
+    *,
+    metric_prefix: str = "training",
 ):
-    """Return the best model and history, based on best validation checkpoint."""
+    """Return the best model and history, based on best validation checkpoint.
+
+    Epoch metrics are logged under `<metric_prefix>/train` and `<metric_prefix>/validation`,
+    so that surrogate members trained in the same MLflow run do not overwrite the
+    history of the model under test.
+    """
     model = training_setup.model.to(device)
 
     logger.info(
@@ -148,9 +231,16 @@ def train_model(
 
     criterion = training_setup.loss_fn.to(device)
     scheduler = training_setup.scheduler
+    metric = training_config.checkpoint_metric
+    if metric not in CHECKPOINT_METRICS:
+        raise ValueError(f"checkpoint_metric must be one of {CHECKPOINT_METRICS}")
+    patience = training_config.early_stopping_patience
+    if patience is not None and patience < 1:
+        raise ValueError("early_stopping_patience must be positive or None")
     history = []
-    best_auc = -float("inf")
+    best_value = None
     best_state = None
+    epochs_without_improvement = 0
 
     for epoch in tqdm(
         range(1, training_config.max_epochs + 1), desc="Epochs", leave=False, position=0
@@ -219,13 +309,22 @@ def train_model(
             }
         )
         logger.info(f"Epoch {epoch}: {history[-1]}")
-        log_metrics(train_metrics, prefix="training/train", step=epoch)
-        log_metrics(validation_metrics, prefix="training/validation", step=epoch)
+        log_metrics(train_metrics, prefix=f"{metric_prefix}/train", step=epoch)
+        log_metrics(validation_metrics, prefix=f"{metric_prefix}/validation", step=epoch)
         if scheduler is not None:
             scheduler.step()
-        if auc is not None and auc > best_auc:
-            best_auc = auc
+        if _is_better(metric, history[-1][metric], best_value):
+            best_value = history[-1][metric]
             best_state = deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        if patience is not None and epochs_without_improvement >= patience:
+            logger.info(
+                f"Early stopping after epoch {epoch}: no {metric} improvement "
+                f"for {patience} epochs"
+            )
+            break
 
     if best_state is None:
         raise ValueError("Training completed without a valid best checkpoint")

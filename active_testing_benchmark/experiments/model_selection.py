@@ -16,6 +16,7 @@ from active_testing_benchmark.experiments.utils import (
     _log_evaluation,
     _train_or_load,
     evaluate_model,
+    selected_history_row,
 )
 from active_testing_benchmark.modeling.data import prepare_data
 from active_testing_benchmark.modeling.models import create_image_transform
@@ -105,7 +106,7 @@ def run_model_selection_experiment(
                             "train_size": len(fit),
                             "validation_size": len(holdout),
                             "evaluation_size": len(data.test),
-                            "checkpoint_selection": "max_validation_auc",
+                            "checkpoint_selection": model_config.checkpoint_metric,
                         }
                     )
                 model, checkpoint = _train_or_load(
@@ -121,10 +122,7 @@ def run_model_selection_experiment(
                     reuse_trained_model,
                 )
                 history = checkpoint["history"]
-                best = max(
-                    (row for row in history if row["roc_auc"] is not None),
-                    key=lambda row: row["roc_auc"],
-                )
+                best = selected_history_row(checkpoint)
 
                 # PreparedData.test contains "val" here, not the final FairVision test set.
                 if run is not None:

@@ -103,3 +103,90 @@ def test_checkpoint_selection_still_uses_validation_auc(monkeypatch):
     assert [row["roc_auc"] for row in history] == [0.5, 0.7, 0.6]
     for name, value in result.state_dict().items():
         torch.testing.assert_close(value, snapshots[1][name])
+
+
+def _fixed_validation_metrics(monkeypatch, validation_losses):
+    """Make every epoch report the given validation losses, with a constant AUC."""
+    losses = iter(validation_losses)
+    calls = iter(range(1_000))
+
+    def epoch_metrics(labels, probabilities, loss):
+        # train_model computes training metrics first and validation metrics second.
+        is_validation = next(calls) % 2 == 1
+        value = next(losses) if is_validation else loss
+        return {"loss": value, "accuracy": 0.5, "f1": 0.5, "roc_auc": 0.7}
+
+    monkeypatch.setattr(train, "_epoch_metrics", epoch_metrics)
+
+
+def test_loss_selection_with_early_stopping_keeps_the_lowest_validation_loss(monkeypatch):
+    _fixed_validation_metrics(monkeypatch, [0.5, 0.4, 0.6, 0.7, 0.8, 0.3])
+    model = nn.Linear(2, 2)
+    snapshots = []
+
+    def capture_validation_state(module, args, output):
+        if not module.training:
+            snapshots.append({name: value.clone() for name, value in module.state_dict().items()})
+
+    model.register_forward_hook(capture_validation_state)
+    result, history = train.train_model(
+        train.TrainingSetup(model),
+        train.TrainingConfig(
+            max_epochs=6, checkpoint_metric="validation_loss", early_stopping_patience=3
+        ),
+        FixedLogits(2),
+        FixedLogits(2),
+        "cpu",
+    )
+
+    # Epochs 3 to 5 do not improve on epoch 2, so training stops before epoch 6.
+    assert [row["validation_loss"] for row in history] == [0.5, 0.4, 0.6, 0.7, 0.8]
+    assert train.best_history_row(history, "validation_loss")["epoch"] == 2
+    for name, value in result.state_dict().items():
+        torch.testing.assert_close(value, snapshots[1][name])
+
+
+def test_best_history_row_maximises_auc_minimises_loss_and_keeps_the_first_tie():
+    history = [
+        {"epoch": 1, "roc_auc": 0.8, "validation_loss": 0.6},
+        {"epoch": 2, "roc_auc": None, "validation_loss": 0.4},
+        {"epoch": 3, "roc_auc": 0.8, "validation_loss": 0.4},
+    ]
+    assert train.best_history_row(history, "roc_auc")["epoch"] == 1
+    assert train.best_history_row(history, "validation_loss")["epoch"] == 2
+    with pytest.raises(ValueError, match="checkpoint_metric"):
+        train.best_history_row(history, "accuracy")
+
+
+def test_training_rejects_an_unknown_metric_or_non_positive_patience():
+    for config in (
+        train.TrainingConfig(max_epochs=1, checkpoint_metric="accuracy"),
+        train.TrainingConfig(max_epochs=1, early_stopping_patience=0),
+    ):
+        with pytest.raises(ValueError):
+            train.train_model(
+                train.TrainingSetup(nn.Linear(2, 2)), config, FixedLogits(2), FixedLogits(2), "cpu"
+            )
+
+
+def test_constant_schedule_keeps_the_learning_rate_and_cosine_anneals_it():
+    optimizer = torch.optim.AdamW(nn.Linear(2, 2).parameters(), lr=1e-3)
+    assert train.create_scheduler(optimizer, train.TrainingConfig(lr_schedule="constant")) is None
+    cosine = train.create_scheduler(optimizer, train.TrainingConfig(max_epochs=4))
+    for _ in range(4):
+        optimizer.step()
+        cosine.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.0, abs=1e-12)
+    with pytest.raises(ValueError, match="lr_schedule"):
+        train.create_scheduler(optimizer, train.TrainingConfig(lr_schedule="step"))
+
+
+def test_stored_config_fills_fields_that_old_checkpoints_lack():
+    old = {"max_epochs": 10, "batch_size": 32, "random_state": 5, "removed_field": 1}
+    config = train.stored_training_config(old)
+    assert (config.max_epochs, config.batch_size, config.random_state) == (10, 32, 5)
+    assert config.checkpoint_metric == "roc_auc"
+    assert config.early_stopping_patience is None
+    assert config.lr_schedule == "cosine"
+    new = train.stored_training_config({**old, "lr_schedule": "constant"})
+    assert new.lr_schedule == "constant"
