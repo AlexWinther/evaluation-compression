@@ -478,6 +478,10 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
     'online' uses the paper's plug-in coefficient (Eq. 14), which is generally
     *biased at finite sample sizes* but consistent under its assumptions.
     Fixed lambda=0 recovers LURE with the PPAT RMS-loss proposal.
+    exploration mixes the proposal with uniform sampling. PPAT only asks for a small
+    value and cites Kossen et al. (2021), whose floor is 0.2 times uniform, so 0.2 is
+    the default. With the same value as `KossenActiveTesting`, the two differ only in
+    their estimator and proposal score.
     num_classes is the number of classes expected from the target, proxy and surrogates.
     """
 
@@ -494,7 +498,7 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
         lambda_value: float | str = 1.0,
         lambda_initial: float = 0.5,
         lambda_update_every: int = 100,
-        exploration: float = 0.05,
+        exploration: float = 0.2,
         surrogate_update: Callable | None = None,
         update_every: int = 1,
         seed: int = 0,

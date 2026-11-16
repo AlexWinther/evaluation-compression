@@ -17,7 +17,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
-def variance_gain(scores: np.ndarray, losses: np.ndarray, exploration: float = 0.05) -> float:
+
+def variance_gain(scores: np.ndarray, losses: np.ndarray, exploration: float = 0.2) -> float:
     """Return Var(uniform) / Var(importance sampling) for one draw from the proposal.
 
     The proposal is proportional to `scores`, mixed with uniform sampling as in

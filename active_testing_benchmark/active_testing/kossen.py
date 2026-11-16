@@ -47,7 +47,10 @@ class KossenActiveTesting(ActiveEvaluationMethod):
         the runner's default `nn.CrossEntropyLoss`.
     exploration:
         Fraction of each proposal mixed with uniform sampling (0 < e <= 1).
-        Ensures all weights are finite, even for zero acquisition scores.
+        Ensures all weights are finite, even for zero acquisition scores. Every
+        remaining item keeps at least `exploration` times its uniform probability,
+        which bounds the LURE weights. The default 0.2 matches the minimum proposal
+        probability of Kossen et al. (2021, app. B.1).
     surrogate_update:
         Optional callback `(surrogate, X_observed, y_observed) -> None`, called
         after every `observe`. It receives only labels acquired so far and
@@ -66,7 +69,7 @@ class KossenActiveTesting(ActiveEvaluationMethod):
         num_classes: int,
         acquisition: str = "cross_entropy",
         surrogate_output: str = "logits",
-        exploration: float = 0.05,
+        exploration: float = 0.2,
         surrogate_update: (Callable[[nn.Module, torch.Tensor, torch.Tensor], None] | None) = None,
         seed: int = 0,
         batch_size: int | None = 1,
