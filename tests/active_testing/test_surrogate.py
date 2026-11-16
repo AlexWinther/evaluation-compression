@@ -247,3 +247,94 @@ def test_constant_class_surrogate_scores_the_loss_of_its_class():
 def test_constant_class_surrogate_rejects_an_unknown_class():
     with pytest.raises(ValueError, match="target_class"):
         ConstantClassSurrogate(num_classes=2, target_class=2)
+
+
+def test_temperature_fit_recovers_the_temperature_that_generated_the_labels():
+    rng = np.random.default_rng(0)
+    logits = rng.normal(scale=4.0, size=(20000, 3))
+    true_temperature = 2.5
+    probabilities = np.exp(logits / true_temperature)
+    probabilities /= probabilities.sum(axis=1, keepdims=True)
+    labels = np.array([rng.choice(3, p=row) for row in probabilities])
+    assert surrogate.fit_temperature(logits, labels) == pytest.approx(true_temperature, rel=0.05)
+
+
+def test_temperature_scaling_divides_logits_and_keeps_the_predicted_class():
+    model = FixedLogits([0.7, 0.2, 0.1])
+    scaled = surrogate.TemperatureScaled(model, temperature=2.0)
+    inputs = torch.zeros(4, 1)
+    torch.testing.assert_close(scaled(inputs), model(inputs) / 2.0)
+    assert torch.equal(scaled(inputs).argmax(dim=1), model(inputs).argmax(dim=1))
+    with pytest.raises(ValueError, match="positive"):
+        surrogate.TemperatureScaled(model, temperature=0.0)
+
+
+def separable_development(count=40):
+    """Two-dimensional features whose first coordinate decides an imbalanced label."""
+    rng = np.random.default_rng(3)
+    features = torch.tensor(rng.normal(size=(count, 2)), dtype=torch.float32)
+    labels = (features[:, 0] > 1.0).long()
+    return [{"image": x, "label": y} for x, y in zip(features, labels)]
+
+
+def test_forest_models_the_development_prevalence_without_class_weights():
+    forest = RandomForestModule(2, nn.Identity(), n_estimators=5)
+    assert forest.forest.class_weight is None
+    assert forest.forest.criterion == "entropy"
+    assert forest.forest.max_features == "sqrt"
+
+
+def test_bootstrapped_forests_keep_distinct_resamples_across_refits(monkeypatch):
+    development = separable_development()
+    loader = DataLoader(development, batch_size=8)
+    original = torch.stack([item["image"] for item in development]).numpy()
+    forests = [
+        RandomForestModule(
+            2, nn.Identity(), n_estimators=5, random_state=seed, bootstrap_development=True
+        ).fit(loader)
+        for seed in (1, 2)
+    ]
+    first, second = (forest._development_features for forest in forests)
+    assert first.shape == second.shape == original.shape
+    assert not np.array_equal(first, second)
+    # Every resampled row is a development row, and some rows repeat.
+    assert all((original == row).all(axis=1).any() for row in first)
+    assert len(np.unique(first, axis=0)) < len(first)
+    again = RandomForestModule(
+        2, nn.Identity(), n_estimators=5, random_state=1, bootstrap_development=True
+    ).fit(loader)
+    np.testing.assert_array_equal(again._development_features, first)
+
+    fits = []
+    monkeypatch.setattr(forests[0].forest, "fit", lambda X, y: fits.append((X.copy(), y.copy())))
+    observed = torch.tensor([[5.0, 5.0], [6.0, 6.0]])
+    update_random_forest_surrogates(forests[:1], observed, torch.ones(2, dtype=torch.long))
+    np.testing.assert_array_equal(fits[0][0][: len(first)], first)
+    np.testing.assert_array_equal(fits[0][0][len(first) :], observed.numpy())
+
+
+def test_forest_calibration_sets_a_temperature_and_keeps_valid_probabilities():
+    development = separable_development()
+    forest = RandomForestModule(2, nn.Identity(), n_estimators=10, random_state=0).fit(
+        DataLoader(development[:30], batch_size=8)
+    )
+    images = torch.stack([item["image"] for item in development[30:]])
+    uncalibrated = forest(images).softmax(dim=1)
+    forest.calibrate(DataLoader(development[30:], batch_size=8))
+    assert forest.temperature > 0
+    calibrated = forest(images).softmax(dim=1)
+    torch.testing.assert_close(calibrated.sum(dim=1), torch.ones(len(images)))
+    assert torch.equal(calibrated.argmax(dim=1), uncalibrated.argmax(dim=1))
+
+
+def test_frozen_feature_probe_returns_log_probabilities_for_every_class():
+    development = separable_development()
+    probe = surrogate.FrozenFeatureProbe(3, nn.Identity()).fit(DataLoader(development, 8))
+    images = torch.stack([item["image"] for item in development])
+    log_probabilities = probe(images)
+    assert log_probabilities.shape == (len(images), 3)
+    # Class 2 never occurs, so it gets the probability floor.
+    torch.testing.assert_close(log_probabilities.exp().sum(dim=1), torch.ones(len(images)))
+    assert (log_probabilities[:, 2] < -15).all()
+    labels = torch.stack([item["label"] for item in development])
+    assert (log_probabilities.argmax(dim=1) == labels).float().mean() > 0.9
