@@ -54,3 +54,7 @@ proxy-experiment *args: requirements
 # Fit surrogate conditions for a checkpoint and run the holdout diagnostics (pre-benchmark gate)
 surrogate-experiment *args: requirements
     uv run python -m active_testing_benchmark.experiments.surrogate_experiment "$@"
+# Write the report tables and figures for one AT run (see active_testing_benchmark/reporting.py)
+report-results run *args: requirements
+    uv run python -m active_testing_benchmark.reporting "$@"
+
