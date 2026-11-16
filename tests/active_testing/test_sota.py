@@ -286,3 +286,45 @@ def test_ase_refits_at_label_frequency_and_refreshes_estimates():
     assert counts == [3, 6]
     assert history[1]["estimate"].risk > history[0]["estimate"].risk
     assert history[2]["estimate"].risk == history[1]["estimate"].risk
+
+
+def test_ppat_leaves_subgroups_without_labels_undefined():
+    N = 6
+    logits = torch.tensor([[2.0, 0.0], [0.0, 1.0]] * 3)
+    method = PredictionPoweredActiveTesting(num_classes=2, proxy_losses=np.linspace(0.2, 1.2, N))
+    state = method.initialize(
+        Problem(
+            N,
+            N,
+            logits,
+            None,
+            nn.Identity(),
+            nn.CrossEntropyLoss(),
+            subgroup_indices={"seen": (0, 1, 2), "unseen": (3, 4, 5)},
+        )
+    )
+    losses = nn.functional.cross_entropy(logits[:1], torch.zeros(1).long(), reduction="none")
+    method.observe(
+        state,
+        SelectionPlan([0], selection_probabilities=[1 / N]),
+        torch.zeros(1).long(),
+        losses.tolist(),
+    )
+    estimate = method.estimate(state, [])
+    assert estimate.subgroup_risks["unseen"] is None
+    assert estimate.subgroup_risks["seen"] is not None
+    assert estimate.subgroup_n_labels == {"seen": 1, "unseen": 0}
+
+
+@pytest.mark.parametrize("pool_size", [1, 7])
+def test_ppat_draws_the_last_remaining_item_with_probability_one(pool_size):
+    logits = torch.randn(pool_size, 2, generator=torch.Generator().manual_seed(pool_size))
+    method = PredictionPoweredActiveTesting(
+        num_classes=2, proxy_losses=np.linspace(0.3, 0.9, pool_size), batch_size=None
+    )
+    state = method.initialize(
+        Problem(pool_size, pool_size, logits, None, nn.Identity(), nn.CrossEntropyLoss())
+    )
+    selection = method.acquire(state, [])
+    assert selection.selection_probabilities[-1] == 1.0
+    assert all(0 < q <= 1 for q in selection.selection_probabilities)

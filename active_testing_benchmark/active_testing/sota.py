@@ -685,7 +685,8 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
 
             # Mix RMS scores with exploration
             if scores.sum() > 0:
-                q = (1 - self.exploration) * scores / scores.sum() + self.exploration / len(
+                # Normalise before scaling, so the last remaining item gets exactly 1.
+                q = (1 - self.exploration) * (scores / scores.sum()) + self.exploration / len(
                     candidates
                 )
             else:
@@ -795,9 +796,12 @@ class PredictionPoweredActiveTesting(ActiveEvaluationMethod):
 
         # Compute subgroup risk
         subgroup_risks = {}
-        # TODO: Currently if no point from subgroup g has been acquired, this indicator-weighted
-        # LURE subgroup estimate evaluates to 0. This is not an observed zero loss.
         for group, indices in state["subgroup_indices"].items():
+            # Without any label from the group, the indicator-weighted sum would be 0,
+            # which is not an observed zero loss. Leave it undefined, as LURE does.
+            if state["subgroup_counts"][group] == 0:
+                subgroup_risks[group] = None
+                continue
             size = state["subgroup_sizes"][group]
             group_mask = np.array([i in indices for i in selected], dtype=bool)
             # Subgroup controls must be centered at their own
