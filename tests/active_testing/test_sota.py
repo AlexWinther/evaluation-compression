@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from active_testing_benchmark.active_testing.interface import Problem, SelectionPlan
 from active_testing_benchmark.active_testing.runner import EvaluationPool, run_active_evaluation
 from active_testing_benchmark.active_testing.sota import (
+    KOSSEN_RETRAINING_SCHEDULE,
     ActiveSurrogateEstimator,
     PredictionPoweredActiveTesting,
 )
@@ -286,6 +287,56 @@ def test_ase_refits_at_label_frequency_and_refreshes_estimates():
     assert counts == [3, 6]
     assert history[1]["estimate"].risk > history[0]["estimate"].risk
     assert history[2]["estimate"].risk == history[1]["estimate"].risk
+
+
+def schedule_method_and_state(counts, schedule, pool_size=60, batch_size=25):
+    def update(surrogate, X, y):
+        counts.append(len(y))
+
+    method = ActiveSurrogateEstimator(
+        nn.Identity(),
+        num_classes=2,
+        acquisition="expected_loss",
+        surrogate_update=update,
+        update_schedule=schedule,
+        batch_size=batch_size,
+    )
+    state = method.initialize(
+        Problem(
+            N=pool_size,
+            budget=pool_size,
+            X_pool=torch.ones(pool_size, 2),
+            stratification_groups=None,
+            model=nn.Identity(),
+            loss_fn=nn.CrossEntropyLoss(),
+        )
+    )
+    return method, state
+
+
+def test_ase_refits_at_the_scheduled_label_counts_and_then_stays_fixed():
+    counts = []
+    method, state = schedule_method_and_state(counts, KOSSEN_RETRAINING_SCHEDULE)
+    batch_sizes = []
+    while state["remaining_budget"]:
+        selection = method.acquire(state, [])
+        batch_sizes.append(len(selection.indices))
+        method.observe(
+            state,
+            selection,
+            torch.zeros(len(selection.indices)).long(),
+            [math.log(2)] * len(selection.indices),
+        )
+    # Batches stop at each refit, and no refit follows the last scheduled count below 60.
+    assert counts == [5, 10, 20, 30, 40]
+    assert batch_sizes == [5, 5, 10, 10, 10, 20]
+    assert state["next_surrogate_update"] == 100
+
+
+@pytest.mark.parametrize("schedule", [(), (5, 5), (10, 5), (0, 5)])
+def test_ase_rejects_an_invalid_schedule(schedule):
+    with pytest.raises(ValueError, match="update_schedule"):
+        ActiveSurrogateEstimator(nn.Identity(), num_classes=2, update_schedule=schedule)
 
 
 def test_ppat_leaves_subgroups_without_labels_undefined():

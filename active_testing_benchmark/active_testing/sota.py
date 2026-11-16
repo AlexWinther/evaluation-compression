@@ -1,6 +1,7 @@
 """Active finite-pool risk estimation runner for FairVision image-classification."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from itertools import pairwise
 import statistics
 
 from loguru import logger
@@ -260,6 +261,11 @@ def _record_observation(
     return state
 
 
+# Labels after which Kossen et al. (2021, app. C.3) retrain their small-data surrogates:
+# frequent refits early, when each label changes the surrogate most, then every 150.
+KOSSEN_RETRAINING_SCHEDULE = (5, 10, 20, 30, 40, 100, 250, 400, 550, 700, 850, 1000)
+
+
 def _compute_lure_weights(N: int, q: list[float], horizon: int) -> np.ndarray:
     """LURE weights at the current horizon"""
     if horizon == N:
@@ -283,6 +289,10 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
 
     Surrogate models must be fitted without evaluation-pool labels in advance.
     With surrogate_update, newly acquired labels may be used after observation.
+    Refits happen every `update_every` labels, or at the absolute label counts in
+    `update_schedule` when it is given (for example `KOSSEN_RETRAINING_SCHEDULE`).
+    Without surrogate_update the surrogate is fixed and the estimate stays constant,
+    as in the paper's "ASE (const.)" (Kossen et al., 2022, Sec. 7.3).
 
     num_classes is the number of classes expected from the target and surrogates.
     """
@@ -297,10 +307,19 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         surrogate_output: str = "logits",
         surrogate_update: Callable | None = None,
         update_every: int = 1,
+        update_schedule: Sequence[int] | None = None,
         seed: int = 0,
         batch_size: int | None = 1,
         prediction_batch_size: int = 256,
     ) -> None:
+        if update_schedule is not None:
+            update_schedule = tuple(int(count) for count in update_schedule)
+            if not update_schedule or any(
+                later <= earlier for earlier, later in pairwise(update_schedule)
+            ):
+                raise ValueError("update_schedule must be a nonempty, increasing sequence")
+            if update_schedule[0] < 1:
+                raise ValueError("update_schedule must contain positive label counts")
         if acquisition not in {"xwed", "expected_loss"}:
             raise ValueError("acquisition must be 'xwed' or 'expected_loss'")
         if loss_type not in {"cross_entropy", "error_rate"}:
@@ -323,9 +342,16 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         self.surrogate_output = surrogate_output
         self.surrogate_update = surrogate_update
         self.update_every = update_every
+        self.update_schedule = update_schedule
         self.batch_size = batch_size
         self.prediction_batch_size = prediction_batch_size
         self.rng = np.random.default_rng(seed)
+
+    def _next_update(self, count: int) -> int | None:
+        """Return the next label count that triggers a refit, or None if none remain."""
+        if self.update_schedule is None:
+            return (count // self.update_every + 1) * self.update_every
+        return next((threshold for threshold in self.update_schedule if threshold > count), None)
 
     def _refresh_predictions(self, state: dict) -> dict:
         members = _predict_surrogate_members(
@@ -357,7 +383,7 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         )
 
         state = self._refresh_predictions(state)
-        state["next_surrogate_update"] = self.update_every
+        state["next_surrogate_update"] = self._next_update(0)
 
         return state
 
@@ -388,8 +414,8 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
             state["remaining_budget"],
             len(state["remaining"]),
         )
-        if self.surrogate_update is not None:
-            # Ensure that the surrogate is updated every self.update_every labels
+        if self.surrogate_update is not None and state["next_surrogate_update"] is not None:
+            # Stop each batch at the next refit, so the refit sees exactly that many labels
             count = min(count, state["next_surrogate_update"] - len(state["selections"]))
         if count <= 0:
             raise ValueError("No remaining budget or unlabeled items")
@@ -427,16 +453,18 @@ class ActiveSurrogateEstimator(ActiveEvaluationMethod):
         # Anchor refits to absolute label thresholds. If a supplied batch crosses
         # several thresholds, refit once with all observations and schedule the
         # next multiple, rather than waiting update_every labels from this refit.
-        if self.surrogate_update is not None and current_count >= threshold:
+        if (
+            self.surrogate_update is not None
+            and threshold is not None
+            and current_count >= threshold
+        ):
             X_seen = state["X_pool"][state["selected_order"]]
             y_seen = torch.as_tensor(
                 state["observed_labels"], device=X_seen.device, dtype=torch.long
             )
             self.surrogate_update(self.surrogate, X_seen, y_seen)
             state = self._refresh_predictions(state)
-            state["next_surrogate_update"] = (
-                current_count // self.update_every + 1
-            ) * self.update_every
+            state["next_surrogate_update"] = self._next_update(current_count)
             logger.trace(
                 f"ASE surrogate refit at {current_count} acquired labels "
                 f"(scheduled threshold: {threshold}; next: {state['next_surrogate_update']})"
