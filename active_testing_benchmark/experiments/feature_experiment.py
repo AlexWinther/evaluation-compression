@@ -231,6 +231,11 @@ def main() -> None:
         type=Path,
         help="AT_dev classifier checkpoint. Adds surrogate diagnostics and uses its seed",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Also save the comparison as CSV, for example for active_testing_benchmark.reporting",
+    )
     args = parser.parse_args()
     if args.target_checkpoint is not None:
         # Fail before loading any data when the seed conflicts with the checkpoint.
@@ -250,6 +255,9 @@ def main() -> None:
         extractors=tuple(args.extractors),
         target_checkpoint=args.target_checkpoint,
     )
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        results.to_csv(args.output, index=False)
     print(results.to_string(index=False))
 
 

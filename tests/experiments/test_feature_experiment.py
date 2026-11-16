@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 import mlflow
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 from torch.utils.data import Dataset
@@ -155,3 +158,12 @@ def test_target_checkpoint_rejects_a_different_seed(monkeypatch, target_checkpoi
         feature_experiment.main()
     assert error.value.code == 2
     assert "does not match" in capsys.readouterr().err
+
+
+def test_main_saves_the_comparison_when_given_an_output_path(monkeypatch, tmp_path):
+    results = pd.DataFrame({"extractor": ["pooled_pixels"], "auc": [0.6]})
+    monkeypatch.setattr(feature_experiment, "run_feature_experiment", lambda **kwargs: results)
+    output = tmp_path / "comparison" / "features.csv"
+    monkeypatch.setattr("sys.argv", ["feature", "--no-mlflow", "--output", str(output)])
+    feature_experiment.main()
+    pd.testing.assert_frame_equal(pd.read_csv(output), results)
