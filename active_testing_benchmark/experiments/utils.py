@@ -101,6 +101,15 @@ def model_from_checkpoint(checkpoint: dict, device: torch.device | str) -> nn.Mo
     return model.to(device).eval()
 
 
+def ensemble_cache_dir(checkpoint_path: Path, seed: int) -> Path:
+    """Where the deep-ensemble surrogate trained alongside a checkpoint is cached.
+
+    The directory is keyed by the seed, which also fixes the development split, so a
+    reused checkpoint and its diagnostics load the same ensemble.
+    """
+    return Path(checkpoint_path).parent / "surrogate_ensemble" / f"seed-{seed}"
+
+
 def reused_checkpoint_seed(checkpoint_path: Path, requested_seed: int | None) -> int:
     """Return the seed that trained a reused checkpoint, rejecting a conflicting seed.
 

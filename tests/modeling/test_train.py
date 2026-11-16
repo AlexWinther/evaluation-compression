@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
@@ -167,6 +169,132 @@ def test_training_rejects_an_unknown_metric_or_non_positive_patience():
             train.train_model(
                 train.TrainingSetup(nn.Linear(2, 2)), config, FixedLogits(2), FixedLogits(2), "cpu"
             )
+
+
+def test_member_seeds_are_deterministic_and_never_shared_between_kinds():
+    forest = train.member_seeds(42, "forest")
+    ensemble = train.member_seeds(42, "resnet_ensemble")
+    assert forest == train.member_seeds(42, "forest")
+    assert len(forest) == len(ensemble) == train.ENSEMBLE_SIZE
+    assert len(set(forest) | set(ensemble)) == 2 * train.ENSEMBLE_SIZE
+    assert forest != train.member_seeds(43, "forest")
+
+
+@pytest.fixture
+def linear_members(monkeypatch):
+    """Replace the ResNet factory with a small linear model, recording each creation."""
+    created = []
+
+    def create(model_type, out_dim, use_pretrained):
+        created.append(use_pretrained)
+        return nn.Linear(2, out_dim)
+
+    monkeypatch.setattr(train, "create_model", create)
+    return created
+
+
+def test_resnet_ensemble_is_calibrated_cached_and_rejects_a_stale_cache(
+    monkeypatch, tmp_path, linear_members
+):
+    data = FixedLogits(2)
+    config = train.TrainingConfig(max_epochs=2, batch_size=4, random_state=3)
+    members, seeds = train.train_resnet_ensemble(data, data, ["no", "yes"], config, "cpu", tmp_path)
+    assert seeds == train.member_seeds(3, "resnet_ensemble")
+    assert len(members) == train.ENSEMBLE_SIZE
+    assert linear_members == [True] * train.ENSEMBLE_SIZE
+    assert all(member.temperature > 0 for member in members)
+    stored = torch.load(tmp_path / "member-0.pt", weights_only=True)
+    # Members keep their lowest validation loss, unlike the AUC-selected model under test.
+    assert stored["config"]["checkpoint_metric"] == "validation_loss"
+    assert stored["config"]["early_stopping_patience"] == train.ENSEMBLE_EARLY_STOPPING_PATIENCE
+    assert stored["config"]["random_state"] == seeds[0]
+    assert stored["config"]["lr_schedule"] == "cosine"
+
+    monkeypatch.setattr(train, "train_model", lambda *args, **kwargs: pytest.fail("Retrained"))
+    loaded, _ = train.train_resnet_ensemble(data, data, ["no", "yes"], config, "cpu", tmp_path)
+    inputs = data.images
+    for original, reloaded in zip(members, loaded):
+        torch.testing.assert_close(reloaded(inputs), original(inputs))
+    # The members keep their cosine recipe when the model under test uses another
+    # schedule, so the cache still matches.
+    constant = replace(config, lr_schedule="constant")
+    train.train_resnet_ensemble(data, data, ["no", "yes"], constant, "cpu", tmp_path)
+    # Caches saved before `lr_schedule` existed were trained with cosine and still load.
+    for path in tmp_path.glob("member-*.pt"):
+        old = torch.load(path, weights_only=True)
+        del old["config"]["lr_schedule"]
+        torch.save(old, path)
+    train.train_resnet_ensemble(data, data, ["no", "yes"], config, "cpu", tmp_path)
+
+    with pytest.raises(ValueError, match="different configuration"):
+        train.train_resnet_ensemble(
+            data, data, ["no", "yes"], train.TrainingConfig(max_epochs=3), "cpu", tmp_path
+        )
+
+
+@pytest.mark.parametrize("proxy_kind", ["imagenet_probe", "resnet_ensemble"])
+def test_auxiliary_models_pair_five_forests_with_an_independent_proxy(
+    monkeypatch, tmp_path, linear_members, proxy_kind
+):
+    monkeypatch.setattr(train, "FrozenImageNetFeatures", nn.Identity)
+    data = FixedLogits(2)
+    config = train.TrainingConfig(max_epochs=1, batch_size=4, random_state=8)
+    auxiliary = train.fit_auxiliary_models(
+        data, data, ["no", "yes"], config, "cpu", proxy_kind=proxy_kind, ensemble_dir=tmp_path
+    )
+    assert auxiliary.surrogate_kind == "forest"
+    assert auxiliary.proxy_kind == proxy_kind
+    assert auxiliary.seeds == train.member_seeds(8, "forest")
+    assert len(auxiliary.surrogates) == train.ENSEMBLE_SIZE
+    assert all(isinstance(m, train.RandomForestModule) for m in auxiliary.surrogates)
+    assert all(m.bootstrap_development and m.temperature > 0 for m in auxiliary.surrogates)
+    if proxy_kind == "imagenet_probe":
+        assert isinstance(auxiliary.proxy, train.FrozenFeatureProbe)
+        assert not linear_members
+    else:
+        assert isinstance(auxiliary.proxy, train.MeanProbabilityEnsemble)
+        assert len(auxiliary.proxy.members) == train.ENSEMBLE_SIZE
+    assert auxiliary.proxy(data.images).shape == (len(data), 2)
+
+
+def test_auxiliary_models_reject_unknown_kinds():
+    data = FixedLogits(2)
+    with pytest.raises(ValueError, match="surrogate_kind"):
+        train.fit_auxiliary_models(
+            data, data, ["no", "yes"], train.TrainingConfig(), "cpu", surrogate_kind="gp"
+        )
+    with pytest.raises(ValueError, match="proxy_kind"):
+        train.fit_auxiliary_models(
+            data, data, ["no", "yes"], train.TrainingConfig(), "cpu", proxy_kind="gp"
+        )
+
+
+def test_oracle_auxiliaries_need_no_fitting_and_use_separate_noise_seeds(linear_members):
+    data = FixedLogits(2)
+    config = train.TrainingConfig(random_state=8)
+    auxiliary = train.fit_auxiliary_models(
+        data,
+        data,
+        ["no", "yes"],
+        config,
+        "cpu",
+        surrogate_kind="noisy_oracle",
+        proxy_kind="oracle",
+        oracle_noise=0.25,
+    )
+    (surrogate_oracle,) = auxiliary.surrogates
+    surrogate_seed, proxy_seed = train.oracle_seeds(8)
+    assert (surrogate_oracle.kind, surrogate_oracle.noise) == ("noisy_oracle", 0.25)
+    assert not surrogate_oracle.hard_labels
+    assert (auxiliary.proxy.kind, auxiliary.proxy.noise) == ("oracle", 0.0)
+    assert auxiliary.proxy.hard_labels
+    assert auxiliary.seeds == (surrogate_seed,)
+    assert (surrogate_oracle.seed, auxiliary.proxy.seed) == (surrogate_seed, proxy_seed)
+    assert surrogate_seed != proxy_seed
+    # No fitted member shares a seed with an oracle, and no ensemble was trained.
+    fitted = set(train.member_seeds(8, "forest")) | set(train.member_seeds(8, "resnet_ensemble"))
+    assert not fitted & {surrogate_seed, proxy_seed}
+    assert not linear_members
 
 
 def test_constant_schedule_keeps_the_learning_rate_and_cosine_anneals_it():

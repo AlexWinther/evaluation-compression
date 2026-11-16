@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 
 from loguru import logger
 import numpy as np
@@ -14,10 +15,19 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from tqdm.auto import tqdm
 
-from active_testing_benchmark.active_testing.surrogate import RandomForestModule
+from active_testing_benchmark.active_testing.surrogate import (
+    ORACLE_KINDS,
+    FrozenFeatureProbe,
+    LabelOracle,
+    MeanProbabilityEnsemble,
+    RandomForestModule,
+    TemperatureScaled,
+    fit_temperature,
+    predict_logits,
+)
 from active_testing_benchmark.config import RAW_DATA_DIR
 from active_testing_benchmark.modeling.data import FairVisionData, prepare_data
-from active_testing_benchmark.modeling.models import create_model
+from active_testing_benchmark.modeling.models import FrozenImageNetFeatures, create_model
 from active_testing_benchmark.modeling.registry import log_metrics
 
 
@@ -333,37 +343,243 @@ def train_model(
     return model, history
 
 
+SURROGATE_KINDS = ("forest", "resnet_ensemble")
+PROXY_KINDS = ("resnet_ensemble", "imagenet_probe")
+ENSEMBLE_SIZE = 5
+# Members stop after this many epochs without a lower validation loss (validation-loss early stopping for the deep-ensemble surrogate).
+ENSEMBLE_EARLY_STOPPING_PATIENCE = 3
+
+
 @dataclass
 class AuxiliaryModels:
-    surrogates: tuple[RandomForestModule, RandomForestModule]
-    proxy: RandomForestModule
-    seeds: tuple[int, int, int]
+    """The surrogate ensemble and proxy shared by all active-testing methods of a run.
+
+    `surrogates` are the calibrated ensemble members. AT averages them, ASE and PPAT use
+    them as members. `proxy` is the fixed PPAT proxy labeller. `seeds` are the member
+    seeds of the surrogate ensemble.
+    """
+
+    surrogates: tuple[nn.Module, ...]
+    proxy: nn.Module
+    seeds: tuple[int, ...]
+    surrogate_kind: str = "forest"
+    proxy_kind: str = "resnet_ensemble"
 
 
-def fit_auxiliary_models(
-    dataset: FairVisionData | Subset[FairVisionData],
-    classes: list[str],
-    config: TrainingConfig,
-    device: torch.device | str,
-):
-    """Fit the two active-testing surrogates and proxy on all development images."""
-    children = np.random.SeedSequence(config.random_state).spawn(3)
-    seeds = tuple(int(child.generate_state(1)[0]) for child in children)
-    if len(seeds) != 3:
-        raise ValueError("Expected only 3 generated seeds")
+def member_seeds(random_state: int, kind: str, count: int = ENSEMBLE_SIZE) -> tuple[int, ...]:
+    """Derive independent member seeds for one ensemble kind from the experiment seed.
 
-    loader = DataLoader(
+    Each kind has its own branch of the seed sequence, so the forests and the ResNets
+    of one experiment never share a seed, and adding a kind changes no existing seed.
+    """
+    branch = SURROGATE_KINDS.index(kind)
+    children = np.random.SeedSequence(random_state).spawn(len(SURROGATE_KINDS))[branch]
+    return tuple(int(child.generate_state(1)[0]) for child in children.spawn(count))
+
+
+def oracle_seeds(random_state: int) -> tuple[int, int]:
+    """Derive the noise seeds of an oracle surrogate and an oracle proxy.
+
+    The two differ, so a noisy oracle surrogate and a noisy oracle proxy make their
+    mistakes on different items. Their branch of the seed sequence comes after the
+    branches of `member_seeds`, so no fitted member shares a seed with an oracle.
+    """
+    branch = np.random.SeedSequence(random_state).spawn(len(SURROGATE_KINDS) + 1)[-1]
+    surrogate_seed, proxy_seed = branch.generate_state(2)
+    return int(surrogate_seed), int(proxy_seed)
+
+
+def _loader(dataset, config: TrainingConfig, device: torch.device | str) -> DataLoader:
+    return DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
-        pin_memory=device.type == "cuda" if isinstance(device, torch.device) else device == "cuda",
+        pin_memory=str(device).startswith("cuda"),
     )
+
+
+def fit_forest_ensemble(
+    train: FairVisionData | Subset[FairVisionData],
+    holdout: FairVisionData | Subset[FairVisionData],
+    classes: list[str],
+    config: TrainingConfig,
+    device: torch.device | str,
+) -> tuple[tuple[RandomForestModule, ...], tuple[int, ...]]:
+    """Fit five bootstrapped, temperature-calibrated forests on frozen ImageNet features.
+
+    This is the cheap surrogate condition. Each member draws its own bootstrap of the
+    development split, so the members disagree where the finite training data leaves
+    the forest uncertain (see `RandomForestModule`). The members share one frozen
+    feature extractor to avoid holding five copies of the backbone.
+    """
+    seeds = member_seeds(config.random_state, "forest")
+    extractor = FrozenImageNetFeatures()
     forests = tuple(
-        RandomForestModule(num_classes=len(classes), random_state=seed).fit(loader, device=device)
+        RandomForestModule(
+            num_classes=len(classes),
+            feature_extractor=extractor,
+            random_state=seed,
+            bootstrap_development=True,
+        )
+        .fit(_loader(train, config, device), device=device)
+        .calibrate(_loader(holdout, config, device), device=device)
         for seed in seeds
     )
-    return AuxiliaryModels((forests[0], forests[1]), forests[2], seeds)
+    for index, forest in enumerate(forests):
+        logger.info(f"Forest member {index}: holdout temperature {forest.temperature:.3f}")
+    return forests, seeds
+
+
+def train_resnet_ensemble(
+    train: FairVisionData | Subset[FairVisionData],
+    holdout: FairVisionData | Subset[FairVisionData],
+    classes: list[str],
+    config: TrainingConfig,
+    device: torch.device | str,
+    cache_dir: Path | None = None,
+) -> tuple[tuple[TemperatureScaled, ...], tuple[int, ...]]:
+    """Train or load the expensive surrogate: five fine-tuned, calibrated ResNet-18s.
+
+    This follows the deep-ensemble surrogates of Kossen et al. (2021, Sec. 5.3) and
+    Kossen et al. (2022, Sec. 7.3). Members use the same architecture, optimiser,
+    schedule and data as the model under test and differ only in their seed. The model
+    under test is not a member. Each member keeps its lowest validation loss checkpoint,
+    stops after `ENSEMBLE_EARLY_STOPPING_PATIENCE` epochs without improvement, and is then
+    temperature-scaled on the same holdout (Kossen et al., 2022, app. D.3). The members
+    share one training split, since bagging hurt deep ensembles in Lakshminarayanan et
+    al. (2017). Their diversity comes from the seed alone.
+    The ensemble is trained once and never updated during acquisition.
+
+    Members are cached in `cache_dir` and reused when their seed, classes and training
+    configuration match, so that repeated benchmarks and diagnostics share one ensemble.
+    """
+    seeds = member_seeds(config.random_state, "resnet_ensemble")
+    # The members keep their own recipe whatever schedule trained the model under test
+    # (agreed 16.11.2026: the surrogates need not follow FairVision).
+    member_config = replace(
+        config,
+        checkpoint_metric="validation_loss",
+        early_stopping_patience=ENSEMBLE_EARLY_STOPPING_PATIENCE,
+        lr_schedule="cosine",
+    )
+    members = []
+    for index, seed in enumerate(seeds):
+        path = None if cache_dir is None else Path(cache_dir) / f"member-{index}.pt"
+        expected = asdict(replace(member_config, random_state=seed))
+        if path is not None and path.exists():
+            stored = torch.load(path, map_location="cpu", weights_only=True)
+            stored_config = {**HISTORICAL_TRAINING_DEFAULTS, **stored["config"]}
+            if stored_config != expected or stored["classes"] != list(classes):
+                raise ValueError(
+                    f"Cached ensemble member {path} was trained with a different "
+                    "configuration. Remove the cache directory to retrain it."
+                )
+            model = create_model(config.model_type, out_dim=len(classes), use_pretrained=False)
+            model.load_state_dict(stored["model_state_dict"])
+            members.append(TemperatureScaled(model, stored["temperature"]).to(device).eval())
+            logger.info(f"Loaded ensemble member {index} from {path}")
+            continue
+
+        torch.manual_seed(seed)
+        model = create_model(config.model_type, out_dim=len(classes), use_pretrained=True)
+        model = model.to(device)
+        optimizer = AdamW(
+            model.parameters(), lr=config.initial_lr, weight_decay=config.weight_decay
+        )
+        setup = TrainingSetup(
+            model, optimizer=optimizer, scheduler=create_scheduler(optimizer, member_config)
+        )
+        torch.manual_seed(seed)
+        model, history = train_model(
+            setup,
+            replace(member_config, random_state=seed),
+            train,
+            holdout,
+            device=device,
+            metric_prefix=f"surrogate_ensemble/member_{index}",
+        )
+        logits, labels = predict_logits(model, holdout, device, config.batch_size)
+        temperature = fit_temperature(logits, labels)
+        logger.info(f"Ensemble member {index}: holdout temperature {temperature:.3f}")
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "model_state_dict": {
+                        key: value.detach().cpu() for key, value in model.state_dict().items()
+                    },
+                    "temperature": temperature,
+                    "config": expected,
+                    "classes": list(classes),
+                    "history": history,
+                },
+                path,
+            )
+        members.append(TemperatureScaled(model, temperature).to(device).eval())
+    return tuple(members), seeds
+
+
+def fit_auxiliary_models(
+    train: FairVisionData | Subset[FairVisionData],
+    holdout: FairVisionData | Subset[FairVisionData],
+    classes: list[str],
+    config: TrainingConfig,
+    device: torch.device | str,
+    *,
+    surrogate_kind: str = "forest",
+    proxy_kind: str = "resnet_ensemble",
+    ensemble_dir: Path | None = None,
+    oracle_noise: float = 0.0,
+) -> AuxiliaryModels:
+    """Fit the surrogate ensemble and the PPAT proxy for one experiment.
+
+    Both are fitted on the development split `train`. `holdout` is the split that
+    selected the checkpoint of the model under test. It early-stops and calibrates the
+    surrogates, and is never the evaluation pool.
+
+    The proxy is chosen independently of the surrogate, so that both surrogate
+    conditions are compared with the same proxy (as in PPAT's surrogate ablation,
+    Ashouritaklimi et al., 2026, app. C.2.2). The `resnet_ensemble` proxy predicts the
+    argmax of the deep ensemble's mean probabilities. `imagenet_probe` is a cheap
+    logistic-regression probe on frozen ImageNet features, mainly for development runs.
+
+    The kinds in `ORACLE_KINDS` are control conditions that read the true labels (see
+    `LabelOracle`). They need no fitting, and `oracle_noise` sets their noise level. An
+    oracle surrogate is a single member, and `seeds` then holds its noise seed.
+    """
+    if surrogate_kind not in SURROGATE_KINDS + ORACLE_KINDS:
+        raise ValueError(f"surrogate_kind must be one of {SURROGATE_KINDS + ORACLE_KINDS}")
+    if proxy_kind not in PROXY_KINDS + ORACLE_KINDS:
+        raise ValueError(f"proxy_kind must be one of {PROXY_KINDS + ORACLE_KINDS}")
+    surrogate_oracle_seed, proxy_oracle_seed = oracle_seeds(config.random_state)
+
+    ensemble = None
+    if "resnet_ensemble" in (surrogate_kind, proxy_kind):
+        ensemble = train_resnet_ensemble(train, holdout, classes, config, device, ensemble_dir)
+
+    if surrogate_kind == "forest":
+        surrogates, seeds = fit_forest_ensemble(train, holdout, classes, config, device)
+    elif surrogate_kind in ORACLE_KINDS:
+        surrogates = (
+            LabelOracle(len(classes), surrogate_kind, oracle_noise, surrogate_oracle_seed),
+        )
+        seeds = (surrogate_oracle_seed,)
+    else:
+        surrogates, seeds = ensemble
+
+    if proxy_kind == "resnet_ensemble":
+        proxy = MeanProbabilityEnsemble(ensemble[0])
+    elif proxy_kind in ORACLE_KINDS:
+        # PPAT uses the proxy's hard label, so the noisy grader returns its label.
+        proxy = LabelOracle(
+            len(classes), proxy_kind, oracle_noise, proxy_oracle_seed, hard_labels=True
+        )
+    else:
+        proxy = FrozenFeatureProbe(len(classes), FrozenImageNetFeatures()).fit(
+            _loader(train, config, device), device=device
+        )
+    return AuxiliaryModels(tuple(surrogates), proxy, seeds, surrogate_kind, proxy_kind)
 
 
 def main():

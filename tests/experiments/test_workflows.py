@@ -73,8 +73,12 @@ def tiny_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(
         experiment,
         "fit_auxiliary_models",
-        lambda *args: SimpleNamespace(
-            surrogates=(nn.Identity(), nn.Linear(2, 2)), proxy=nn.Identity(), seeds=(11, 12, 13)
+        # Fixed stand-in modules, so ASE does not refit them during acquisition.
+        lambda *args, **kwargs: SimpleNamespace(
+            surrogates=(nn.Identity(), nn.Linear(2, 2)),
+            proxy=nn.Identity(),
+            seeds=(11, 12, 13),
+            surrogate_kind="resnet_ensemble",
         ),
     )
     return {
@@ -219,6 +223,31 @@ def test_at_reuse_adopts_the_checkpoint_seed_and_rejects_a_different_one(
     assert [item["configuration"]["seed"] for item in metadata] == [42, 42]
 
 
+def test_at_reuse_records_the_recipe_of_the_checkpoint_not_the_request(
+    local_mlflow, tiny_pipeline, monkeypatch
+):
+    arguments, _ = tiny_pipeline
+    trained = replace(arguments["training_config"], lr_schedule="constant", max_epochs=1)
+    experiment.run_dev_experiment(
+        **{**arguments, "training_config": trained}, repetitions=1, track=False
+    )
+    monkeypatch.setattr(
+        utils, "train_model", lambda *args, **kwargs: pytest.fail("Retrained reused model")
+    )
+    requested = replace(trained, lr_schedule="cosine", max_epochs=7, batch_size=3)
+    experiment.run_dev_experiment(
+        **{**arguments, "training_config": requested},
+        repetitions=1,
+        reuse_trained_model=True,
+        track=False,
+    )
+    metadata = [json.loads(path.read_text()) for path in arguments["output_dir"].glob("*.json")]
+    recorded = [item["configuration"]["training"] for item in metadata]
+    assert [(r["lr_schedule"], r["max_epochs"], r["batch_size"]) for r in recorded] == [
+        ("constant", 1, 8)
+    ] * 2
+
+
 @pytest.mark.parametrize("final", [False, True])
 def test_cli_reuse_takes_the_seed_from_the_checkpoint(monkeypatch, tmp_path, final):
     experiment_name = "AT_final" if final else "AT_dev"
@@ -237,7 +266,9 @@ def test_cli_reuse_takes_the_seed_from_the_checkpoint(monkeypatch, tmp_path, fin
 
 
 @pytest.mark.parametrize("final", [False, True])
-@pytest.mark.parametrize("save_checkpoint,message", [(True, "does not match"), (False, "No checkpoint")])
+@pytest.mark.parametrize(
+    "save_checkpoint,message", [(True, "does not match"), (False, "No checkpoint")]
+)
 def test_cli_reuse_rejects_a_conflicting_seed_or_missing_checkpoint(
     monkeypatch, tmp_path, capsys, final, save_checkpoint, message
 ):
@@ -258,6 +289,18 @@ def test_cli_reuse_rejects_a_conflicting_seed_or_missing_checkpoint(
 
     assert error.value.code == 2
     assert message in capsys.readouterr().err
+
+
+def test_cli_passes_checkpoint_selection_and_early_stopping(monkeypatch):
+    arguments = ["experiment", "--checkpoint-metric", "validation_loss"]
+    monkeypatch.setattr("sys.argv", arguments + ["--early-stopping-patience", "3"])
+    calls = []
+    monkeypatch.setattr(experiment, "run_dev_experiment", lambda **kwargs: calls.append(kwargs) or {})
+
+    experiment.main()
+
+    assert calls[0]["training_config"].checkpoint_metric == "validation_loss"
+    assert calls[0]["training_config"].early_stopping_patience == 3
 
 
 def test_local_only_pipeline_creates_outputs_without_mlflow_runs(local_mlflow, tiny_pipeline):
@@ -322,7 +365,7 @@ def test_pipeline_refits_ase_and_records_custom_frequency(
 ):
     arguments, _ = tiny_pipeline
 
-    def fit_auxiliary(dataset, classes, config, device):
+    def fit_auxiliary(dataset, holdout, classes, config, device, **kwargs):
         loader = torch.utils.data.DataLoader(dataset, batch_size=8)
         models = tuple(
             RandomForestModule(2, nn.Identity(), n_estimators=5, random_state=seed).fit(loader)
@@ -390,14 +433,8 @@ class TinyDataset:
         return 4
 
 
-@pytest.mark.parametrize(
-    "protected_attribute,expected_columns,should_reject",
-    [(None, ("gender", "race"), False), ("race", ("gender", "race"), False), ("age", None, True)],
-)
-def test_run_experiment_selects_columns_for_benchmark_and_metadata(
-    monkeypatch, tmp_path, protected_attribute, expected_columns, should_reject
-):
-    dataset = TinyDataset(tmp_path / "fairvision" / "dr")
+def stub_experiment_stages(monkeypatch) -> dict:
+    """Replace training, evaluation and the benchmark, recording the benchmark arguments."""
     checkpoint = {
         "config": {"random_state": 4},
         "history": [{"epoch": 1, "roc_auc": 0.75}],
@@ -418,7 +455,7 @@ def test_run_experiment_selects_columns_for_benchmark_and_metadata(
     monkeypatch.setattr(
         experiment,
         "fit_auxiliary_models",
-        lambda *args: SimpleNamespace(surrogates=(), proxy=None, seeds=(1, 2, 3)),
+        lambda *args, **kwargs: SimpleNamespace(surrogates=(), proxy=None, seeds=(1, 2, 3)),
     )
 
     def run_benchmark(**kwargs):
@@ -426,19 +463,35 @@ def test_run_experiment_selects_columns_for_benchmark_and_metadata(
         return pd.DataFrame({"protected_attribute": kwargs["protected_columns"]})
 
     monkeypatch.setattr(experiment, "run_benchmark", run_benchmark)
+    return benchmark_arguments
+
+
+def run_stubbed_experiment(tmp_path, **kwargs):
+    dataset = TinyDataset(tmp_path / "fairvision" / "dr")
+    return experiment._run_experiment(
+        dataset,
+        dataset,
+        dataset,
+        TrainingConfig(random_state=4),
+        "cpu",
+        tmp_path / "checkpoint.pt",
+        output_dir=tmp_path / "results",
+        track=False,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "protected_attribute,expected_columns,should_reject",
+    [(None, ("gender", "race"), False), ("race", ("gender", "race"), False), ("age", None, True)],
+)
+def test_run_experiment_selects_columns_for_benchmark_and_metadata(
+    monkeypatch, tmp_path, protected_attribute, expected_columns, should_reject
+):
+    benchmark_arguments = stub_experiment_stages(monkeypatch)
 
     def run():
-        return experiment._run_experiment(
-            dataset,
-            dataset,
-            dataset,
-            TrainingConfig(random_state=4),
-            "cpu",
-            tmp_path / "checkpoint.pt",
-            output_dir=tmp_path / "results",
-            track=False,
-            protected_attribute=protected_attribute,
-        )
+        return run_stubbed_experiment(tmp_path, protected_attribute=protected_attribute)
 
     if should_reject:
         with pytest.raises(ValueError, match="not available"):
@@ -456,6 +509,64 @@ def test_run_experiment_selects_columns_for_benchmark_and_metadata(
     assert metadata["configuration"]["stratification_attribute"] == protected_attribute
 
 
+@pytest.mark.parametrize(
+    "pool_size,budget,expected_pool,expected_budget,sampling",
+    [(None, None, 4, 4, "fixed"), (3, None, 3, 3, "class_stratified"), (3, 2, 3, 2,
+     "class_stratified"), (None, 2, 4, 2, "fixed")],
+)
+def test_run_experiment_forwards_the_pool_design_and_records_it(
+    monkeypatch, tmp_path, pool_size, budget, expected_pool, expected_budget, sampling
+):
+    benchmark_arguments = stub_experiment_stages(monkeypatch)
+    run_stubbed_experiment(tmp_path, pool_size=pool_size, budget=budget)
+    # Without a pool size the benchmark keeps the frozen pool of the whole split.
+    assert benchmark_arguments["pool_size"] == pool_size
+    assert benchmark_arguments["budget"] == expected_budget
+    metadata = json.loads(next((tmp_path / "results").glob("*.json")).read_text())
+    assert metadata["configuration"]["pool_size"] == expected_pool
+    assert metadata["configuration"]["budget"] == expected_budget
+    assert metadata["configuration"]["pool_sampling"] == sampling
+
+
+@pytest.mark.parametrize(
+    "arguments,message", [({"pool_size": 5}, "pool_size"), ({"pool_size": 2, "budget": 3}, "budget")]
+)
+def test_run_experiment_rejects_a_pool_or_budget_beyond_the_split(
+    monkeypatch, tmp_path, arguments, message
+):
+    benchmark_arguments = stub_experiment_stages(monkeypatch)
+    with pytest.raises(ValueError, match=message):
+        run_stubbed_experiment(tmp_path, **arguments)
+    assert not benchmark_arguments
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_cli_forwards_pool_size_and_budget(monkeypatch, final):
+    args = ["experiment", "--no-mlflow", "--pool-size", "1000", "--budget", "300"]
+    monkeypatch.setattr("sys.argv", args + (["--FINAL"] if final else []))
+    calls = []
+    runner = "run_final_experiment" if final else "run_dev_experiment"
+    monkeypatch.setattr(experiment, runner, lambda **kwargs: calls.append(kwargs) or {})
+    experiment.main()
+    assert (calls[0]["pool_size"], calls[0]["budget"]) == (1000, 300)
+
+
+@pytest.mark.parametrize(
+    "arguments,message",
+    [
+        (["--pool-size", "0"], "--pool-size must be positive"),
+        (["--budget", "0"], "--budget must be positive"),
+        (["--pool-size", "10", "--budget", "11"], "--budget cannot exceed --pool-size"),
+    ],
+)
+def test_cli_rejects_invalid_pool_size_or_budget(monkeypatch, capsys, arguments, message):
+    monkeypatch.setattr("sys.argv", ["experiment", *arguments])
+    with pytest.raises(SystemExit) as error:
+        experiment.main()
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("final", [False, True])
 @pytest.mark.parametrize("frequency", [None, 7])
 def test_cli_forwards_ase_update_frequency(monkeypatch, final, frequency):
@@ -469,7 +580,8 @@ def test_cli_forwards_ase_update_frequency(monkeypatch, final, frequency):
     runner = "run_final_experiment" if final else "run_dev_experiment"
     monkeypatch.setattr(experiment, runner, lambda **kwargs: calls.append(kwargs) or {})
     experiment.main()
-    assert calls[0]["ase_update_every"] == (100 if frequency is None else frequency)
+    # Without a frequency, ASE refits on the retraining schedule of Kossen et al. (2021).
+    assert calls[0]["ase_update_every"] == frequency
 
 
 @pytest.mark.parametrize("frequency", [0, -1])
