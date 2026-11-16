@@ -50,3 +50,7 @@ feature-experiment *args: requirements
 # Compare candidate PPAT proxies (frozen-feature probes, FLAIR zero-shot) on a checkpoint's holdout
 proxy-experiment *args: requirements
     uv run python -m active_testing_benchmark.experiments.proxy_experiment "$@"
+
+# Fit surrogate conditions for a checkpoint and run the holdout diagnostics (pre-benchmark gate)
+surrogate-experiment *args: requirements
+    uv run python -m active_testing_benchmark.experiments.surrogate_experiment "$@"

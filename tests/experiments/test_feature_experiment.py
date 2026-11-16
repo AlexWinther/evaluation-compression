@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from active_testing_benchmark.experiments import (
     feature_experiment,
     proxy_experiment,
+    surrogate_experiment,
 )
 from active_testing_benchmark.modeling import foundation
 from active_testing_benchmark.modeling.models import create_model
@@ -142,9 +143,7 @@ def test_target_checkpoint_adds_diagnostics_and_uses_its_seed(monkeypatch, targe
         "kossen_error_auc",
         "ase_relative_bias",
         "ppat_proxy_correlation",
-    } <= set(
-        results.columns
-    )
+    } <= set(results.columns)
 
 
 def test_target_checkpoint_rejects_a_different_seed(monkeypatch, target_checkpoint, capsys):
@@ -186,9 +185,7 @@ class FakeFlair(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.vision_model = torch.nn.Sequential(
-            torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten()
-        )
+        self.vision_model = torch.nn.Sequential(torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten())
 
     def preprocess_text(self, prompts):
         ids = torch.tensor([[index % 3] for index in range(len(prompts))])
@@ -270,4 +267,37 @@ def test_proxy_experiment_rejects_unknown_candidates_and_a_different_seed(
     with pytest.raises(ValueError, match="does not match the seed 5"):
         proxy_experiment.run_proxy_experiment(
             target_checkpoint, seed=6, track=False, candidates=("imagenet_probe",)
+        )
+
+
+def test_surrogate_experiment_fits_each_condition_on_the_checkpoint_split(
+    monkeypatch, target_checkpoint
+):
+    monkeypatch.setattr(surrogate_experiment, "FairVisionData", SyntheticData)
+    calls = []
+
+    class Logits(torch.nn.Module):
+        def forward(self, images):
+            return images.mean(dim=(2, 3))[:, :2]
+
+    def fit_auxiliary(fit, holdout, classes, config, device, **kwargs):
+        calls.append((len(fit), len(holdout), config.random_state, kwargs))
+        return SimpleNamespace(surrogates=(Logits(), Logits()), proxy=Logits(), seeds=(1, 2))
+
+    monkeypatch.setattr(surrogate_experiment, "fit_auxiliary_models", fit_auxiliary)
+    results = surrogate_experiment.run_surrogate_experiment(
+        target_checkpoint, device="cpu", track=False
+    )
+    assert results["surrogate_kind"].tolist() == ["forest", "resnet_ensemble"]
+    assert [call[:3] for call in calls] == [(16, 4, 5), (16, 4, 5)]
+    # Both conditions share the proxy and the ensemble cache of the checkpoint.
+    expected_dir = target_checkpoint.parent / "surrogate_ensemble" / "seed-5"
+    assert {call[3]["ensemble_dir"] for call in calls} == {expected_dir}
+    assert {call[3]["proxy_kind"] for call in calls} == {"resnet_ensemble"}
+    assert {"kossen_variance_gain", "member_disagreement", "ppat_lambda_dagger"} <= set(
+        results.columns
+    )
+    with pytest.raises(ValueError, match="surrogate kinds"):
+        surrogate_experiment.run_surrogate_experiment(
+            target_checkpoint, track=False, surrogate_kinds=("gp",)
         )
