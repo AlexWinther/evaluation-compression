@@ -100,6 +100,47 @@ Each extractor then also reports the
 surrogate and proxy. The run uses the checkpoint's training seed, so the holdout
 is the checkpoint's own selection holdout and contains no images the classifier
 was trained on. Omit `--seed` to adopt it. A different `--seed` stops the run.
+Add `--output <csv>` to save the comparison for the
+[report tables](#report-tables-and-figures).
+
+### Comparison of PPAT proxy candidates
+
+PPAT only reduces variance when its proxy loss correlates with the true loss.
+This experiment compares proxies that need no fine-tuning on the holdout of an
+`AT_dev` checkpoint, before any benchmark:
+
+```bash
+just proxy-experiment --target-checkpoint models/experiment/AT_dev/dr/resnet.pt
+just proxy-experiment --target-checkpoint models/experiment/AT_dev/dr/resnet.pt --candidates imagenet_probe flair_zero_shot --no-mlflow --output reports/active-testing/diagnostics/dr-proxy-candidates.csv
+```
+
+| Candidate | Proxy |
+|---|---|
+| `imagenet_probe` | Logistic regression on frozen ImageNet ResNet-18 features |
+| `retfound_probe` | Logistic regression on frozen RETFound (MAE, colour fundus) ViT-L/16 features |
+| `flair_probe` | Logistic regression on frozen FLAIR image embeddings |
+| `flair_zero_shot` | FLAIR zero-shot with the prompts in `modeling/foundation.py` |
+
+Probes train on the checkpoint's 80 % development split, and every candidate is
+scored on its 20 % holdout with the proxy diagnostics of the
+[surrogate diagnostics](#surrogate-diagnostics) table. Frozen features are
+cached in `data/interim/proxy_features/<disease>/`, so each encoder runs once.
+
+FLAIR and RETFound are not project dependencies:
+
+- FLAIR comes from its repository, not the unrelated `flair` package on PyPI. The
+  `just` recipes run `uv sync --locked`, which removes packages outside the lock
+  file, so add FLAIR as a temporary layer instead of installing it. Its weights
+  download from Hugging Face (`jusiro2/FLAIR`) on first use:
+
+  ```bash
+  uv run --with "flair @ git+https://github.com/jusiro/FLAIR.git" python -m active_testing_benchmark.experiments.proxy_experiment --target-checkpoint models/experiment/AT_dev/dr/resnet.pt --candidates flair_zero_shot flair_probe
+  ```
+- RETFound's weights (`YukunZhou/RETFound_mae_natureCFP`, about 4 GB) are gated.
+  Request access on the Hugging Face page and log in with `hf auth login`.
+
+Both were pretrained on colour fundus photographs, while FairVision provides SLO
+images, so their transfer must be measured here before use.
 
 ### Model selection
 
@@ -139,10 +180,16 @@ just experiment --help
 
 The development AT experiment trains ResNet-18 on a label-stratified 80% of
 FairVision's training split. The remaining 20% selects the checkpoint with the
-highest ROC AUC. Ties keep the earliest checkpoint. The restored model is
-evaluated and benchmarked on FairVision validation. Training defaults to 10
-epochs, batch size 32, pretrained ImageNet weights, unweighted cross-entropy,
-AdamW, and cosine learning rate scheduling.
+highest ROC AUC by default. Ties keep the earliest checkpoint. The restored model is
+evaluated and benchmarked on FairVision validation. Training follows the CNN
+recipe of the FairVision paper (Luo et al., 2024, Sec. 5): 10 epochs, AdamW
+with learning rate 1e-4 held constant, and the checkpoint with the highest
+validation AUC. It deviates in three ways: batch size 32 instead of 6, weight
+decay 1e-3 (the paper gives none), and selection on the 20% development holdout
+instead of FairVision validation, which is the evaluation pool here. Training uses
+pretrained ImageNet weights and unweighted cross-entropy. Pass
+`--lr-schedule cosine` for the cosine schedule that earlier checkpoints were
+trained with. The deep-ensemble surrogate always keeps its own cosine recipe.
 
 #### Final run
 
@@ -162,29 +209,58 @@ checkpoint. `--FINAL` flag is only available for the AT benchmarking experiment.
 AT benchmarking runs uniform, balanced/proportional stratified, Kossen,
 active-surrogate, and prediction-powered methods. It estimates unweighted
 cross-entropy risk overall and by subgroup, including `age_group`. Each method
-runs for `--repetitions` (default 50), with a max label budget equal to the
-full evaluation pool.
+runs for `--repetitions` (default 50).
 
-Kossen and PPAT use the same average predictive probabilities from both
-surrogate forests. ASE starts with that ensemble and uses its individual
-members for XWED.
+All active methods share one surrogate ensemble of five members, chosen with
+`--surrogate` (see `specs/surrogate-pipeline-review.md` for the reasoning):
 
-Both surrogates and the proxy use frozen ImageNet ResNet-18 features for their
-random forests by default. The classification layer is removed, producing 512
-features per image.  Backbone weights and batch-normalization statistics remain
-frozen during fitting, prediction, and ASE updates. It accepts the same resized,
-ImageNet-normalized images as the target model. The first use downloads
-approximately 45 MB of `ResNet18_Weights.IMAGENET1K_V1` weights to torchvision's
-cache.  Custom extractors remain supported through
+| `--surrogate` | Members | Updated during acquisition |
+|---|---|---|
+| `forest` (default, cheap) | Five random forests on frozen ImageNet ResNet-18 features, each on its own bootstrap of the development split, without class weights, temperature-calibrated on the holdout | ASE refits them on the retraining schedule of Kossen et al. (2021): after 5, 10, 20, 30, 40, 100, 250, 400, ... labels |
+| `resnet_ensemble` (expensive) | Five fine-tuned ResNet-18s with the classifier's recipe and new seeds, early-stopped on validation loss and temperature-scaled on the holdout | Never, as in the large-scale experiments of Kossen et al. (2021, 2022). ASE then reports a constant estimate |
+
+Kossen averages the member probabilities. ASE uses the members for XWED and PPAT
+for its RMS-residual proposal. Kossen and PPAT mix their proposals with 20 %
+uniform sampling (the minimum proposal probability of Kossen et al., 2021), and
+PPAT uses the fixed coefficient λ = 0.5.
+
+The PPAT proxy is chosen with `--proxy` and is the same for both surrogate
+conditions. `resnet_ensemble` (default) uses the argmax of the deep ensemble,
+`imagenet_probe` a logistic-regression probe on frozen ImageNet features. The
+deep ensemble is trained once per checkpoint seed and cached in
+`models/experiment/<experiment>/<disease>/surrogate_ensemble/seed-<seed>/`. Its
+members log their training curves under `surrogate_ensemble/member_<k>/` in the
+run, so the classifier's own `training/` history stays separate.
+
+Both `--surrogate` and `--proxy` also accept three control conditions that read
+the true labels of the pool (`LabelOracle`). They show what the estimators gain
+from the best possible auxiliary model and how fast that gain is lost. They are
+never usable methods, since they need the labels that active testing saves.
+`--oracle-noise` sets the noise level of the two noisy kinds:
+
+| Kind | Output | `--oracle-noise` |
+|---|---|---|
+| `oracle` | The true label with certainty. The Kossen score equals the true loss and the proxy loss equals the true loss | Ignored |
+| `noisy_oracle` | A simulated second grader whose mistakes are independent of the classifier. Surrogates receive the calibrated posterior given the noisy label, proxies the noisy label itself | Probability that a label is replaced by another class |
+| `model_noisy_oracle` | The true label, or the classifier's own predicted distribution. Its mistakes coincide with the classifier's confident errors, as those of real surrogates tend to | Share of images that fall back to the classifier's prediction. At 1 the classifier is its own surrogate |
+
+An oracle surrogate is a single fixed member, so ASE acquires by expected loss
+instead of XWED. The surrogate and the proxy draw their noise from different
+seeds. The holdout diagnostics are computed for oracles as well, so a sweep over
+`--oracle-noise` relates surrogate quality to the estimation error.
+
+The frozen ImageNet ResNet-18 features drop the classification layer and give
+512 features per image. Backbone weights and batch-normalization statistics
+remain frozen during fitting, prediction, and ASE refits. The first use
+downloads approximately 45 MB of `ResNet18_Weights.IMAGENET1K_V1` weights to
+torchvision's cache. Custom extractors remain supported through
 `RandomForestModule(feature_extractor=...)`, including
 `SpatialTextureFeatures()` for the previous texture baseline.
 
-ASE refits its surrogate forests on the original development data plus all
-acquired labels every 100 labels. Set `--ase-update-every N` to change that
-frequency (positive integers only). Acquisition batches stop at update
-thresholds so refitting happens at the requested label counts. Each objective
-and repetition starts with fresh copies of the development-trained ASE
-surrogates.
+Set `--ase-update-every N` to refit the forests every N labels instead of on the
+schedule. Acquisition batches stop at refit thresholds, so refits happen at the
+requested label counts. Each objective and repetition starts with fresh copies
+of refitted surrogates. A fixed surrogate is shared without copying.
 
 By default, AT benchmarking reports all marginal subgroup attributes except raw
 `age`. Uniform sampling, Kossen, ASE, and PPAT each share one sampling run per
@@ -198,9 +274,45 @@ For example:
 
 ```bash
 just experiment --repetitions 5 --seed 42 --epochs 20
-just experiment --ase-update-every 100 --seed 42
+just experiment --surrogate resnet_ensemble --seed 42
+just experiment --surrogate forest --proxy imagenet_probe --seed 42
+just experiment --surrogate oracle --proxy oracle --reuse-trained-model
+just experiment --surrogate model_noisy_oracle --proxy noisy_oracle --oracle-noise 0.2 --reuse-trained-model
 just experiment --protected-attribute gender --seed 42
+just experiment --pool-size 500 --budget 150 --repetitions 100 --seed 42
+just experiment --acquisition-batch-size 10 --budget 200 --seed 42
 ```
+
+`--acquisition-batch-size` (default 25) sets how many labels every method
+acquires before its proposal is recomputed. 10 labels is a 1% step on the
+1,000-image development pool.
+
+#### Evaluation pools and repetitions
+
+By default the evaluation pool is frozen: every repetition evaluates the whole
+evaluation split (FairVision validation for dev runs, test for final runs) and
+only the acquisition randomness changes, as in PPAT (Ashouritaklimi et al.,
+2026, app. B.1). With `--pool-size N`, every repetition instead draws a new pool
+of N images from the split, without replacement and stratified by class, as in
+Kossen et al. (2021, app. C.5). All methods of a repetition share its pool and
+seed, and the pool depends only on `--seed` and the repetition number.
+`--budget M` caps the labels per repetition and defaults to the whole pool.
+
+Errors are measured against the exact risk of the pool that each repetition
+evaluated. A frozen pool is the right reference for the unbiased estimators,
+but a deterministic method such as ASE then gives the same answer in every
+repetition, so its error is pure bias. Resampled pools also average that bias
+over pools.
+
+The model, surrogates and proxy stay fixed across repetitions, so their outputs
+on the split are computed once and looked up by image index
+(`active_testing/prediction_cache.py`). For forests the cache holds the frozen
+image features, so ASE refits still predict from the same features. This makes
+a repetition cost mostly the forest refits of ASE.
+
+The sizes proposed for the thesis are a pool of 500 of the 1,000 validation
+images with a budget of 150 for dev runs, and 1,000 of the 3,000 test images
+with a budget of 300 for final runs.
 
 #### Surrogate diagnostics
 
@@ -219,18 +331,29 @@ The diagnostics are:
 | `target_variance_gain` | The same ratio when the classifier is its own surrogate (Kossen without a surrogate, "Ori" in Lee et al., 2024) |
 | `confidence_oracle_variance_gain` | The same ratio for the best proposal using only the classifier's confidence, proportional to the RMS loss per confidence bin (an optimistic in-sample estimate, not a strict limit, of what any surrogate-free or recalibrated proposal can reach, never below about 1) |
 | `ase_relative_bias` | Relative error of the ASE estimate before acquiring labels |
-| `ppat_proxy_correlation` | Correlation of the PPAT proxy loss with the true loss (λ = 0.5 helps above 0.25) |
+| `surrogate_nll` | Negative log-likelihood of the labels under the ensemble mean (calibration and sharpness) |
+| `surrogate_class_frequency_error` | Largest gap between the ensemble's mean class probability and the class frequency (calibration in the large, the direct cause of ASE bias) |
+| `member_disagreement` | Mean fraction of images on which two members predict different classes |
+| `xwed_spearman` | Rank correlation of the XWED score with the true loss. XWED targets where a label would most improve the surrogate, not where the loss is, so low or negative values are expected |
+| `ppat_proxy_correlation` | Correlation of the PPAT proxy loss L(f(x), argmax g(x)) with the true loss (λ = 0.5 helps above 0.25) |
+| `ppat_soft_proxy_correlation` | The same for the soft proxy loss, an ablation |
+| `ppat_lambda_dagger` | The variance-minimising λ of PPAT Prop. 3.4 on the holdout. λ = 0.5 reduces variance when this exceeds 0.25. The largest possible gain is about the squared proxy correlation |
+| `proxy_auc`, `proxy_accuracy`, `proxy_class_frequency_error` | Label quality of the proxy, including whether its hard labels ignore the rare class |
 
 They are logged to MLflow under `diagnostics/` and saved in the metadata JSON
-as `surrogate_diagnostics`.
+as `surrogate_diagnostics`. The holdout also calibrated the surrogates, so the
+values are slightly optimistic.
 
 #### Outputs and tracking
 
 AT runs save uniquely named curves CSVs and matching metadata JSON files under
 `reports/active-testing/AT_benchmarking/`. Curves contain methods, objectives,
-repetitions, seeds, label counts, and overall/subgroup risk estimates. Metadata
-records configuration, checkpoint details, training history, auxiliary seeds,
-dataset sizes, and full-pool reference metrics.
+repetitions, seeds, label counts, and overall/subgroup risk estimates. Each row
+also stores its pool size, the pool size of every group (`pool_n_<group>`), and
+the exact risk of its pool (`reference_risk` and `reference_risk <group>`).
+Metadata records configuration (including `pool_size`, `pool_sampling` and
+`budget`), checkpoint details, training history, auxiliary seeds, dataset sizes,
+and reference metrics for the whole evaluation split.
 
 Curves include a `protected_attribute` column: `shared` identifies a
 non-stratified run reporting multiple attributes, while an attribute name
@@ -243,12 +366,71 @@ attributes. A reported subgroup may cross the sampling strata, so its estimate
 uses the stratum weights from that run. At smaller budgets, methods that
 require observed labels may leave a subgroup's risk blank when its label count
 is zero. Prediction-based methods may still estimate it. At the full-pool
-budget, every requested subgroup has labels and an estimate. Overall risk is
+budget, every requested subgroup has labels and an estimate. A small group can
+be missing from a resampled pool, and then its columns are blank for that
+repetition. Overall risk is
 stored once per sampling trajectory.
 
 During AT, the MLflow tags `stage`, `AT.method`, and `AT.repetition` show
 progress. Risk and label-count metrics are logged after each method/repetition. Overall and subgroup reference metrics
 are logged after evaluation. Full AT curves remain available in the CSV artifact.
+
+#### Report tables and figures
+
+Two steps turn a finished AT run into the tables and figures of the report. Pass
+the run as its CSV, its JSON, or their shared stem:
+
+```bash
+just pool-diagnostics reports/active-testing/AT_benchmarking/<run>
+just report-results reports/active-testing/AT_benchmarking/<run>
+```
+
+`pool-diagnostics` refits the run's surrogates from its seed and saves
+`<run>-diagnostics.json` next to the run. It holds the surrogate diagnostics on
+the classifier's own holdout and on the evaluation pool, and how concentrated
+the classifier's loss is on the pool. The pool diagnostics use the pool labels,
+so they explain a finished run and must not inform choices made before it.
+
+`report-results` (`active_testing_benchmark/reporting.py`) writes the outputs
+below. The prefix defaults to the disease. The report expects one prefix per
+dataset and surrogate condition, `dr_forest`, `dr_resnet`, `glaucoma_forest`, and
+`glaucoma_resnet`, so pass it with `--prefix`. The report includes each table and
+figure once its file exists and shows a placeholder box until then.
+
+| Output | Content |
+|---|---|
+| `report/figures/results/<prefix>_rmse_curves.pdf` | RMSE against label budget, overall and per group |
+| `report/figures/tables/<prefix>_reference.tex` | Full-pool size, risk, and AUC per group |
+| `report/figures/tables/<prefix>_rmse.tex` | RMSE at selected budgets, lowest per column in bold |
+| `report/figures/tables/<prefix>_mse_ratio.tex` | MSE(uniform) / MSE(method) with paired bootstrap intervals |
+| `report/figures/tables/<prefix>_allocation.tex` | Mean labels per group at one budget |
+| `report/figures/tables/<prefix>_diagnostics.tex` | Surrogate diagnostics, when diagnostics are available |
+| `reports/active-testing/analysis/<prefix>_*.csv` | The same numbers at full precision |
+
+The `.tex` files hold only the `tabular`, so captions and labels stay in the
+report. Options choose the attributes (`--attributes gender race`), the RMSE
+table groups (`--table-targets overall gender=female race=black`), and the
+budgets. `--feature-experiment <csv>` adds one holdout column per feature
+extractor to the diagnostics table. The development DR tables that currently stand
+in for the final `dr_forest` results were made with:
+
+```bash
+just report-results reports/active-testing/AT_benchmarking/20261112-221743-817504-9561f439132f44b58b1ee66c27cca9b5 --table-targets overall gender=female race=black --feature-experiment reports/active-testing/diagnostics/dr-feature-experiment-at-dev.csv --prefix dr_forest
+```
+
+#### Overview diagram
+
+The overview figure of the report is drawn from `diagrams/overview.mmd` with
+mermaid-cli (`brew install mermaid-cli`):
+
+```bash
+just overview-diagram
+```
+
+It writes `report/figures/overview.pdf`. mermaid-cli renders through Puppeteer,
+which looks for its own `chrome-headless-shell` by default.
+`diagrams/puppeteer-config.json` points it to the installed Google Chrome
+instead, so change `executablePath` there if Chrome lives elsewhere.
 
 ### Classifier training and checkpointing
 
@@ -265,7 +447,19 @@ Each epoch logs loss, accuracy, F1, and ROC AUC under separate MLflow paths:
 names are `loss`, `accuracy`, `f1`, and `roc_auc`. Training metrics aggregate
 predictions from the optimization pass, while validation uses the updated model
 in evaluation mode after the epoch. No extra training-set inference pass is
-needed. Checkpoint selection continues to maximize validation AUC.
+needed. Checkpoint selection maximizes validation AUC by default.
+
+Active testing estimates the cross-entropy, so an overconfident checkpoint
+changes the risk being estimated, not only the ranking quality. To select the
+checkpoint with the lowest validation cross-entropy instead, and to stop after
+a number of epochs without improvement of that metric, pass:
+
+```bash
+just experiment --checkpoint-metric validation_loss --early-stopping-patience 3
+```
+
+Both values are stored in the checkpoint configuration, and the reported best
+epoch follows the checkpoint's own selection metric.
 
 Best checkpoints are saved under `models/experiment/`, separated by
 `model_selection`, `AT_dev`, or `AT_final`, then disease and model name. A fresh
@@ -280,6 +474,8 @@ just model-selection --reuse-trained-model
 `--checkpoint-dir` selects another checkpoint root. Reuse requires a matching
 checkpoint. AT reuse runs with the checkpoint's training seed, so the
 development holdout, auxiliary models and repetitions match the original run.
+It also records the checkpoint's stored training recipe instead of the
+command-line training flags, which do not apply to a reused model.
 Omit `--seed` to adopt it. A mismatching `--seed` stops the run before any
 prompt or data loading. Python callers get a `ValueError` if
 `training_config.random_state` differs from the checkpoint's seed. AT still
@@ -345,6 +541,25 @@ just experiment --no-mlflow --seed 42
 The final-experiment confirmation is required with or without tracking. Failed
 runs are marked as failed in MLflow. Tracking errors propagate rather than
 silently producing an untracked run.
+
+### Querying MLflow from Claude Code
+
+`.mcp.json` registers MLflow's own MCP server as `mlflow`, started by
+`deploy/mlflow/mcp-server.sh`. It talks to the remote tracking server, never to
+a local `mlflow.db`. The script uses `MLFLOW_TRACKING_URI`,
+`MLFLOW_TRACKING_USERNAME`, and `MLFLOW_TRACKING_PASSWORD` from the environment,
+or from `.env` when they are not set. It exposes the experiment, run, and model
+tools (`MLFLOW_MCP_TOOLS=ml`). `.claude/settings.json` enables the server,
+allows the read-only tools, and denies the delete, rename, and update tools.
+
+Cloud sessions do not have `.env`, so the cloud environment needs two settings:
+
+1. Add the three `MLFLOW_TRACKING_*` variables as environment variables.
+2. Allow network access to the MLflow host, either with a custom network policy
+   that adds the host to the allowed domains or with full network access.
+
+With these variables set, the experiment code in cloud sessions also logs to
+the remote server.
 
 ## Acknowledgment
 
